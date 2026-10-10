@@ -513,9 +513,39 @@ def build_scenario(
             # Two commands, the plan's Task 3 step 4, written out rather than
             # delegated: pretending the transaction took the machine over would be
             # the harness lying about the precondition.
+            #
+            # **THE UNDO IS THE POINT OF THIS BLOCK, and it was missing for four
+            # matrix runs.** MEASURED, 24.04, sampled every 5s across a live cell:
+            # the profile `eth0-managed` went from `ipv4.dns=<unset>` with
+            # `ipv4.ignore-auto-dns=no` and the device publishing `10.89.0.2`, to
+            # `ipv4.dns=127.0.0.1` with `ipv4.ignore-auto-dns=yes` and the device
+            # publishing `127.0.0.1`, and it stayed there. `install` runs first in
+            # this same container (`run.PACKAGE_SCENARIOS`) and its transaction now
+            # completes, because the cell starts a mock foreign resolver; completing
+            # means writing those three properties **to the profile** and
+            # reactivating, and a profile outlives the process that wrote it.
+            #
+            # So activating `eth0-managed` here did not produce a machine
+            # following its lease -- it produced the takeover again, and the wait
+            # below could not succeed by construction. That is the whole of the
+            # `read '127.0.0.1'` refusal this block used to end in, on 22.04, 24.04
+            # and 26.04 alike.
+            #
+            # Written unconditionally, and that is deliberate rather than
+            # convenient: `ipv4.dns ''` clears a list that may already be empty and
+            # `ignore-auto-dns no` is the value a lease-following profile already
+            # had, so on a `--scenario watchdog` cell -- which starts no foreign
+            # mock, so its own transaction refuses, so nothing has taken the
+            # profile over -- all three are no-ops and the hand-off still works.
+            # Guarding them on "is something there to undo" would need a read that
+            # races the install, which is a worse dependency than three idempotent
+            # writes.
             run(
                 "set -eu\n"
                 f"nmcli connection modify {MANAGED_PROFILE} ipv4.never-default yes\n"
+                f"nmcli connection modify {MANAGED_PROFILE} ipv4.dns ''\n"
+                f"nmcli connection modify {MANAGED_PROFILE} ipv4.ignore-auto-dns no\n"
+                f"nmcli connection modify {MANAGED_PROFILE} ipv6.ignore-auto-dns no\n"
                 f"nmcli connection up {MANAGED_PROFILE}\n"
             )
             document["profile_after_handoff"] = wait_for(

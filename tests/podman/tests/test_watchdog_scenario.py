@@ -180,6 +180,7 @@ def watchdog_rules(
     journals: list[str] | None = None,
     record_reads: list[str] | None = None,
     connection_dns: list[str] | None = None,
+    device_dns: list[str] | None = None,
     backup: str | None = BACKUP,
     operator_exit: int = 0,
     probe_status: int = 0,
@@ -236,8 +237,22 @@ def watchdog_rules(
         # the lease reads. `cell_rules()` answers the same command with a lease
         # for the `dhcp` scenario, and this rule is narrower and comes first, so
         # the two suites agree about what a device with a DHCP lease publishes.
+        #
+        # **A SEQUENCE, because a previous install in the same cell takes this
+        # device over.** MEASURED, 24.04, from a live cell: the profile
+        # `eth0-managed` went from `ipv4.dns=<unset> ipv4.ignore-auto-dns=no`
+        # publishing `10.89.0.2` to `ipv4.dns=127.0.0.1 ipv4.ignore-auto-dns=yes`
+        # publishing `127.0.0.1` the moment the install's transaction completed,
+        # and it stayed that way for every later read. The install writes those
+        # properties to the PROFILE and reactivates, so they outlive the process
+        # that set them -- which is what makes this a precondition the hand-off
+        # has to establish rather than one it can read.
+        #
+        # The default is a device that publishes the lease throughout, because
+        # that is the machine a `watchdog`-only cell has. A case that wants the
+        # taken-over machine says so with `device_dns`.
         {"match": ["nmcli", "-g", "IP4.DNS", "device", "show", "eth0"],
-         "stdout": f"{MOCK_ROUTER_ADDRESS}\n"},
+         "answers": [{"stdout": f"{value}\n"} for value in (device_dns or [MOCK_ROUTER_ADDRESS])]},
         {"match": ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", "eth0"],
          "answers": [{"stdout": "eth0\n"}, {"stdout": f"{PROFILE}\n"}]},
         # -- the package ----------------------------------------------------
@@ -430,6 +445,84 @@ class WatchdogScenarioHarness(PodmanTestCase):
             for argv in fake.invocations()
             if argv[:2] == ["exec", TARGET]
         ]
+
+
+class TheHandoffEstablishesItsOwnPreconditionTest(WatchdogScenarioHarness):
+    """**The hand-off has to be able to make its precondition true.**
+
+    The scenario waits for the device to publish the DHCP lease's resolver before
+    it installs anything, because a restore can only be measured against a machine
+    that resolves. It gets there by activating `eth0-managed` -- and on a
+    `watchdog`-only cell that is enough, because the profile still follows the
+    lease.
+
+    **In the full matrix cell it is not enough, and that is what every release
+    failed on.** `install` runs first in the same container (see
+    `run.PACKAGE_SCENARIOS`), its transaction now completes because the cell
+    starts a mock foreign resolver, and completing means writing
+    `ipv4.dns=127.0.0.1` and `ipv4.ignore-auto-dns=yes` **to the profile** and
+    reactivating it. MEASURED, 24.04, sampled every 5s across a live cell:
+
+        profile=[|no]        device=[10.89.0.2]     <- the lease is published
+        profile=[127.0.0.1|yes] device=[127.0.0.1]  <- and never again
+
+    Those writes outlive the process that made them, so the hand-off re-activating
+    the profile reproduces the takeover exactly: the wait for `10.89.0.2` then
+    cannot succeed by construction, and the scenario fails after its whole budget
+    having read `127.0.0.1`.
+    """
+
+    def test_the_handoff_undoes_a_previous_install_s_takeover_before_waiting(self):
+        """**Both halves in one run, because neither discriminates alone.**
+
+        The device is answered as the measurement saw it -- the loopback address
+        first, the lease once the profile is undone -- and the gate is on the
+        commands. The gate has to be on the commands: the fake podman answers a
+        command from a table and keeps one counter per rule, so it cannot make an
+        answer to `nmcli -g IP4.DNS` depend on whether the scenario cleared the
+        profile first. An answer sequence alone would let a scenario that never
+        clears anything pass, and a green case that stays green under the defect
+        it exists to catch reads as coverage while measuring nothing.
+        """
+        fake, result = self.run_scenario(
+            device_dns=[LOCAL_DNS, LOCAL_DNS] + [MOCK_ROUTER_ADDRESS],
+        )
+        self.assertEqual(
+            result.status, "passed",
+            "a device an earlier install had pointed at the local resolver was never brought "
+            f"back to the lease, so the scenario reported {result.status}: {result.detail}",
+        )
+        lines = "\n".join(self.asked(fake)).splitlines()
+        first_up = next(
+            index for index, line in enumerate(lines) if f"connection up {PROFILE}" in line
+        )
+        before = lines[:first_up]
+        for property_name in ("ipv4.dns", "ipv4.ignore-auto-dns", "ipv6.ignore-auto-dns"):
+            self.assertTrue(
+                any(f"connection modify {PROFILE} {property_name} " in line for line in before),
+                f"the hand-off activated {PROFILE} without first undoing {property_name}, so on a "
+                "machine an earlier install in this cell already took over, the activation "
+                f"reproduces the takeover and the wait for the lease cannot succeed. "
+                f"Before the first `connection up {PROFILE}` the scenario issued: {before}",
+            )
+
+    def test_a_watchdog_only_cell_still_passes_with_nothing_to_undo(self):
+        """**The other half of the matrix: the standalone cell, with nothing to undo.**
+
+        The gate above holds the scenario to undoing a takeover that may not be
+        there. A scenario that refused to run without one would pass the full cell
+        and fail `--scenario watchdog` on its own, and `MOCK_SCENARIO_EXTRA` has no
+        entry for `watchdog` -- the foreign mock it would need is not started for
+        that cell. So the properties are written unconditionally, and on a profile
+        that never carried them they are no-ops: `ipv4.dns ''` clears an empty
+        list and `ignore-auto-dns no` is the value the lease path already had.
+        """
+        _fake, result = self.run_scenario()
+        self.assertEqual(
+            result.status, "passed",
+            f"the watchdog cell on a machine no install had taken over reported "
+            f"{result.status}: {result.detail}",
+        )
 
 
 class ScenarioPassesTest(WatchdogScenarioHarness):
