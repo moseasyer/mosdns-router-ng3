@@ -50,11 +50,23 @@ var chinaConfLine = regexp.MustCompile(`^server=/([A-Za-z0-9.-]+)/([0-9.]+)$`)
 // disabledReason 匹配上游自己停用的那一行,取值是它给出的原因。
 var disabledReason = regexp.MustCompile(`^#server=/[A-Za-z0-9.-]+/[0-9.]+\s*#\s*Disabled:\s*(.+)$`)
 
-// addressShaped 找出读起来像一个 IPv4 地址的片段:四段数字、点分隔。
+// addressShaped 找出读起来像一段 IPv4 地址的连续数字:至少四段,点分隔。
 //
-// 它刻意**不**要求 netip 解析通过:`010.1.1.1` 不是合法地址,但上游写下它时
-// 指的就是那个地址,门禁和读日志的人也会把它读成地址。
-var addressShaped = regexp.MustCompile(`\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b`)
+// 两个刻意的选择,都是因为按"能否解析"来判断会把最该拦下的几种漏掉:
+//
+//   - 它**不**要求 netip 解析通过。`010.1.1.1`、`999.1.1.1`、`999.999.999.999`
+//     都不是合法地址,但上游写下它们时指的就是地址,门禁和读日志的人也会把
+//     它们读成地址。
+//   - 它**不**要求两侧是词边界。带 `\b` 时 `see1.2.3.4`、`v1.2.3.4`、
+//     `1.2.3.4here` 与 `1234.1.1.1` 全部漏过:前三者的数字开头处没有边界,
+//     最后一者的首段是四位而模式只肯吃三位。
+//
+// `{3,}` 是贪婪的,所以 `1.2.3.4.5` 整段被替换,而不是留下 `<address>.5`
+// ——半遮半掩既没去掉地址,也没留下原文,比两个极端都更糟。
+//
+// 三段(`1.2.3`)不算地址形状,刻意放过:版本号不是地址,而域名里的标签组也
+// 不是八位组,`domain:1.2.3` 是必须保留的合法规则。
+var addressShaped = regexp.MustCompile(`[0-9]+(?:\.[0-9]+){3,}`)
 
 // redactedAddress 是地址在产物里的样子。
 const redactedAddress = "<address>"
@@ -171,8 +183,14 @@ func ConvertChinaConfFS(fsys fs.FS, entries []string) (ChinaConfResult, error) {
 			if name == "" {
 				return ChinaConfResult{}, fmt.Errorf("%s:%d: the domain field is not a domain this gateway can match", entry, number+1)
 			}
-			if _, err := netip.ParseAddr(name); err == nil {
-				return ChinaConfResult{}, fmt.Errorf("%s:%d: the domain field is an IPv4 address rather than a domain name, and publishing it would put an address in the list", entry, number+1)
+			// Address-SHAPED, not parseable, and deliberately the same predicate
+			// the redaction above uses. netip refuses 999.1.1.1, 010.1.1.1 and
+			// 1.2.3.4.5, so a parse-based guard would publish all three as
+			// `domain:999.1.1.1` and friends -- the same reasoning that made the
+			// redaction shape-based, applied to the one field that becomes a
+			// published expression.
+			if addressShaped.MatchString(name) {
+				return ChinaConfResult{}, fmt.Errorf("%s:%d: the domain field reads as an IPv4 address rather than a domain name, and publishing it would put an address in the list", entry, number+1)
 			}
 			expression := "domain:" + name
 			rulesInEntry++
@@ -187,9 +205,15 @@ func ConvertChinaConfFS(fsys fs.FS, entries []string) (ChinaConfResult, error) {
 		}
 	}
 
-	// Unreachable while the per-entry gate above holds, and kept anyway: an
-	// empty success result is the one thing that would silently publish an
-	// empty China set, and that failure is invisible at the call site.
+	// Unreachable while the per-entry gate above holds, and it will never be the
+	// thing that fires: a non-empty `entries` plus `rulesInEntry` on every one of
+	// them means a successful return already carries at least one expression.
+	// It is kept anyway, and the honest reason is that it is a contract
+	// backstop rather than a check -- if someone later adds a path that skips an
+	// entry, this is the alarm, and an empty SUCCESS result is the one failure
+	// that would silently publish an empty China set with nothing to notice it.
+	// Unlike the dead test assertion the review rejected, this one cannot be
+	// removed by accident without also removing the per-entry gate.
 	if len(result.Expressions) == 0 {
 		return ChinaConfResult{}, errors.New("the named entries resolved to no rules at all")
 	}

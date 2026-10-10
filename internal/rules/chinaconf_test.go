@@ -245,6 +245,50 @@ func TestAReasonNamingAnAddressShapedButInvalidValueLosesItToo(t *testing.T) {
 	}
 }
 
+func TestRedactionCatchesARunOfAddressShapedDigitsHoweverItIsGlued(t *testing.T) {
+	// The word boundaries the first version leaned on did not survive contact
+	// with prose: `see1.2.3.4`, `v1.2.3.4`, `1.2.3.4here` and `1234.1.1.1` all
+	// sailed past it, because the first three have no boundary where the digits
+	// begin and the last has a group the pattern refused to span.
+	//
+	// The result is asserted EXACTLY rather than by "does not contain", because
+	// the failure being fixed is a PARTIAL redaction: `1.2.3.4.5` became
+	// `<address>.5`, which neither removes the address nor leaves the text
+	// intact. A "no leak" assertion passes on that output happily.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: strings.Join([]string{
+			"#server=/x.cn/203.0.113.7 # Disabled: see1.2.3.4 v1.2.3.4 1.2.3.4here 1234.1.1.1 1.2.3.4.5",
+			"server=/kept.cn/203.0.113.7",
+		}, "\n"),
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	want := "# disabled upstream: see<address> v<address> <address>here <address> <address>"
+	if got.Comments[0] != want {
+		t.Fatalf("comment =\n%s\nwant\n%s", got.Comments[0], want)
+	}
+}
+
+func TestRedactionLeavesThreeGroupsAndBareNumbersAlone(t *testing.T) {
+	// The other half of the boundary: a three-group version and a bare number
+	// are not addresses. Redacting them would edit the upstream's prose for
+	// nothing, and `1.2.3` in the DOMAIN field is a legal name this converter
+	// is required to keep -- a label group is not an octet.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: "#server=/x.cn/203.0.113.7 # Disabled: build 1.2.3 and issue 391\nserver=/kept.cn/203.0.113.7\n",
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	want := "# disabled upstream: build 1.2.3 and issue 391"
+	if got.Comments[0] != want {
+		t.Fatalf("comment = %q, want a three-group version left intact: %q", got.Comments[0], want)
+	}
+}
+
 func TestADisabledLineThisConverterDoesNotDefineIsRefused(t *testing.T) {
 	// Review finding 2. A `#server=` line that is not a recognised disabled entry
 	// is upstream drifting in shape, and an active rule that drifts is a hard
@@ -321,14 +365,42 @@ func TestAnAddressShapedButInvalidAddressFieldIsRefused(t *testing.T) {
 	}
 }
 
-func TestADomainFieldThatIsAnAddressIsRefused(t *testing.T) {
+func TestADomainFieldThatIsAddressShapedIsRefused(t *testing.T) {
 	// `server=/1.2.3.4/...` would publish `domain:1.2.3.4`: an address in the
 	// list, reached through the field that is supposed to carry only names.
+	// Real upstream has none (measured: 0 of 111,288), but the constraint is
+	// that no address reaches a product, not that upstream has been well behaved
+	// so far.
+	//
+	// The predicate is ADDRESS-SHAPED, not PARSEABLE. netip refuses 999.1.1.1,
+	// 010.1.1.1 and 1.2.3.4.5, so a parse-based guard lets all three through
+	// into the published list -- which is the same argument that made the
+	// redaction shape-based, applied consistently here.
+	for _, field := range []string{"1.2.3.4", "999.1.1.1", "010.1.1.1", "999.999.999.999", "1.2.3.4.5"} {
+		t.Run(field, func(t *testing.T) {
+			fsys := chinaConfFS(map[string]string{
+				chinaConfPrimary: "server=/" + field + "/203.0.113.7\n",
+			})
+			if _, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary}); err == nil {
+				t.Fatalf("the domain field %q was published as a rule", field)
+			}
+		})
+	}
+}
+
+func TestAThreeGroupDomainFieldIsStillAPublishedRule(t *testing.T) {
+	// The other side of that predicate, so it cannot be tightened into refusing
+	// every dotted name: three groups is a legal name, not an address.
 	fsys := chinaConfFS(map[string]string{
-		chinaConfPrimary: "server=/1.2.3.4/203.0.113.7\n",
+		chinaConfPrimary: "server=/1.2.3/203.0.113.7\n",
 	})
-	if _, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary}); err == nil {
-		t.Fatal("an address in the domain field was published as a rule")
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	want := []string{"domain:1.2.3"}
+	if strings.Join(got.Expressions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("expressions = %v, want a three-group name published", got.Expressions)
 	}
 }
 
@@ -396,19 +468,26 @@ func TestAMissingEntryNamesTheEntryItCouldNotRead(t *testing.T) {
 }
 
 func TestAnEntryThatResolvesToNoRuleIsAFailure(t *testing.T) {
-	// An empty China set sends every query to the foreign branch, silently. The
-	// message is asserted as well as the failure, because that is the assertion
-	// that would have caught the per-entry gate comparing a running total: the
-	// error existed and was correct, it just described the wrong thing.
+	// An empty China set sends every query to the foreign branch, silently.
+	//
+	// The assertions reach the WORDING on purpose. Asserting only "no rules"
+	// certifies nothing: the misleading message this replaces also contains
+	// "no rules", so a check that stops there passes on the very text that
+	// describes the wrong thing -- which is exactly the half of round 1 that
+	// was not delivered. What differs is whose shortfall the message names:
+	// this entry's, not the whole set's.
 	fsys := chinaConfFS(map[string]string{chinaConfPrimary: "\n\n# nothing but a comment\n"})
 	_, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
 	if err == nil {
 		t.Fatal("an entry with no rules was accepted")
 	}
-	if !strings.Contains(err.Error(), "no rules") {
-		t.Fatalf("error = %v, want it to say the entry resolved to no rules", err)
-	}
 	if !strings.Contains(err.Error(), chinaConfPrimary) {
 		t.Fatalf("the failure does not name the entry: %v", err)
+	}
+	if !strings.Contains(err.Error(), "short of what the pin says") {
+		t.Fatalf("the failure does not name this entry's own shortfall: %v", err)
+	}
+	if strings.Contains(err.Error(), "empty China set") {
+		t.Fatalf("the failure blames the whole set rather than this entry: %v", err)
 	}
 }
