@@ -1,7 +1,6 @@
 package rules
 
 import (
-	"sort"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -68,6 +67,36 @@ func TestEveryEntryNamedIsConvertedAndTheyAreUnioned(t *testing.T) {
 	}
 }
 
+func TestAnEntryWhoseEveryRuleIsAlreadySeenIsStillAnEntryWithRules(t *testing.T) {
+	// Review finding 1. The old per-entry gate compared a running TOTAL against
+	// the count from before the entry, so an entry contributing nothing new read
+	// as an empty entry and aborted with "resolved to no rules, and an empty
+	// China set sends every query abroad" -- a sentence describing something
+	// that was not happening. This is not hypothetical: `qiao-cn.com` is in
+	// `accelerated-domains.china.conf:73926` AND `google.china.conf:85`, so the
+	// two files already collide on one domain, and the build survives today only
+	// because the other 111 google rules happen to be new. If upstream ever
+	// collapsed google.china.conf to its already-seen domains, the converter
+	// would refuse a source carrying 111,011 rules and send an operator hunting
+	// for an empty file. The count that decides must be the rules THIS entry
+	// states, not the expressions this entry adds.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary:    "server=/only-primary.cn/203.0.113.7\nserver=/shared.cn/203.0.113.7\n",
+		"google.china.conf": "server=/shared.cn/203.0.113.7\nserver=/shared.cn/198.51.100.9\n",
+		"apple.china.conf":  "server=/only-apple.cn/203.0.113.7\n",
+	})
+	got, err := ConvertChinaConfFS(fsys, ChinaConfEntries)
+	if err != nil {
+		t.Fatalf("an entry whose rules were all already seen was refused: %v", err)
+	}
+	// google.china.conf contributes two rules and zero new expressions. If the
+	// gate counted new expressions, this is the entry it would call empty.
+	want := []string{"domain:only-apple.cn", "domain:only-primary.cn", "domain:shared.cn"}
+	if strings.Join(got.Expressions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("expressions =\n%s\nwant\n%s", strings.Join(got.Expressions, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 func TestTwoSpellingsCollapseToTheOneRuleMOSDNSWillMatch(t *testing.T) {
 	// Case folding is neither this converter's policy nor a statistic's: it is
 	// the pinned matcher's. `SubDomainMatcher.Add` normalises every value it
@@ -75,10 +104,6 @@ func TestTwoSpellingsCollapseToTheOneRuleMOSDNSWillMatch(t *testing.T) {
 	// `domain:Example.CN` would publish bytes that differ from the rule that
 	// actually lands in the trie. One spelling is therefore one rule, and the
 	// spelling that survives is the one the matcher itself produces.
-	//
-	// The trap this case was written to close is real but lives upstream of the
-	// converter: a COUNT taken with a case-folding `sort -fu` is not this
-	// converter's count. Step 5 measures the exact string count.
 	fsys := chinaConfFS(map[string]string{
 		chinaConfPrimary: "server=/Example.CN/203.0.113.7\nserver=/example.cn/203.0.113.7\n",
 	})
@@ -89,9 +114,6 @@ func TestTwoSpellingsCollapseToTheOneRuleMOSDNSWillMatch(t *testing.T) {
 	want := []string{"domain:example.cn"}
 	if strings.Join(got.Expressions, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("expressions =\n%s\nwant\n%s", strings.Join(got.Expressions, "\n"), strings.Join(want, "\n"))
-	}
-	if !sort.StringsAreSorted(got.Expressions) {
-		t.Fatalf("expressions %v are not sorted, and the published list has to be byte-deterministic", got.Expressions)
 	}
 }
 
@@ -116,6 +138,29 @@ func TestNormalizeChinaDomainFoldsWithThePinnedMatcherAndRefusesWhatItCannotMatc
 	}
 }
 
+func TestTheProducedListIsSortedWhateverOrderUpstreamStatesItIn(t *testing.T) {
+	// Byte-determinism is a property of the PUBLISHED file, which carries 111k
+	// lines, so it is pinned here over a slice that can actually be out of order.
+	// (A one-element slice is sorted by definition, so a sortedness assertion on
+	// one would assert nothing.)
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: strings.Join([]string{
+			"server=/zulu.cn/203.0.113.7",
+			"server=/alpha.cn/203.0.113.7",
+			"server=/mike.cn/203.0.113.7",
+			"server=/bravo.cn/203.0.113.7",
+		}, "\n"),
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	want := []string{"domain:alpha.cn", "domain:bravo.cn", "domain:mike.cn", "domain:zulu.cn"}
+	if strings.Join(got.Expressions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("expressions =\n%s\nwant\n%s", strings.Join(got.Expressions, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 func TestADisabledEntryBecomesACommentAndNeverARule(t *testing.T) {
 	fsys := chinaConfFS(map[string]string{
 		chinaConfPrimary: "#server=/ax1x.com/203.0.113.7 # Disabled: https://example.test/issues/391\nserver=/kept.cn/203.0.113.7\n",
@@ -137,6 +182,111 @@ func TestADisabledEntryBecomesACommentAndNeverARule(t *testing.T) {
 	}
 }
 
+func TestAReasonThatIsFreeTextIsKeptReadable(t *testing.T) {
+	// A reason is prose, not a URL: the real source carries five links (one with
+	// a `#fragment`) and one bare `very unstable`. Refusing or mangling either
+	// would lose the upstream's own record of why it dropped a domain.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: strings.Join([]string{
+			"#server=/a.cn/203.0.113.7 # Disabled: https://example.test/commit/abc#r31928598",
+			"#server=/b.cn/203.0.113.7 # Disabled: very unstable",
+			"server=/kept.cn/203.0.113.7",
+		}, "\n"),
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	want := []string{
+		"# disabled upstream: https://example.test/commit/abc#r31928598",
+		"# disabled upstream: very unstable",
+	}
+	if strings.Join(got.Comments, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("comments =\n%s\nwant\n%s", strings.Join(got.Comments, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestAReasonThatNamesAnAddressLosesTheAddressAndKeepsTheRest(t *testing.T) {
+	// Review finding 3, comment half. The reason is copied into the PUBLISHED
+	// list, so an address inside it is an address in a product.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: "#server=/x.cn/203.0.113.7 # Disabled: point at 114.114.114.114 instead\nserver=/kept.cn/203.0.113.7\n",
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	rendered := strings.Join(got.Comments, "\n")
+	if strings.Contains(rendered, "114.114.114.114") {
+		t.Fatalf("the comment kept the upstream address: %q", rendered)
+	}
+	want := "# disabled upstream: point at <address> instead"
+	if rendered != want {
+		t.Fatalf("comment = %q, want the reason kept with only the address replaced: %q", rendered, want)
+	}
+}
+
+func TestAReasonNamingAnAddressShapedButInvalidValueLosesItToo(t *testing.T) {
+	// The redaction asks "does this read as an address", not "does Go parse it":
+	// `010.1.1.1` is refused by netip and is still unmistakably an address to
+	// both the gate and a human reading the log.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: "#server=/x.cn/203.0.113.7 # Disabled: see 010.1.1.1 and 999.1.1.1\nserver=/kept.cn/203.0.113.7\n",
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	rendered := strings.Join(got.Comments, "\n")
+	for _, leaked := range []string{"010.1.1.1", "999.1.1.1"} {
+		if strings.Contains(rendered, leaked) {
+			t.Fatalf("an address-shaped value reached the comment: %q", rendered)
+		}
+	}
+}
+
+func TestADisabledLineThisConverterDoesNotDefineIsRefused(t *testing.T) {
+	// Review finding 2. A `#server=` line that is not a recognised disabled entry
+	// is upstream drifting in shape, and an active rule that drifts is a hard
+	// failure. It must not fall through to the generic comment skip: that loses
+	// the reason silently, so upstream could rewrite its disabled entries one
+	// character at a time and the published list would lose them without one
+	// failure. Each line below is a shape this converter does NOT define.
+	for name, line := range map[string]string{
+		"a space after the hash": "# server=/x.cn/203.0.113.7 # Disabled: reason two",
+		"a lowercased keyword":   "#server=/x.cn/203.0.113.7 #disabled: reason three",
+		"no second hash":         "#server=/x.cn/203.0.113.7 Disabled: reason four",
+		"an empty reason":        "#server=/x.cn/203.0.113.7 # Disabled:",
+		"a non-numeric address":  "#server=/x.cn/hostname # Disabled: reason six",
+	} {
+		t.Run(name, func(t *testing.T) {
+			fsys := chinaConfFS(map[string]string{
+				chinaConfPrimary: "server=/kept.cn/203.0.113.7\n" + line + "\n",
+			})
+			_, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+			if err == nil {
+				t.Fatalf("a disabled line this converter does not define was accepted: %q", line)
+			}
+		})
+	}
+}
+
+func TestACommentThatIsNotARemovedRuleIsStillSkipped(t *testing.T) {
+	// The sibling of the case above: refusing every `#` line would refuse the
+	// pinned source itself, whose google.china.conf opens with two prose headers.
+	fsys := chinaConfFS(map[string]string{
+		"google.china.conf": "# Google Corp aka ÜberProxy domains\n# Other corp related domain\nserver=/dl.google.com/203.0.113.7\n",
+	})
+	got, err := ConvertChinaConfFS(fsys, []string{"google.china.conf"})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	want := []string{"domain:dl.google.com"}
+	if strings.Join(got.Expressions, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("expressions = %v, want %v", got.Expressions, want)
+	}
+}
+
 func TestAnUnrecognisedLineIsAConversionFailure(t *testing.T) {
 	for name, body := range map[string]string{
 		"a bare domain":     "example.cn\n",
@@ -151,6 +301,79 @@ func TestAnUnrecognisedLineIsAConversionFailure(t *testing.T) {
 				t.Fatalf("a line this converter does not define was accepted: %q", body)
 			}
 		})
+	}
+}
+
+func TestAnAddressShapedButInvalidAddressFieldIsRefused(t *testing.T) {
+	// `[0-9.]+` admits IPv4-SHAPED text that is not an address, so this branch is
+	// reachable from the grammar rather than defensive. netip refuses all four:
+	// value > 255, too long, leading zero, too short.
+	for _, field := range []string{"999.1.1.1", "1.2.3.4.5", "010.1.1.1", "1.2.3"} {
+		t.Run(field, func(t *testing.T) {
+			fsys := chinaConfFS(map[string]string{
+				chinaConfPrimary: "server=/example.cn/" + field + "\n",
+			})
+			_, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+			if err == nil {
+				t.Fatalf("an address field of %q was accepted as a rule", field)
+			}
+		})
+	}
+}
+
+func TestADomainFieldThatIsAnAddressIsRefused(t *testing.T) {
+	// `server=/1.2.3.4/...` would publish `domain:1.2.3.4`: an address in the
+	// list, reached through the field that is supposed to carry only names.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: "server=/1.2.3.4/203.0.113.7\n",
+	})
+	if _, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary}); err == nil {
+		t.Fatal("an address in the domain field was published as a rule")
+	}
+}
+
+func TestAnUnrecognisedLineIsReportedByShapeAndNotByEchoingIt(t *testing.T) {
+	// Review finding 3, error half. The old message was
+	// `not a rule this converter defines: %q` with the whole line, so the address
+	// reached the build log. `chinesePublicDNSAddresses` scans rendered
+	// documents, not build output, so nothing catches this. The operator still
+	// gets what they need: which entry, which line, and the shape that was
+	// expected.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: "server=/a.cn/203.0.113.7\nserver=/b.cn/114.114.114.114 junk\n",
+	})
+	_, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err == nil {
+		t.Fatal("an unrecognised line was accepted")
+	}
+	if strings.Contains(err.Error(), "114.114.114.114") {
+		t.Fatalf("the failure echoed the offending line, address and all: %v", err)
+	}
+	// The shape is spelled out here rather than read from the constant the
+	// message is built from: a constant that can be edited to match a regression
+	// would let this case pass on exactly the failure it exists to catch.
+	for _, want := range []string{chinaConfPrimary, ":2", "server=/<domain>/<address>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the failure does not name %q: %v", want, err)
+		}
+	}
+}
+
+func TestAFailureAboutTheAddressFieldDoesNotEchoIt(t *testing.T) {
+	// The sibling leak: the old message was `%q is not an IPv4 address: %w`
+	// around a netip error, and netip's own message quotes the value back.
+	fsys := chinaConfFS(map[string]string{
+		chinaConfPrimary: "server=/example.cn/010.1.1.1\n",
+	})
+	_, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err == nil {
+		t.Fatal("an invalid address field was accepted")
+	}
+	if strings.Contains(err.Error(), "010.1.1.1") {
+		t.Fatalf("the failure echoed the address field: %v", err)
+	}
+	if !strings.Contains(err.Error(), chinaConfPrimary) {
+		t.Fatalf("the failure does not name the entry: %v", err)
 	}
 }
 
@@ -173,9 +396,19 @@ func TestAMissingEntryNamesTheEntryItCouldNotRead(t *testing.T) {
 }
 
 func TestAnEntryThatResolvesToNoRuleIsAFailure(t *testing.T) {
-	// An empty China set sends every query to the foreign branch, silently.
+	// An empty China set sends every query to the foreign branch, silently. The
+	// message is asserted as well as the failure, because that is the assertion
+	// that would have caught the per-entry gate comparing a running total: the
+	// error existed and was correct, it just described the wrong thing.
 	fsys := chinaConfFS(map[string]string{chinaConfPrimary: "\n\n# nothing but a comment\n"})
-	if _, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary}); err == nil {
+	_, err := ConvertChinaConfFS(fsys, []string{chinaConfPrimary})
+	if err == nil {
 		t.Fatal("an entry with no rules was accepted")
+	}
+	if !strings.Contains(err.Error(), "no rules") {
+		t.Fatalf("error = %v, want it to say the entry resolved to no rules", err)
+	}
+	if !strings.Contains(err.Error(), chinaConfPrimary) {
+		t.Fatalf("the failure does not name the entry: %v", err)
 	}
 }
