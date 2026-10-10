@@ -254,20 +254,34 @@ def routing_rules(**overrides):
         # second upstream is the one this cell cannot reach, and the section under
         # test reads it back out of here rather than trusting the policy.
         "rendered_document": rendered_document(),
-        # **And the router's log naming that upstream.** This is the only evidence
-        # in the cell that the dead upstream was asked at all: nothing receives
-        # those queries, so no counter reports them, and mosdns logs a Warn per
-        # failure. A log without this line is the `concurrent: 1` configuration,
-        # which is the one the section exists to be different from.
+        # **AND THE ROUTER'S OWN JOURNAL, WHICH IS A DIFFERENT MACHINE.**
+        # This is the only evidence in the cell that the dead upstream was asked
+        # at all: nothing receives those queries, so no counter reports them, and
+        # mosdns logs a Warn per failed exchange.
+        #
+        # **It is a `journalctl` of `mosdns-router.service` inside the TARGET, and
+        # it was not always.** The fixture used to append this line to
+        # `router_log` -- dnsmasq's log, in the MOCK ROUTER container -- and the
+        # scenario read the mock router's log to look for it, so the two agreed
+        # and the cell was green. They agreed on a machine that cannot exist:
+        # dnsmasq is the domestic branch's resolver and is never sent a mosdns
+        # upstream address, so no run of this cell ever produced this line in
+        # that log. MEASURED, 24.04, from the artifact a live run wrote:
+        # `router_log_for_upstreams` held 13720 characters of dnsmasq output and
+        # not one of mosdns. A fixture that shares the code's wrong model is a
+        # gate that reads as coverage while measuring nothing -- the same defect
+        # the ACL fixture carried in the last matrix run.
+        "router_journal": "",
     }
     # Read from `overrides`, NOT from `answers`: the flag decides what goes INTO the
-    # router log, and the log is built before `answers.update(overrides)` runs. A
-    # first version popped it out of `answers`, which held the default, so
+    # router journal, and the journal is built before `answers.update(overrides)`
+    # runs. A first version popped it out of `answers`, which held the default, so
     # `dead_upstream_warned=False` was applied after the log had already been written
     # -- and the case that exists to prove the cell refuses a router that never tried
     # the second upstream passed against a fixture that always added the line.
     if overrides.pop("dead_upstream_warned", True):
-        answers["router_log"] = answers["router_log"] + (
+        answers["router_journal"] = (
+            "Oct 04 00:00:00 target mosdns-router[612]: "
             "2026-10-04T00:00:00.000+0800\tWARN\tforeign_forward\tupstream error"
             f'\t{{"upstream": "{routing.SECOND_UPSTREAM}", "error": "context deadline exceeded"}}\n'
         )
@@ -312,6 +326,14 @@ def routing_rules(**overrides):
         {"match": ["exec", TARGET, "cat", "/etc/mosdns/mosdns.yaml"],
          "stdout": answers["rendered_document"]},
         {"match": ["logs", ROUTER], "stdout": answers["router_log"]},
+        # **The router's own journal, in the target, and a separate machine from
+        # the line above.** `mosdns-router.service` runs inside the target, so the
+        # log that names a mosdns upstream is the target's journal. Kept as its
+        # own rule and its own answer so a case can make the mock router's log
+        # and the router's journal disagree -- which is exactly what a live cell
+        # does, and what the fixture used to refuse to represent.
+        {"match": ["exec", TARGET, "journalctl", "-u", "mosdns-router.service"],
+         "stdout": answers["router_journal"]},
         # -- what the answers were, read from inside the target -------------
         {"match": ["exec", TARGET, "cat", routing.PUBLISHED_CN_LIST],
          "stdout": answers["published_cn"]},
@@ -1871,7 +1893,7 @@ class ADeadSecondUpstreamStillAnswersTest(RoutingScenarioHarness):
         Asserting only "the query succeeded" would pass against a document with ONE
         upstream -- and one upstream is exactly the configuration this change moves
         away from. So the record has to say the second upstream was dialled, and the
-        only thing in this cell that can say it is the router's own log.
+        only thing in this cell that can say it is the router's own journal.
         """
         _fake, result = self.run_scenario()
         record = self.record(result)
@@ -1882,8 +1904,50 @@ class ADeadSecondUpstreamStillAnswersTest(RoutingScenarioHarness):
             "was added to measure",
         )
         self.assertIn(
-            routing.SECOND_UPSTREAM, record.get("router_log_for_upstreams", ""),
+            routing.SECOND_UPSTREAM, record.get("router_journal_for_upstreams", ""),
             "the record says the upstream was tried but carries no log line naming it",
+        )
+
+    def test_the_dead_upstream_evidence_is_the_router_s_own_journal_and_not_the_mock_s(self):
+        """**The container, and it is what made every cell of this matrix fail.**
+
+        The section under test asks whether the foreign branch dialled an upstream
+        it could not reach. The line that answers that is mosdns's own: upstream
+        MOSDNS's `forward` plugin logs `upstream error` with `upstream=<addr>` on
+        every failed exchange, and `mosdns-router.service` runs INSIDE the target.
+
+        The first version of this read `podman logs` of the MOCK ROUTER -- dnsmasq,
+        the domestic branch's resolver, which is never sent a mosdns upstream
+        address and therefore can never log one. MEASURED on a live 24.04 cell,
+        from the artifact the run wrote: 13720 characters of dnsmasq output
+        standing in for the evidence, on all three releases.
+
+        So the gate is on WHERE the line came from, and the fixture behind it is
+        what makes the gate bite: the dnsmasq log in this table carries no mosdns
+        line, and the target's journal carries it. A fixture that put the line in
+        both places would let the wrong read keep passing.
+        """
+        fake, result = self.run_scenario()
+        self.assertEqual(
+            result.status, "passed",
+            f"the routing cell reported {result.status}: {result.detail}",
+        )
+        asked = "\n".join(
+            " ".join(argv[2:])
+            for argv in fake.invocations()
+            if argv[:2] == ["exec", TARGET]
+        )
+        self.assertIn(
+            "journalctl -u mosdns-router.service", asked,
+            "the scenario never asked the target for the router's own journal, so the dead "
+            "upstream is still being looked for somewhere that cannot report it",
+        )
+        record = self.record(result)
+        self.assertNotIn(
+            "dnsmasq", record.get("router_journal_for_upstreams", ""),
+            "the recorded dead-upstream evidence is dnsmasq output, which is the mock router's "
+            "log rather than the router's: dnsmasq answers the domestic branch and is never "
+            "sent a mosdns upstream address",
         )
 
     def test_the_installed_document_must_name_both_upstreams(self):

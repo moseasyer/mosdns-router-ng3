@@ -993,18 +993,36 @@ def build_scenario(
                 "something else entirely -- so the cell says so rather than passing on "
                 "a configuration it did not set out to test",
             )
-            document["router_log_for_upstreams"] = router_log(podman, router)
-            tried_dead_one = SECOND_UPSTREAM in document["router_log_for_upstreams"]
+            # **THE TARGET'S OWN JOURNAL, and the container is the whole of what was
+            # wrong here.** MEASURED on a live 24.04 cell, from the artifact the run
+            # wrote: `router_log_for_upstreams` held 13720 characters of dnsmasq
+            # output from the MOCK ROUTER and not one character of mosdns. dnsmasq
+            # is the domestic side; it cannot log an upstream of mosdns's foreign
+            # branch, because it never sees one. The line that names the dead
+            # upstream is mosdns's own -- `forward` logs `upstream error` with
+            # `upstream=<addr>` on every failed exchange -- and
+            # `mosdns-router.service` runs INSIDE the target, so its log is the
+            # target's journal and nowhere else.
+            #
+            # So this read names the unit rather than a container, which is what
+            # makes it the only thing in this cell that can answer the question.
+            document["router_journal_for_upstreams"] = try_read(
+                target, "journalctl", "-u", "mosdns-router.service",
+                "-b", "--no-pager", "-n", "200",
+            )
+            tried_dead_one = SECOND_UPSTREAM in document["router_journal_for_upstreams"]
             document["dead_upstream_was_tried"] = tried_dead_one
             _require(
                 tried_dead_one,
-                "the router's log does not mention "
-                f"{SECOND_UPSTREAM} at all. The document names that upstream and "
+                f"the journal of mosdns-router.service does not mention {SECOND_UPSTREAM} at all. "
+                "The document names that upstream and "
                 "`concurrent: 2` asks two of them per query, so it must have been dialled and "
                 "must have failed -- and this cell has no route off its bridge, so a failure is "
                 "expected. A log that never names it means the second upstream was not asked, "
                 "which is the configuration `concurrent: 1` produces and the one this cell "
-                "exists to be different from",
+                "exists to be different from. The mock router's log is NOT the place to look "
+                "for this and never was: it is dnsmasq, it answers the domestic branch, and it "
+                "is never sent a mosdns upstream address at all",
             )
             # And the query that raced it still succeeded -- which is the claim.
             # It is asked AFTER the counters above are read, so its arrival cannot be
