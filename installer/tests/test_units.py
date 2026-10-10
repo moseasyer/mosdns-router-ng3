@@ -556,10 +556,36 @@ UNIT_DIRECTIVES = {
         + SANDBOX
         + (
             # AF_UNIX for the D-Bus connection the action makes to
-            # NetworkManager, AF_INET for the probe. The health check's list
-            # exactly: no interface is enumerated and no netlink socket is
-            # opened.
-            ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"),
+            # NetworkManager, AF_INET for the probe, and AF_NETLINK because the
+            # action cannot do its job without it. This line did NOT have it, and
+            # the comment it used to carry -- "The health check's list exactly: no
+            # interface is enumerated and no netlink socket is opened" -- is what
+            # hid that. The comment was true of `verify-local`, which probes
+            # 127.0.0.1:53 and names no interface, and false of the action, which
+            # runs the rollback.
+            #
+            # MEASURED, real targets, the rollback's own read under this exact
+            # sandbox, `resolvectl dns <link>` against a link that exists and
+            # holds no DNS of its own:
+            #
+            #     24.04  rc=0  "Link 2 (ens33):"
+            #     26.04  rc=1  "Failed to resolve interface \"ens33\": Address
+            #                          family not supported by protocol"
+            #
+            # 26.04's resolvectl turns an interface NAME into a link over
+            # netlink, and socket(AF_NETLINK, ...) under a family list without
+            # that name fails EAFNOSUPPORT. The refusal goes to stderr while
+            # stdout stays empty, and `_text` reads stdout -- so the rollback saw
+            # a read that produced nothing, took it as "a link that exists is
+            # always printed, so this read did not happen", and refused at exit
+            # 6 with the connection still partly as this package left it and the
+            # units it installs still running. The read is right and the
+            # sandbox was wrong: adding AF_NETLINK to this list is what makes the
+            # identical command print `Link 2 (ens33):` on 26.04, also measured.
+            #
+            # The same grant, for the same reason, is already on dnscrypt-proxy's
+            # list above.
+            ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6 AF_NETLINK"),
             # Exactly one directory, the record's OWN 0700 root:root
             # subdirectory rather than /run/mosdns -- which is group-writable by
             # design, and a 0600 file inside a group-writable directory is still

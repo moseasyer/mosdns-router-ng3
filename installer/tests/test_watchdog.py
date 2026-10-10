@@ -2813,6 +2813,17 @@ class UnitAgreementTests(unittest.TestCase):
                 # ABSENCE is asserted in the case below rather than left to this
                 # one skipping it.
                 "SuccessExitStatus",
+                # And the one directive where this unit's work is NOT the health
+                # check's work. The health unit runs `verify-local`, which probes
+                # 127.0.0.1:53 and names no interface; this unit runs the
+                # rollback, which ends by asking `resolvectl dns <device>`
+                # whether the connection put the recorded values on the link, and
+                # on 26.04 that read needs netlink. Excluding it here does not
+                # leave it unpinned -- the very next test pins it as EXACTLY the
+                # health list plus AF_NETLINK, so a second divergence still fails
+                # and a removal still fails. What is forbidden here is only the
+                # rest of the shape growing its own answer.
+                "RestrictAddressFamilies",
             ):
                 continue
             with self.subTest(directive=key):
@@ -2822,6 +2833,45 @@ class UnitAgreementTests(unittest.TestCase):
                     f"{WATCHDOG_UNIT} does not carry the health unit's {key}, so it has a "
                     "hardening shape of its own",
                 )
+
+    def test_its_address_families_are_the_health_check_s_and_the_one_its_action_needs(self):
+        # The divergence the gate above excludes, pinned exactly, so excluding it
+        # there costs nothing.
+        #
+        # This unit's action is not the health check's command. `verify-local`
+        # probes 127.0.0.1:53 and names no interface; `emergency-rollback` ends
+        # by asking `resolvectl dns <device>` whether the connection took the
+        # values that were just put back, and that read resolves an interface
+        # NAME to a link. Measured, under this unit's own sandbox, against a link
+        # that exists and holds no DNS of its own:
+        #
+        #     24.04  rc=0  "Link 2 (ens33):"
+        #     26.04  rc=1  "Failed to resolve interface \"ens33\": Address family
+        #                          not supported by protocol"
+        #
+        # Without AF_NETLINK the 26.04 read fails EAFNOSUPPORT, complains on
+        # stderr and prints nothing on stdout -- and `_text` reads stdout, so the
+        # rollback read silence, called it a read that did not happen, and
+        # refused at exit 6 with the connection still partly as this package left
+        # it. Measured on a real 26.04 target, the shipped value answering the
+        # same command `rc=0  "Link 2 (ens33):"`.
+        #
+        # So the addition is required, and it is the ONLY one: the rest of the
+        # list is the health unit's, token for token, in the same order. A second
+        # family added later, or this one dropped, fails here.
+        health = _unit_sections(
+            (UNIT_DIR / "mosdns-cdn-health.service").read_text(encoding="utf-8")
+        )
+        inherited = health["Service"]["RestrictAddressFamilies"].split()
+        got = self.service()["Service"]["RestrictAddressFamilies"].split()
+        self.assertEqual(
+            got,
+            inherited + ["AF_NETLINK"],
+            f"{WATCHDOG_UNIT}'s address families are the health check's plus the one "
+            "AF_NETLINK its rollback's resolvectl read is measured to need on 26.04, "
+            "and nothing else: a second addition or a removal is a privilege "
+            "decision this gate has no measurement for",
+        )
 
     def test_the_unit_text_says_why_no_verdict_exits_zero(self):
         # The two statuses differ, so the difference has to be findable from the

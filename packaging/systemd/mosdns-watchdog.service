@@ -167,9 +167,28 @@ RestrictSUIDSGID=true
 SystemCallArchitectures=native
 
 # AF_UNIX for the D-Bus connection to NetworkManager that `emergency-rollback`
-# makes, AF_INET for the probe. No interface is enumerated and no netlink socket
-# is opened, so this is the health check's list exactly.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# makes, AF_INET for the probe, and AF_NETLINK for the action's own read.
+#
+# The third one was missing, and the comment that used to sit here -- "No
+# interface is enumerated and no netlink socket is opened" -- is what hid it.
+# That is true of `verify-local`, which the health check runs and which probes
+# 127.0.0.1:53 without naming an interface. It is false of this unit's action:
+# the rollback ends by asking `resolvectl dns <device>` whether the connection
+# put the recorded values on the link, and 26.04's resolvectl turns an interface
+# NAME into a link over netlink. Measured, under this exact sandbox, against a
+# link that exists and holds no DNS of its own:
+#
+#     24.04  rc=0  "Link 2 (ens33):"
+#     26.04  rc=1  "Failed to resolve interface \"ens33\": Address family not
+#                          supported by protocol"
+#
+# socket(AF_NETLINK, ...) with the family missing from this list fails
+# EAFNOSUPPORT, the complaint goes to stderr, and stdout stays empty -- so the
+# rollback read silence, treated it as a read that did not happen, and refused
+# at exit 6 with the connection still partly as this package left it and the
+# units this package installs still running. On a machine whose DNS has already
+# died, that is the worst place this package can add a refusal.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 # Exactly one directory, and it is the one the failure record lives in: its own,
 # 0700 root:root subdirectory rather than /run/mosdns itself. /run/mosdns is
