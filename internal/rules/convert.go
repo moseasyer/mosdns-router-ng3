@@ -467,3 +467,16 @@ func validateRenderedRule(expression string) error {
 	}
 	return nil
 }
+
+// NormalizeChinaDomain 返回一个可以被 MOSDNS 匹配的域名,或空串。
+//
+// 它用的是 pinned matcher 自己的 NormalizeDomain —— ToLower 然后 TrimDot ——
+// 而不是重述一遍,所以上游归一化方式改变时这道闸门跟着变。调用方随后自己
+// 用 validDomainName 判定标签规则,这样"能不能匹配"和"匹配成什么"分开问。
+func NormalizeChinaDomain(name string) string {
+	normalized := mosdnsdomain.NormalizeDomain(name)
+	if normalized == "" || !validDomainName(normalized) {
+		return ""
+	}
+	return normalized
+}
