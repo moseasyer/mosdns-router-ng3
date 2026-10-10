@@ -2372,18 +2372,48 @@ class TheMockRouterLogsTheQueriesTest(unittest.TestCase):
                     "does is no longer documented where the parser is",
                 )
         # And the parser's own documented line shape is the shape this dnsmasq
-        # prints, which is asserted against dnsmasq(1)'s format rather than
-        # against a log line copied out of a run: `log-queries` prints one line
-        # per query as `<timestamp> <host> <client> <name> is <answer>`, and a
-        # query with no answer carries `reply to` instead.
+        # prints, which is asserted against a real run of this harness's own
+        # image rather than against dnsmasq(1)'s format written down from
+        # memory.
+        #
+        # **THESE MARKERS CHANGED, and the old two were a fiction.** They were
+        # `reply to` and `is 1.2.3.4`, on the belief that "`log-queries` prints
+        # one line per query as `<timestamp> <host> <client> <name> is <answer>`,
+        # and a query with no answer carries `reply to` instead". dnsmasq does not
+        # print `reply to` at all, and on this harness it prints neither shape:
+        # the timestamp and the hostname come from syslog, and a container has
+        # none, which is the only reason `log-facility=-` is set. MEASURED,
+        # dnsmasq 2.91 in this harness's mock-router image, four queries from
+        # another container over the bridge:
+        #
+        #     dnsmasq[1]: query[A] install-probe.example from 10.88.0.5
+        #     dnsmasq[1]: config error is REFUSED (EDE: not ready)
+        #     dnsmasq[1]: query[AAAA] api.cloudflare.com from 10.88.0.5
+        #     dnsmasq[1]: config error is REFUSED (EDE: not ready)
+        #
+        # `router_queries` had already been corrected onto exactly that shape --
+        # its docstring records the old one counting `{"error": 6} -- and this
+        # gate was left demanding the discarded markers, so it read as a gate
+        # against the parser while opposing it.
+        #
+        # The three below are the shape the parser keys on AND the neighbour it
+        # must not count: `query[A] probe.` is the per-name counter's own line,
+        # `query[AAAA]` proves the type bracket is part of the one token, and
+        # `config error is REFUSED` is the line whose field before the old
+        # marker was the word `error`.
         parser = (SCENARIOS / "routing_test.py").read_text(encoding="utf-8")
-        for marker in ("reply to", "is 1.2.3.4"):
+        for marker in (
+            "query[A] probe.",
+            "query[AAAA]",
+            "config error is REFUSED",
+        ):
             with self.subTest(marker=marker):
                 self.assertIn(
                     marker, parser,
-                    "the parser's documented dnsmasq line shape has changed; `log-queries` output "
-                    "is what it recognises a query by, and a shape this file no longer names is a "
-                    "shape it cannot be reading",
+                    "the parser's documented dnsmasq line shape has changed; `log-queries` "
+                    "output is what it recognises a query by, and a shape this file no longer "
+                    "names is a shape it cannot be reading. The real shape was measured on this "
+                    "harness's own image and is in the comment above",
                 )
         # The key without a value is what enables the option, so a case that
         # accepted `log-queries=0` would pass on a config that logs nothing.
