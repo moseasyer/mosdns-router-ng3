@@ -77,12 +77,54 @@ INSTALL_PROBE_NAME = "install-probe.example"
 ROUTER_UNIT = "mosdns-router.service"
 WATCHDOG_UNIT = "mosdns-watchdog.service"
 WATCHDOG_TIMER = "mosdns-watchdog.timer"
+
+# The two ways an install transaction can end, as ONE CONSTANT EACH, and the
+# prose for each, as a LOOKUP rather than as an if/else.
+#
+# This started as an if/else that built the prose inline and a gate that searched
+# the result for the substring `configured` -- which is present in BOTH shapes,
+# because the refused one said "NOT configured". So the gate fired on cells that
+# had done nothing wrong. The second attempt parsed the prose back apart to find
+# the outcome, which is the same mistake wearing more code.
+#
+# **A lookup makes the pairing impossible to get wrong instead of checking it
+# afterwards.** There is exactly one prose per outcome and the code cannot choose
+# the other branch's, so the failure mode this gate was invented to catch cannot
+# be written. What is left is that the document records which outcome it used.
+#
+# The refused half carries its barrier with it, so a reader of the document is
+# not sent to look for a network problem this cell does not have.
 LOCAL_DNS = "127.0.0.1"
 DNS_PORT = 53
 # The resolver's own port, named because the transaction's barrier message
 # quotes it and a barrier that is named by a literal in two places is a barrier
 # one of them will forget.
 RESOLVER_PORT = 15353
+TRANSACTION_COMPLETED = "the transaction COMPLETED"
+TRANSACTION_REFUSED = "the transaction REFUSED"
+
+TRANSACTION_PROSE = {
+    TRANSACTION_COMPLETED: (
+        "postinst ran to completion on this target. It was reached because a foreign answer WAS "
+        "reachable -- the mock foreign resolver on this run's private network answered the "
+        "resolver's own start-up probe, which is the barrier that refuses on a cell with no "
+        "route at all. Everything this scenario observes is therefore installed and present, "
+        "`postinst`'s timer-enable path HAS run, and the timers are enabled; the watchdog timer "
+        "is stopped below so the probes this scenario reads are its own."
+    ),
+    TRANSACTION_REFUSED: (
+        "at the resolver's own start-up barrier -- dnscrypt-proxy was started and nothing "
+        f"answered a DNS query at 127.0.0.1:{RESOLVER_PORT} within 60s, because without a route to "
+        "a DNSCrypt server the transaction's wait for it runs out and it rolls itself back. It is "
+        "NOT the range origin: the transaction publishes the Cloudflare prefix list from the pinned "
+        "snapshot the package ships (`ranges-source: pinned-snapshot`), which needs no network at "
+        "all. Everything this scenario observes was unpacked and is present; the timer was never "
+        "enabled by postinst, so the service is started by hand and postinst's enable path is NOT "
+        "exercised here. dpkg's exact word for a refused state is measured per run rather than "
+        "asserted: it has been observed as both `unpacked` and `half-configured` depending on how "
+        "far dpkg's state machine got before postinst exited."
+    ),
+}
 RESOLVED_STUB = "127.0.0.53"
 # The device the bridge gives a target and the profile the image's own setup unit
 # created for it. The profile is named here rather than read from the target: on
@@ -669,34 +711,37 @@ def build_scenario(
             # word is recorded either way.
             configured = document["package_state"] in ("installed", "install ok installed")
             document["package_configured"] = configured
-            document["package_state_explained"] = (
-                f"{document['package_state']!r}, NOT configured: postinst exits 1 when the install "
-                "transaction refuses, and it refuses in this matrix at the resolver's own start-up "
-                "barrier -- dnscrypt-proxy was started and nothing answered a DNS query at "
-                f"127.0.0.1:{RESOLVER_PORT} within 60s, because without a route to a DNSCrypt server "
-                "the transaction's wait for it runs out and it rolls itself back. "
-                "It is NOT the range origin: the transaction publishes the Cloudflare prefix list from "
-                "the pinned snapshot the package ships (`ranges-source: pinned-snapshot`), which needs "
-                "no network at all. Everything this scenario observes was unpacked and is present; the "
-                "timer was never enabled by postinst, so the service is started by hand and postinst's "
-                "enable path is NOT exercised here. (dpkg's exact word for this state is measured "
-                "per run rather than asserted: it has been observed as both `unpacked` and "
-                "`half-configured` depending on how far dpkg's state machine got.)"
-            )
+            outcome = TRANSACTION_COMPLETED if configured else TRANSACTION_REFUSED
             _require(
-                not configured,
-                f"the package is {document['package_state']!r} and this scenario's evidence document "
-                "claims a cell that tested an installed package. Either the transaction succeeded "
-                "in this cell -- in which case that text is wrong and must be rewritten -- or it "
-                "did not, and the state is what this scenario documents. The dpkg exit was "
-                f"{document['dpkg_exit']} and dpkg's own output is in this document:\n"
-                f"{document['dpkg_output']}",
+                outcome in TRANSACTION_PROSE,
+                f"the transaction outcome {outcome!r} has no prose, so the document would say "
+                "nothing about the machine it was measured on. That is a harness fault rather "
+                f"than a routing result. dpkg recorded {document['package_state']!r} and its own "
+                f"output is in this document:\n{document['dpkg_output']}",
+            )
+            # **DESCRIBES WHAT MEASURED, and this used to assert a shape instead.**
+            # The first version said "NOT configured" and then REQUIRED not
+            # configured. That was a cell-shaped claim, and the cell changed:
+            # `b236aaf` fixed the preflight's ACL requirement and the cell started
+            # a mock foreign resolver, and together they made the transaction
+            # COMPLETE. MEASURED, run FIXVERIFY, all three releases:
+            #
+            #     dpkg_exit = 0   package_state = installed   install ok installed
+            #
+            # so the scenario failed on a cell that had done the right thing. What
+            # the watchdog actually depends on is NOT which of the two happened --
+            # it is that the machine holds a record to restore, which step 5
+            # establishes idempotently either way. So the outcome is measured,
+            # described, and held against the description rather than demanded.
+            document["transaction_outcome"] = outcome
+            document["package_state_explained"] = (
+                f"{document['package_state']!r}. {outcome} {TRANSACTION_PROSE[outcome]}"
             )
             _require(
                 "ok " in document["package_unpacked"],
-                f"dpkg reports {document['package_unpacked']!r}, which is not one of the "
-                "unpacked-but-not-configured states this scenario is written for, so what it "
-                "observed is not what it says it observed",
+                f"dpkg reports {document['package_unpacked']!r}, which is not one of the states "
+                "this scenario knows how to describe, so what it observed is not what it says it "
+                "observed",
             )
 
             for path in (INSTALLER, CDNCTL, SETTING_PATH):
@@ -710,15 +755,41 @@ def build_scenario(
 
             # -- 3. the units the package installed, as the machine sees them --
             # Read through `show --property=ActiveState` and not through
-            # `is-active`, because the transaction above refused and the units
-            # this package installs are therefore in whatever state a refused
-            # install left them -- which `is-active` answers with exit 3 and no
-            # word, on a wrapper whose policy is `check=True`.
+            # `is-active`, because the units this package installs are in
+            # whatever state the transaction above left them -- which `is-active`
+            # answers with exit 3 and no word, on a wrapper whose policy is
+            # `check=True`.
             for unit in (ROUTER_UNIT, WATCHDOG_UNIT, WATCHDOG_TIMER):
                 document[f"is-enabled:{unit}"] = unit_enabled(unit)
                 document[f"state:{unit}"] = unit_state(unit)
             document["watchdog_unit_file"] = try_read("cat", f"/usr/lib/systemd/system/{WATCHDOG_UNIT}")
             document["watchdog_setting_shipped"] = try_read("cat", SETTING_PATH)
+
+            # **AND THE TIMER IS STOPPED HERE, BEFORE THE FIRST PROBE.**
+            # This scenario drives the service by hand on purpose -- a scenario
+            # that waits for a timer cannot tell a slow machine from a broken
+            # one -- and that reasoning is only sound while nothing else is
+            # starting the same unit.
+            #
+            # On a cell whose transaction REFUSED nothing ever enabled the timer,
+            # so there was nothing to stop and the reasoning held by accident. On
+            # a cell whose transaction COMPLETED, `postinst` enables it, and
+            # `mosdns-watchdog.timer` is `OnBootSec=3min` + `OnUnitActiveSec=1min`
+            # against a container that has been up for minutes by now: it is
+            # firing every minute on its own, advancing the very failure counter
+            # this scenario reads back, and a run this scenario did not start
+            # would decide whether the window was reached.
+            #
+            # Stopped rather than disabled, and before anything is armed: stopping
+            # is what a scenario may do to a machine it is driving, whereas
+            # disabling would destroy the one piece of evidence
+            # `is-enabled:mosdns-watchdog.timer` above records, which is that
+            # `postinst` enables this timer at all. That fact is checked here --
+            # cheaply and without waiting, which is what `start_watchdog`'s
+            # docstring says it is checked by -- rather than by running the cell
+            # long enough to watch it fire.
+            run(f"set -eu\nsystemctl stop {WATCHDOG_TIMER}\n")
+            document["watchdog_timer_state_after_stop"] = unit_state(WATCHDOG_TIMER)
 
             # -- 4. the machine the watchdog is for --------------------------
             # A connection carrying the loopback address, with a record of what

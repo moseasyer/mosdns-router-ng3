@@ -81,6 +81,16 @@ VERSION = "24.04"
 ROUTER = f"mosdns-{RUN_ID}-mock-router-{VERSION}"
 TARGET = f"mosdns-{RUN_ID}-target-{VERSION}"
 PROFILE = "eth0-managed"
+# The two units whose names are load-bearing for a case that reads what the
+# scenario issued. Restated rather than taken from the scenario, for the reason
+# the installed paths above give.
+WATCHDOG_UNIT = "mosdns-watchdog.service"
+WATCHDOG_TIMER = "mosdns-watchdog.timer"
+# Restated rather than imported: a case that read them out of the module would
+# agree with whatever the module said, and the point of holding the document is
+# that it is held against something outside itself.
+TRANSACTION_COMPLETED = "the transaction COMPLETED"
+TRANSACTION_REFUSED = "the transaction REFUSED"
 RECORDED_DNS = "10.89.0.2"
 LOCAL_DNS = "127.0.0.1"
 MOCK_ROUTER_ADDRESS = "10.89.0.2"
@@ -104,6 +114,19 @@ DPKG_OUTPUT = (
     "Errors were encountered while processing:\n"
     " /tmp/mosdns-router.deb\n"
     "DPKG_EXIT=1\n"
+)
+
+# What dpkg prints when the transaction COMPLETED, which is what this matrix has
+# produced on every release since the preflight's ACL requirement was fixed and
+# the cell started a mock foreign resolver. MEASURED, run `FIXVERIFY`, from the
+# watchdog cell's own evidence document (`dpkg_exit = 0`,
+# `package_state = installed`).
+DPKG_SUCCESS_OUTPUT = (
+    "(Reading database ... 8491 files and directories currently installed.)\n"
+    "Preparing to unpack /tmp/mosdns-router.deb ...\n"
+    "Unpacking mosdns-router (0.3.1) over (0.3.1) ...\n"
+    "Setting up mosdns-router (0.3.1) ...\n"
+    "DPKG_EXIT=0\n"
 )
 
 BACKUP = json.dumps(
@@ -181,6 +204,7 @@ def watchdog_rules(
     record_reads: list[str] | None = None,
     connection_dns: list[str] | None = None,
     device_dns: list[str] | None = None,
+    transaction_succeeded: bool = False,
     backup: str | None = BACKUP,
     operator_exit: int = 0,
     probe_status: int = 0,
@@ -231,6 +255,24 @@ def watchdog_rules(
         f"{LOCAL_DNS}\n",
         f"{RECORDED_DNS}\n",       # after the operator's own rollback
     ]
+    # **A SUCCESSFUL TRANSACTION, as a separate shape rather than as the default.**
+    # This table's default answers a cell where postinst exited 1 and left the
+    # package unpacked-but-not-configured. That is what every release did until
+    # `b236aaf` fixed the preflight's ACL requirement AND the cell started a mock
+    # foreign resolver, and the combination made the transaction COMPLETE.
+    # MEASURED, run `FIXVERIFY`, 22.04/24.04/26.04, from the watchdog cell's own
+    # evidence document:
+    #
+    #     dpkg_exit = 0
+    #     package_state = installed
+    #     package_unpacked = install ok installed
+    #
+    # A fixture that only knows the refused shape describes a cell that this
+    # matrix no longer produces, which is the same defect as the two the routing
+    # and hand-off gates were hiding.
+    dpkg_state = "installed" if transaction_succeeded else "half-configured"
+    dpkg_phrase = f"install ok {dpkg_state}"
+    timer_unit_state = "enabled" if transaction_succeeded else "disabled"
     return cell_rules() + [
         # -- the hand-off, before the package -------------------------------
         # The mock router's address on the DEVICE, which is what the wait for
@@ -284,8 +326,8 @@ def watchdog_rules(
         # the real word turned out to be this one. The scenario asserts the
         # PROPERTY (not configured) rather than the literal, because dpkg picks
         # the word; the table answers the word a real dpkg used.
-        {"match": ["sh", "-c", DPKG_STATE_QUERY], "stdout": "half-configured\n"},
-        {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": "install ok half-configured\n"},
+        {"match": ["sh", "-c", DPKG_STATE_QUERY], "stdout": f"{dpkg_state}\n"},
+        {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": f"{dpkg_phrase}\n"},
         # `dpkg -i` runs ONCE now, through `sh -c`, and the status comes out of
         # the same string as the output: the script prints `DPKG_EXIT=<n>` after
         # the install. The previous fixture had two rules -- one for the `sh -c`
@@ -294,9 +336,13 @@ def watchdog_rules(
         # transaction executed twice and the recorded state described the second
         # run. The cell was green throughout, which is the point: a fixture that
         # models a defect faithfully reports the defect as normal.
-        {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0, "stdout": DPKG_OUTPUT},
+        {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0,
+         "stdout": DPKG_SUCCESS_OUTPUT if transaction_succeeded else DPKG_OUTPUT},
         {"match": ["dpkg-reconfigure"],
-         "stdout": "/usr/sbin/dpkg-reconfigure: mosdns-router is broken or not fully installed\n"},
+         "stdout": (
+             "/usr/sbin/dpkg-reconfigure: mosdns-router is broken or not fully installed\n"
+             if not transaction_succeeded else ""
+         )},
         # The setting's own mode, NAMED rather than matched on the bare
         # `["stat", "-c", "%a %U %G"]`: the fake takes the FIRST matching rule,
         # so a generic rule here would swallow the record's and the record's
@@ -319,7 +365,7 @@ def watchdog_rules(
         # make the placement its own comment argues for look right in a cell
         # where it never ran.
         {"match": ["systemctl", "show", "mosdns-watchdog.timer", "--property=UnitFileState"],
-         "stdout": "UnitFileState=disabled\n"},
+         "stdout": f"UnitFileState={timer_unit_state}\n"},
         {"match": ["systemctl", "show", "mosdns-router.service", "--property=UnitFileState"],
          "stdout": "UnitFileState=enabled\n"},
         {"match": ["systemctl", "show", "mosdns-watchdog.service", "--property=UnitFileState"],
@@ -522,6 +568,97 @@ class TheHandoffEstablishesItsOwnPreconditionTest(WatchdogScenarioHarness):
             result.status, "passed",
             f"the watchdog cell on a machine no install had taken over reported "
             f"{result.status}: {result.detail}",
+        )
+
+
+class TheCellWhoseTransactionCompletedTest(WatchdogScenarioHarness):
+    """**The shape the matrix actually produces now, and it was never in the fixture.**
+
+    This scenario was written for a cell where `postinst` exits 1 and the package
+    is left unpacked-but-not-configured, and it says so in its own evidence
+    document. That was every release until `b236aaf` fixed the preflight's ACL
+    requirement AND the cell started a mock foreign resolver -- the combination
+    that made the transaction COMPLETE. MEASURED, run `FIXVERIFY`, all three
+    releases, from this scenario's own evidence document:
+
+        dpkg_exit = 0
+        package_state = installed
+        package_unpacked = install ok installed
+
+    and the refusal the document asserts was not what stopped it:
+
+        the package is 'installed' and this scenario's evidence document claims
+        a cell that tested an installed package
+
+    So the scenario requires a failure mode as its premise, and this matrix no
+    longer produces it. The watchdog's own behaviour is not what depends on it --
+    what depends on it is only that nothing has pointed the machine anywhere yet,
+    and step 5 already does that idempotently.
+    """
+
+    def test_a_cell_whose_transaction_completed_is_not_refused(self):
+        _fake, result = self.run_scenario(transaction_succeeded=True)
+        self.assertEqual(
+            result.status, "passed",
+            "a cell where the install transaction COMPLETED was reported as "
+            f"{result.status}: {result.detail}",
+        )
+
+    def test_a_completed_transaction_is_described_as_what_measured(self):
+        """**The document is the deliverable, and it has to match the cell.**
+
+        The prose was not decoration: it is what a reader of a green report
+        believes about the machine the report came from. Asserting the state
+        while the prose said "NOT configured" would leave a document that is
+        self-contradictory, and that is worse than either alone.
+        """
+        _fake, result = self.run_scenario(transaction_succeeded=True)
+        record = self.record(result)
+        self.assertTrue(
+            record.get("package_configured"),
+            "the record does not say the package reached its configured state, so the document "
+            "cannot be held against what dpkg recorded",
+        )
+        self.assertNotIn(
+            "NOT configured", record.get("package_state_explained", ""),
+            "the document still describes a cell that tested an unpacked package, on a cell "
+            "where dpkg recorded `installed`",
+        )
+
+    def test_the_timer_is_stopped_while_the_scenario_drives_the_service_by_hand(self):
+        """**The one thing the completed shape really needs, and it is not cosmetic.**
+
+        `mosdns-watchdog.timer` is `OnBootSec=3min` + `OnUnitActiveSec=1min`, and
+        a successful transaction's `postinst` ENABLES it -- the install scenario
+        on run FIXVERIFY reports "all four timers are enabled". The container has
+        been up for minutes by the time this scenario runs, so the timer is
+        firing every minute on its own.
+
+        This scenario drives the service by hand, deliberately: a scenario that
+        waits for a timer cannot tell a slow machine from a broken one. That
+        reasoning is only sound while the timer is not also firing, so on the
+        completed shape the timer has to be stopped before the first probe, and
+        the fact that it WAS enabled is the evidence the scenario records instead
+        of waiting for it.
+        """
+        fake, result = self.run_scenario(transaction_succeeded=True)
+        self.assertEqual(
+            result.status, "passed",
+            f"the completed-transaction cell reported {result.status}: {result.detail}",
+        )
+        asked = "\n".join(self.asked(fake))
+        stopped = asked.find(f"systemctl stop {WATCHDOG_TIMER}")
+        self.assertNotEqual(
+            stopped, -1,
+            f"the scenario never stopped {WATCHDOG_TIMER}, so on a cell whose postinst enabled it "
+            "the timer fires every minute while this scenario drives the service by hand, and the "
+            "failure count it reads back belongs to two mechanisms at once",
+        )
+        started = asked.find("systemctl start mosdns-watchdog.service")
+        self.assertLess(
+            stopped, started,
+            "the timer was stopped AFTER the scenario had already started the service by hand, so "
+            "every probe before that point could have been the timer's",
         )
 
 
@@ -926,7 +1063,19 @@ class WithoutARecordTest(WatchdogScenarioHarness):
         written = self.record(passing)
         self.assertFalse(written["package_configured"], "the document claims a configured package")
         self.assertIn("ok ", written["package_unpacked"])
-        self.assertIn("NOT configured", written["package_state_explained"])
+        # **The outcome as a FIELD, not as a phrase in the prose.** This case used
+        # to assert `"NOT configured"`, which is a substring of the refused prose
+        # AND would have been a substring of nothing else -- until the outcome
+        # became two real shapes, at which point the phrase stopped being a way to
+        # name either of them. The field is what a reader and a machine can both
+        # read; the phrase is the prose, and prose is not an interface.
+        self.assertEqual(written["transaction_outcome"], TRANSACTION_REFUSED)
+        self.assertIn(TRANSACTION_REFUSED, written["package_state_explained"])
+        self.assertNotIn(
+            TRANSACTION_COMPLETED, written["package_state_explained"],
+            "the document describes a refused transaction and also says it completed, so a reader "
+            "of this green report cannot tell which one the machine had",
+        )
         self.assertIn("postinst's enable path is NOT", written["package_state_explained"])
         # **And it names the reason the transaction actually gives.** It used to
         # say `update-lists --refresh-ranges` needs `api.cloudflare.com`, which
