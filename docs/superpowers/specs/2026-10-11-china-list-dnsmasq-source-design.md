@@ -32,9 +32,20 @@
 
 ### 2.2 IP 一律是同一个
 
-三份文件中每一行规则的地址都是 `114.114.114.114`，无一例外。这意味着"取域名、丢弃 IP、改走 DHCP 下发的国内解析"与上游语义**完全等价**——上游写死这个 IP 是 dnsmasq 的语法要求（`server=` 必须带地址），而不是在说这些域名必须由某个特定解析器回答。
+三份文件中每一行规则的地址都是 `114.114.114.114`，无一例外。
 
-因此**不需要**任何 DNS 应答改写，`google.china.conf` 的 112 条规则也不需要特殊处理。
+**这个地址是上游的一个决定，不是语法占位符。** dnsmasq 的 `server=` 语法确实要求带一个地址，但上游选择的是 114DNS——它在说"这些域名请交给 114DNS 回答"。这是一个真实的、属于上游的选择。
+
+**本项目不接受这个选择。** 上游对"用什么解析器回答国内域名"没有任何发言权：国内分支只应到达 DHCP 下发的地址。
+
+这不是本次新增的让步，而是本项目早就写死并已在扫描的约束：
+
+- `internal/mosdnsconfig/render.go` 的 `chinesePublicDNSAddresses` 列表（含 `114.114.114.114`，注释标注 114DNS）对**渲染完成的配置文档**做扫描，命中即失败；
+- `installer/tests/test_package.py` 的 `FORBIDDEN_ADDRESSES` 同样包含它，其注释把原则写得很直白——*"A resolver ADDRESS is refused EVERYWHERE, the China domain list included. An address in a document is an upstream somebody would be asked, and the domestic branch of the routing document reaches exactly one set of upstreams: the addresses the DHCP lease published."*
+
+因此本次转换器**只取域名，丢弃地址**。这个地址不进入发布列表、source-lock、日志或任何测试夹具；国内域名照旧走 `dhcp_forward`，即 DHCP 租约发布的地址。
+
+**不需要**任何 DNS 应答改写，`google.china.conf` 的 112 条规则也不需要特殊处理——它们与主表走同一条国内路径，不因来自 google 文件而有别。
 
 ### 2.3 停用记录
 
@@ -67,7 +78,9 @@ server=/<域名>/<IPv4>
 
 不匹配即转换失败。不猜测、不跳过、不"尽力而为地"取域名部分——延续 `convert.go` 既有的 "nothing here guesses" 立场：一个形状不认识的行意味着我们对上游的理解有缺口，而带着缺口发布的列表是一个洞。
 
-**产出**：每个域名经 `mosdnsdomain.NormalizeDomain` 后写成 `domain:<域名>`。**地址部分被丢弃，绝不进入任何产物。** 项目的硬性约束是"绝不生成中国公共 DNS 地址"，`114.114.114.114` 不出现在发布列表、source-lock、日志或任何测试夹具中。
+**产出**：每个域名经 `mosdnsdomain.NormalizeDomain` 后写成 `domain:<域名>`。**地址部分被丢弃，绝不进入任何产物。**
+
+解析器仍要求行里有一个合法的 IPv4 才算格式正确——这是"不猜测"的一部分：上游若改了格式，我们应当失败，而不是取走域名那一半继续。但**读到之后不使用**。§2.2 的既有门禁（`chinesePublicDNSAddresses` 与 `FORBIDDEN_ADDRESSES`）已经覆盖这个地址；本次转换器不得让它们失败。
 
 **停用记录**：§2.3 的 6 行降级为注释后保留，但写成
 
@@ -208,7 +221,8 @@ ok  mosdns-router/tests/integration  26.034s
 
 ## 12. 测试策略
 
-- **转换器单元测试**：合法行、`#` 注释截断、空行、IP 丢弃后产物中无任何地址、6 条停用记录降级为注释、形状不认识即失败、0 条即失败、重复域名折叠。
+- **转换器单元测试**：合法行、`#` 注释截断、空行、**转换结果中不出现任何地址**、6 条停用记录降级为注释且注释里没有地址、形状不认识即失败、0 条即失败、重复域名折叠。
+- **地址边界门禁**：用 `felixonmars/dnsmasq-china-list` 的真实三个 entry 作为夹具跑转换，把产物交给既有的 `FORBIDDEN_ADDRESSES` 扫描。这一条是"上游无权指定解析器"的执行形式——不是靠 spec 承诺，是靠现有的地址黑名单扫出来。
 - **lock schema 测试**：v2 往返编解码、未知字段拒绝、尾随数据拒绝、v1 拒绝并指向重新 pin 的命令、`supplement` 省略的合法形状。
 - **护栏测试**：主源条数塌缩被拒；补充条数变化被拒；跨源的 92.5% 跌幅不能由刷新路径发布。
 - **已提交清单测试**：`configs/cn-domains.txt` 与 `configs/source-lock.json` 的 `list_sha256` 一致（现有 `internal/rules/committed_test.go` 扩展）；发布列表不含任何地址（现有包内容门禁）。
