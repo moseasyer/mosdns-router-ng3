@@ -156,13 +156,28 @@ now and then.
 .br
 Everything that can fail happens before anything is written, so a machine with no
 route out fails without having touched the pin, the list or the archive. A machine
-with \em no China list at all, which is the one state the drift report above
-cannot describe \em is given the reviewed
+with \em no China list at all, which is the one state the drift report above cannot
+describe \em is installed first, and it is installed from the primary: a fresh
+install on a working network gets
+.I felixonmars/dnsmasq\-china\-list
+and the supplement beside it. Only when the primary itself cannot be reached does
+it get the
 .I v2fly/domain\-list\-community
-list as its primary instead, and the run says in so many words that that is what
-it was given and what to re\-pin from once the source has been reviewed. A machine
+list instead, and the run says in so many words that that is what it was given.
+A machine
 that already has a list keeps it through a failed refresh: the last good result is
 strictly better than the fallback, which is an eighth the size.
+.br
+The refresh's destination is always the primary, never whatever the published lock
+names. A machine published from the fallback is one that has not reached the
+primary yet, so its next successful refresh migrates it: the fallback is not a
+second primary, it is what this gateway falls back to. That migration is the one
+run with no previous count to measure against \em the number on disk belongs to the
+source being left, and weighing the new primary against it would be exactly the
+cross\-source comparison the guardrail above exists to refuse \em so the collapse
+guardrail is skipped on that run, and the report says so by name. A machine whose
+list names a repository this build does not know is refused with that name, rather
+than being moved onto a source nobody reviewed.
 .TP
 .B \-\-check
 Reports whether the pinned source has moved, and reports the published ranges read

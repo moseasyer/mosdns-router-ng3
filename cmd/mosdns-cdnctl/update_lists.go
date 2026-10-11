@@ -712,8 +712,14 @@ func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, s
 	// A machine with no China list at all is the one state the report below cannot
 	// describe: the check refuses a machine that has nothing to compare against, and
 	// a refusal would stop the refresh before it ever ran. So with the China switch
-	// on, a machine that has nothing is given the fallback FIRST and the report then
+	// on, a machine that has nothing is INSTALLED FIRST and the report then
 	// describes the pair that publication left behind.
+	//
+	// Installed, and specifically the PRIMARY. The fallback is what this project
+	// falls back TO; a fresh install that took it would be running an eighth of the
+	// list for as long as it lived. publishPrimaryOrFallback asks the primary whether
+	// it can be reached and publishes the fallback only when it cannot, so "this
+	// machine had nothing" never means "this machine gets the small list".
 	//
 	// The decision is made HERE rather than inside the refresh because this is where
 	// the policy is known: an operator who turned the refresh off has not asked for
@@ -723,7 +729,7 @@ func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, s
 	// command that gets past it.
 	if policy.Lists.China.Automatic {
 		if _, _, found, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile); readErr == nil && !found {
-			if code := publishFallback(ctx, options, stdout, stderr, services); code != exitSuccess {
+			if code := publishPrimaryOrFallback(ctx, options, stdout, stderr, services); code != exitSuccess {
 				return code
 			}
 		}
@@ -778,7 +784,7 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// the wrong reason.
 	const minimumRetained = 0.95
 
-	pinned, current, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
+	pinned, current, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
 		// An unattended run cannot ask which source to install, so it stops here
 		// -- and the pair it cannot read is exactly the state a schema migration
@@ -795,22 +801,30 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 		return exitStateUnavailable
 	}
 
+	// The DESTINATION is the primary source, and it is not a function of what this
+	// machine happens to be published from. The fallback is not a second primary:
+	// it is what this project falls back to when the primary cannot be reached, and
+	// a machine still on it has not reached the primary yet. Resolving against the
+	// published lock instead would ask the fallback where it had moved on and
+	// republish the same smaller list every day, with the primary never fetched at
+	// all -- which is the state this whole primary/fallback split exists to end.
+	destination := rules.RepositoryChina
+	// migrating is that transition: the machine is published from a source other
+	// than the one it is being moved onto. It decides one thing below -- whether the
+	// primary's size may be compared against what is on disk -- and it is decided
+	// here, once, rather than inferred from two unequal numbers further down.
+	migrating := found && pinned.Primary.Repository != destination
+
 	client := services.newHTTPClient()
-	// The refresh re-pins the source the published lock names, so the count it
-	// compares is a count of the same source's rules.
-	resolved, err := rules.ResolveHEAD(ctx, client, pinned.Primary.Repository)
+	resolved, err := rules.ResolveHEAD(ctx, client, destination)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
 	// The supplement is resolved against ITS OWN repository and its own HEAD, for
-	// the same reason the primary is resolved against the lock's: a document cannot
-	// be looked up in a repository it does not live in.
-	//
-	// An absent supplement stays absent. Adding one is a decision about what this
-	// installation runs, and a refresh is not where that decision is made -- and a
-	// v2fly primary may not carry one at all, because it already holds every kind a
-	// supplement contributes.
+	// the same reason the primary is resolved against the destination rather than
+	// the lock's: a document cannot be looked up in a repository it does not live
+	// in.
 	supplement, err := resolveSupplement(ctx, client, pinned.Supplement)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: the supplement could not be resolved, and publishing "+
@@ -818,7 +832,8 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 			len(rules.SupplementKinds()), err)
 		return exitStateUnavailable
 	}
-	if resolved.Primary.Commit == pinned.Primary.Commit &&
+	if !migrating && found &&
+		resolved.Primary.Commit == pinned.Primary.Commit &&
 		(supplement == nil || supplement.Commit == pinned.Supplement.Commit) {
 		// Already there -- and "there" means BOTH sources, because the second one
 		// moves on its own schedule. Reporting already-at because the primary is
@@ -852,11 +867,36 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// published for that same source is the only comparison whose two sides mean the
 	// same thing.
 	wasPrimary, wasSupplement := sourceRuleCounts(current, pinned.Supplement)
-	isPrimary, isSupplement := sourceRuleCounts(list, pinned.Supplement)
-	if err := guardSize(stderr, "primary", &published.Primary, isPrimary, wasPrimary, minimumRetained); err != nil {
+	isPrimary, isSupplement := sourceRuleCounts(list, supplement)
+	if migrating {
+		// The primary guardrail is SKIPPED here, and it is a branch rather than a
+		// comparison against something else because there is nothing to compare
+		// with: this machine has published no dnsmasq list at all, and the number on
+		// disk is the FALLBACK's. Judging 111,357 dnsmasq rules against 8,363
+		// v2fly rules is the cross-source comparison the whole guardrail is built
+		// to refuse -- in the one direction that would refuse the intended
+		// upgrade.
+		//
+		// The shrinking direction cannot hide in here either, and the reason is
+		// structural rather than hopeful: the destination is never the fallback, so
+		// the only list this can move FROM is the smaller one.
+		//
+		// It is said out loud because a guardrail that is skipped silently is
+		// indistinguishable from one that passed, and this is the one run where an
+		// operator cannot tell from the exit code alone whether anything was
+		// checked.
+		writeReportLine(stdout, "china-list: migrating from the %s list to the %s primary; the "+
+			"collapse guardrail was skipped on this run, because it is judged per source and this "+
+			"machine has published no %s list to compare against\n",
+			pinned.Primary.Repository, rules.RepositoryChina, rules.RepositoryChina)
+	} else if err := guardSize(stderr, "primary", &published.Primary, isPrimary, wasPrimary, minimumRetained); err != nil {
 		return exitStateUnavailable
 	}
 	if supplement != nil {
+		// The supplement guard needs no exemption of its own. On a migration and on
+		// a cold start this machine published no supplement, so wasSupplement is
+		// zero and guardSize reads a published count of zero as nothing to compare
+		// against rather than as a count of nothing.
 		if err := guardSize(stderr, "supplement", supplement, isSupplement, wasSupplement, minimumRetained); err != nil {
 			return exitStateUnavailable
 		}
@@ -878,22 +918,36 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	return runPinRemote(ctx, measured, stdout, stderr, services)
 }
 
-// resolveSupplement re-pins the supplement this machine already has, against the
-// repository that issued it, and returns nothing at all when the published lock has
-// no supplement to re-pin.
+// resolveSupplement returns the supplement a dnsmasq primary is published beside.
+//
+// It is wanted whenever the destination is the dnsmasq source, which is every time
+// -- the dnsmasq syntax cannot express `full:` or `regexp:`, so a primary published
+// alone is a list quietly missing the seventy-odd rules a supplement contributes.
+// That makes two ordinary states need one RESOLVED rather than one carried: a
+// cold start, and a machine published from the fallback, which by construction has
+// no supplement because a v2fly primary may not carry one.
+//
+// A machine that already has one has it re-pinned in place, against the repository
+// that issued it. The kinds come from the lock rather than from the package
+// constant in that case: the lock is the document that says what went into the list
+// a later reader is about to compare, and the allowlist in rules still gates the
+// value. The slice is copied rather than aliased for the same reason rules exports
+// it -- a lock sharing a package-level backing array could be rewritten through it.
 func resolveSupplement(ctx context.Context, client *http.Client, current *rules.SourceRef) (*rules.SourceRef, error) {
-	if current == nil {
-		return nil, nil
+	repository := rules.RepositoryV2Fly
+	var kinds []string
+	if current != nil {
+		repository = current.Repository
+		kinds = append([]string(nil), current.Kinds...)
+	} else {
+		kinds = append([]string(nil), rules.SupplementKinds()...)
 	}
-	resolved, err := rules.ResolveHEAD(ctx, client, current.Repository)
+	resolved, err := rules.ResolveHEAD(ctx, client, repository)
 	if err != nil {
 		return nil, err
 	}
 	ref := resolved.Primary
-	// The kinds are the ones the lock already records, copied rather than aliased:
-	// this is a document a later reader trusts, and a lock sharing the backing array
-	// of a package-level slice could be rewritten through it.
-	ref.Kinds = append([]string(nil), current.Kinds...)
+	ref.Kinds = kinds
 	return &ref, nil
 }
 
@@ -964,23 +1018,54 @@ func guardSize(stderr io.Writer, name string, ref *rules.SourceRef, incoming, pu
 	return fmt.Errorf("the %s collapsed", name)
 }
 
-// publishFallback publishes the list this project ships with -- v2fly as the
+// publishPrimaryOrFallback is the cold-start decision: publish the reviewed
+// PRIMARY if this machine can reach it, and the fallback if it cannot.
+//
+// The predicate is the reachability of the PRIMARY, not "a failure happened". A
+// fresh install on a working network must get the 111,357-rule list and the
+// supplement beside it; the v2fly list is what this project falls back TO, not
+// what it starts on. Publishing the fallback to a reachable origin would be a
+// silent, eight-fold downgrade that no exit code distinguishes from a healthy
+// install -- and, before the migration rule in refreshChinaList, one the machine
+// then followed forever.
+//
+// Both paths run refreshChinaList's own decision, so the cold start and every
+// later refresh publish through one code path and cannot disagree about what the
+// primary is. The split is made here, on the primary's own resolution, because that
+// is the only place where "can this machine reach its source" is a fact rather
+// than an assumption.
+//
+// The primary is asked the cheap way -- the commit alone, no archive -- because
+// the question is whether it can be REACHED. A machine that can goes on to
+// refreshChinaList, which fetches the archive it is about to verify, so nothing is
+// fetched twice.
+func publishPrimaryOrFallback(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	client := services.newHTTPClient()
+	if _, err := rules.ResolveCommit(ctx, client, rules.RepositoryChina, ""); err != nil {
+		writeCLIError(stderr, "update-lists: the %s primary could not be reached (%v), so this machine "+
+			"gets the %s fallback instead.\n", rules.RepositoryChina, err, rules.RepositoryV2Fly)
+		return publishFallback(ctx, options, stdout, stderr, services)
+	}
+	return refreshChinaList(ctx, options, stdout, stderr, services)
+}
+
+// publishFallback publishes the list this project falls back TO -- v2fly as the
 // PRIMARY and no supplement, because a supplement beside a v2fly primary is a
 // document untrue about how the list was built -- and only on a machine that has no
-// China list at all.
+// China list at all and cannot reach the primary.
 //
-// "Only when there is nothing" is the whole rule, and it is enforced by the one
-// caller rather than by a condition in here. A machine with a good list keeps it
-// through a failed refresh: the last good result is strictly better than this one,
-// which is an eighth the size, and replacing it would turn an outage into a
-// downgrade. A machine with nothing gets rules rather than a silent hole where every
-// query goes abroad.
+// "Only then" is the whole rule, and it is enforced by the one caller rather than
+// by a condition in here. A machine with a good list keeps it through a failed
+// refresh: the last good result is strictly better than this one, which is an
+// eighth the size, and replacing it would turn an outage into a downgrade. A machine
+// with nothing gets rules rather than a silent hole where every query goes abroad.
 //
-// Publishing here and nowhere else is also what keeps the guardrail honest. The
-// fallback is 8,363 rules where the dnsmasq list is 111,357, so publishing it from a
-// refresh would be a 92.49% drop -- which the 0.95 guardrail refuses, every time,
-// which is exactly the property that lets the refresh promise that a machine with a
-// list never loses it to a failed run.
+// It is also the ONLY publisher of a v2fly primary, and that is now structural
+// rather than lucky. refreshChinaList's destination is always the dnsmasq source --
+// a machine published from v2fly is treated as one that has not reached the primary
+// yet -- so the refresh can never publish this source at all, and the arithmetic
+// that used to make an 8,363-rule publication self-refusing against a 111,357-rule
+// one is no longer what holds the property up. The single caller is.
 //
 // It does not take the control lock's archive step because there is nothing to
 // archive: this branch runs only when nothing is published. It does take the lock
@@ -1016,10 +1101,10 @@ func publishFallback(ctx context.Context, options updateListOptions, stdout, std
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
-	writeReportLine(stdout, "china-list: this machine had no China list, so the %s fallback was "+
-		"published at %s (%s). Re-pin with `--pin-remote HEAD --pin-source %s` once you have "+
-		"reviewed that source.\n",
-		rules.RepositoryV2Fly, published.Primary.Commit, ruleCount(countListRules(list)), rules.RepositoryChina)
+	writeReportLine(stdout, "china-list: this machine had no China list and the %s primary could not be "+
+		"reached, so the %s fallback was published at %s (%s). The next refresh migrates it to the "+
+		"primary once the origin is reachable.\n",
+		rules.RepositoryChina, rules.RepositoryV2Fly, published.Primary.Commit, ruleCount(countListRules(list)))
 	return exitSuccess
 }
 

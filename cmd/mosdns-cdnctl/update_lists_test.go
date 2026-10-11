@@ -1618,11 +1618,22 @@ func TestTheRefusalNamesTheCommandThatRecoversFromIt(t *testing.T) {
 func TestForceAnswersOnlyTheDisagreement(t *testing.T) {
 	t.Run("it does not waive the collapse guardrail", func(t *testing.T) {
 		paths := newListPaths(t)
-		publishPair(t, paths, lockedCommit, rulesOf(200))
+		publishChinaPair(t, paths, lockedCommit, rulesOf(200))
 		// Upstream now publishes a fraction of the list. That is refused on size
 		// alone, and --force is not in the conversation.
-		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
-			remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(4))),
+		origin := newFakeOriginSources(t, map[string]fakeSource{
+			rules.RepositoryChina: {
+				head: remoteCommit,
+				archives: map[string][]byte{
+					remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:only.cn\n"),
+				},
+			},
+			rules.RepositoryV2Fly: {
+				head: remoteCommit,
+				archives: map[string][]byte{
+					remoteCommit: supplementArchive(t, remoteCommit, 2),
+				},
+			},
 		})
 		before := snapshot(t, paths.dir)
 		code, _, stderr := runCLI(t, origin.services(), "--automatic",
@@ -1826,7 +1837,12 @@ func TestTheUnattendedRefreshResolvesAndPublishesFromThePinnedRepository(t *test
 				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:refreshed.cn\n"),
 			},
 		},
-		rules.RepositoryV2Fly: {head: lockedCommit},
+		rules.RepositoryV2Fly: {
+			head: lockedSupplementCommit,
+			archives: map[string][]byte{
+				lockedSupplementCommit: supplementArchive(t, lockedSupplementCommit, 2),
+			},
+		},
 	})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--automatic", "--policy", policy,
@@ -1843,13 +1859,16 @@ func TestTheUnattendedRefreshResolvesAndPublishesFromThePinnedRepository(t *test
 			t.Errorf("--automatic fetched %v, want %q", origin.requests, path)
 		}
 	}
-	for _, path := range []string{
-		origin.commitPath(rules.RepositoryV2Fly),
-		origin.archivePath(rules.RepositoryV2Fly, remoteCommit),
-	} {
-		if origin.fetched(path) {
-			t.Errorf("--automatic fetched %q, which belongs to a source this list was not published from", path)
-		}
+	// The supplement IS fetched, because the dnsmasq primary cannot express the
+	// rule kinds it carries -- but from its OWN repository and at its OWN commit.
+	// That is the half of the rule this case exists for: the measured commit is a
+	// v2fly commit here, and asking the dnsmasq repository for it would verify a
+	// digest against an archive that commit is not in.
+	if other := origin.archivePath(rules.RepositoryChina, lockedSupplementCommit); origin.fetched(other) {
+		t.Errorf("--automatic fetched %q, which is a commit of the other repository", other)
+	}
+	if want := origin.archivePath(rules.RepositoryV2Fly, lockedSupplementCommit); !origin.fetched(want) {
+		t.Errorf("--automatic fetched %v, want the supplement at %q", origin.requests, want)
 	}
 	if !strings.Contains(stdout, "pinned-commit: "+remoteCommit) {
 		t.Errorf("the refresh did not publish the measured commit:\n%s", stdout)
@@ -1945,9 +1964,20 @@ func TestAutomaticWithBothSwitchesOffIsTheCheck(t *testing.T) {
 // is written down at all.
 func TestAutomaticStillReportsDriftWhenItRefreshes(t *testing.T) {
 	paths := newListPaths(t)
-	publishPair(t, paths, lockedCommit, rulesOf(200))
-	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
-		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
 	})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--automatic",
@@ -2034,10 +2064,21 @@ func TestAutomaticHonoursEachSwitchSeparately(t *testing.T) {
 func TestAListThatShrinksSharplyIsRefused(t *testing.T) {
 	paths := newListPaths(t)
 	published := rulesOf(200)
-	publishPair(t, paths, lockedCommit, published)
+	publishChinaPair(t, paths, lockedCommit, published)
 	// Upstream now publishes one rule where this machine has two hundred.
-	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
-		remoteCommit: sourceArchive(t, remoteCommit, "domain:first.cn\n"),
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:first.cn\n"),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
 	})
 
 	code, _, stderr := runCLI(t, origin.services(), "--automatic",
@@ -2072,12 +2113,23 @@ func TestAListThatShrinksSharplyIsRefused(t *testing.T) {
 // machinery attached.
 func TestASmallReductionIsPublished(t *testing.T) {
 	paths := newListPaths(t)
-	publishPair(t, paths, lockedCommit, rulesOf(1000))
+	publishChinaPair(t, paths, lockedCommit, rulesOf(1000))
 	// 980 of 1000: a 2% reduction, comfortably clear of the threshold, because a case
 	// balanced exactly on a boundary passes for the wrong reason when the boundary
 	// moves by one.
-	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
-		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(980))),
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(980))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
 	})
 
 	code, _, stderr := runCLI(t, origin.services(), "--automatic",
@@ -2144,12 +2196,23 @@ func TestAFailedAutomaticRunTouchesNothing(t *testing.T) {
 func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 	paths := newListPaths(t)
 	published := rulesOf(200)
-	publishPair(t, paths, lockedCommit, published)
+	publishChinaPair(t, paths, lockedCommit, published)
 	measured := remoteCommit
 	collapsed := "3333333333333333333333333333333333333333"
-	origin := newFakeOrigin(t, measured, map[string][]byte{
-		measured:  sourceArchive(t, measured, string(rulesOf(200))),
-		collapsed: sourceArchive(t, collapsed, "domain:only.cn\n"),
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: measured,
+			archives: map[string][]byte{
+				measured:  chinaSourceArchive(t, measured, string(rulesOf(200))),
+				collapsed: chinaSourceArchive(t, collapsed, "domain:only.cn\n"),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
 	})
 	// Upstream answers `measured` for its first three resolutions of HEAD and
 	// `collapsed` from the fourth on. Three is the drift report's two plus the
@@ -2178,7 +2241,7 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 		}
 		resolutions++
 		if resolutions >= 4 {
-			o.setHead(rules.RepositoryV2Fly, collapsed)
+			o.setHead(rules.RepositoryChina, collapsed)
 		}
 	}
 	code, _, stderr := runCLI(t, origin.services(), "--automatic",
@@ -2199,10 +2262,16 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 	if lock.Primary.Commit != measured {
 		t.Errorf("published %s, want the commit that was measured (%s)", lock.Primary.Commit, measured)
 	}
-	// And the list that is published is the measured commit's, not the collapsed one.
-	if got := countListRules(list); got != countListRules(published) {
-		t.Errorf("the published list holds %d rules, want the measured commit's %d",
-			got, countListRules(published))
+	// And the list that is published is the measured commit's, not the collapsed
+	// one's. Said by what is IN it rather than by counting: the measured archive
+	// holds two hundred domains and the collapsed one holds a single different
+	// domain, so each is named and the other forbidden.
+	publishedList := string(list)
+	if !strings.Contains(publishedList, "domain:host00199.example.cn") {
+		t.Errorf("the published list is not the measured commit's -- its last domain is missing:\n%s", list)
+	}
+	if strings.Contains(publishedList, "domain:only.cn") {
+		t.Errorf("the published list is the collapsed commit's, which nothing measured:\n%s", list)
 	}
 }
 
@@ -2392,18 +2461,28 @@ func TestAColdStartWithNoRoutePublishesTheFallbackRatherThanNothing(t *testing.T
 	}
 }
 
-// The same cold start with a reachable origin publishes the reviewed default: v2fly
-// as the PRIMARY and no supplement, because a supplement beside it is a document that
-// attributes rules to a second source which already held every one of them.
+// A cold start on a WORKING network installs the primary. The fallback is what
+// this project falls back TO, not what it starts on.
 //
-// This is the shape a first install gets whether it is reached by a hand-run pin or
-// by the timer, and it is deliberately not the dnsmasq primary: nothing on a machine
-// with no lock says which of the two reviewed sources this installation runs, and the
-// smaller list is the one that has been shipping here.
-func TestAColdStartPublishesTheReviewedDefaultAsAPrimaryWithNoSupplement(t *testing.T) {
+// A fresh machine that resolved the fallback's repository, published 8,363 rules
+// and exited 0 would be running an eighth of the list this change exists to ship --
+// and, before the migration rule below, on that list forever, while every report
+// said it had published the reviewed default.
+func TestAColdStartWithAReachableOriginPublishesThePrimary(t *testing.T) {
 	paths := newListPaths(t)
-	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
-		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(300))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+			},
+		},
 	})
 
 	code, stdout, stderr := runAutomatic(t, paths, origin)
@@ -2414,16 +2493,172 @@ func TestAColdStartPublishesTheReviewedDefaultAsAPrimaryWithNoSupplement(t *test
 	if err != nil || !found {
 		t.Fatalf("the cold start published no pair: found=%t err=%v", found, err)
 	}
-	if lock.Primary.Repository != rules.RepositoryV2Fly {
-		t.Errorf("the cold start published %q, want the reviewed default %q",
-			lock.Primary.Repository, rules.RepositoryV2Fly)
+	if lock.Primary.Repository != rules.RepositoryChina {
+		t.Errorf("a cold start on a working network published %q, want the primary %q",
+			lock.Primary.Repository, rules.RepositoryChina)
 	}
-	if lock.Supplement != nil {
-		t.Errorf("the fallback publication carries a supplement beside a v2fly primary: %+v", lock.Supplement)
+	// The primary cannot express the kinds a supplement carries, so a primary
+	// published alone silently drops them. This is a first migration as much as a
+	// cold start: a fallback publication has no supplement by construction.
+	if lock.Supplement == nil {
+		t.Errorf("the primary was published without the supplement whose rules its syntax "+
+			"cannot express: %+v", lock)
 	}
 	if len(list) == 0 {
 		t.Error("the cold start published an empty list, which sends every query abroad")
 	}
+}
+
+// A machine published from the fallback migrates. The fallback is not the primary
+// -- it is what this project falls back TO -- so a refresh that asked the fallback
+// where it had moved would answer a question nobody asked, and republish 8,363
+// rules forever while the primary was never fetched at all.
+//
+// The origin serves BOTH repositories, because a fixture that served only the one
+// the machine is on could not tell this apart from "kept refreshing where it was",
+// which is the defect.
+func TestAMachinePublishedFromTheFallbackMigratesToThePrimary(t *testing.T) {
+	paths := newListPaths(t)
+	// publishPair is the fallback publication: v2fly as the primary and no
+	// supplement, which is the only shape a v2fly primary may have.
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				// The supplement's kinds, and not the fallback's: a v2fly list
+				// converted as a supplement keeps only the rule forms the dnsmasq
+				// syntax cannot say, and a fixture that served plain `domain:` lines
+				// would resolve to nothing and be refused before it got here.
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(300))),
+			},
+		},
+	})
+
+	code, _, stderr := runAutomatic(t, paths, origin)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatalf("the migration published a pair that does not describe itself: %v", err)
+	}
+	if lock.Primary.Repository != rules.RepositoryChina {
+		t.Fatalf("the machine was still published from %q after a refresh, so it would follow "+
+			"the fallback forever; want the primary %q", lock.Primary.Repository, rules.RepositoryChina)
+	}
+	if lock.Primary.Commit != remoteCommit {
+		t.Errorf("the migrated pin names %s, want the primary's HEAD %s", lock.Primary.Commit, remoteCommit)
+	}
+	// The dnsmasq syntax cannot express what the supplement carries, so the migrated
+	// machine takes one. The fallback publication had none by construction, so this
+	// one has to be resolved fresh rather than carried.
+	if lock.Supplement == nil {
+		t.Errorf("the migration published a primary with no supplement, dropping every rule "+
+			"only the supplement can express: %+v", lock)
+	}
+	// A migration is a real publication, so the fallback it replaces is a rollback
+	// target.
+	archived, err := rules.ReadPrevious(paths.previousLock)
+	if err != nil {
+		t.Errorf("the migration left no rollback target: %v", err)
+	} else if archived.Primary.Repository != rules.RepositoryV2Fly {
+		t.Errorf("the archive names %q, want the fallback this machine was on", archived.Primary.Repository)
+	}
+}
+
+// The migration is the one transition where the two sources are not comparable, and
+// the guardrail has to say so rather than skip in silence: a skipped guard that
+// leaves no trace is indistinguishable from one that passed.
+//
+// The primary here publishes THREE rules where the fallback published 200. Against
+// the fallback's count that is a collapse -- and across a source change it is a
+// first migration with no baseline, which is exactly what the per-source rule says
+// must not be compared.
+func TestTheMigrationSaysWhichGuardrailItSkippedAndWhy(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				// Three rules where the fallback published two hundred.
+				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:only.cn\n"),
+			},
+		},
+	})
+
+	code, stdout, stderr := runAutomatic(t, paths, origin)
+	if code != exitSuccess {
+		t.Fatalf("a first migration was refused against the rule count of the source it is "+
+			"leaving, which is the cross-source comparison the guard exists to refuse: %s%s", stdout, stderr)
+	}
+	if !strings.Contains(stdout, rules.RepositoryChina) || !strings.Contains(stdout, rules.RepositoryV2Fly) {
+		t.Errorf("the report does not name the source it moved between: %s", stdout)
+	}
+	if !strings.Contains(stdout, "guardrail") {
+		t.Errorf("the report does not say a guardrail was skipped, so a reader cannot tell a "+
+			"first migration from an ordinary refresh that passed one: %s", stdout)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Primary.Repository != rules.RepositoryChina {
+		t.Errorf("published %q, want the primary %q", lock.Primary.Repository, rules.RepositoryChina)
+	}
+}
+
+// A published pair naming a repository this build does not know is refused BY
+// NAME. It is not defaulted to one of the two reviewed sources: a lock is the
+// record of what was reviewed, and quietly moving the machine onto a different
+// repository is a publication nobody asked for.
+func TestARefreshRefusesAPublishedSourceItDoesNotKnowByName(t *testing.T) {
+	paths := newListPaths(t)
+	list := rulesOf(200)
+	// The allowlist is a rules-layer gate, so this pair cannot be produced by any
+	// command here -- which is the point. The case is about what a refresh does
+	// when it finds one anyway.
+	writePublishedPair(t, paths, rules.SourceLock{
+		SchemaVersion: 2,
+		Primary: rules.SourceRef{
+			Repository: "attacker/domain-list",
+			Commit:     lockedCommit,
+			SHA256:     sha256Hex([]byte("an archive nobody reviewed")),
+			Entry:      rules.V2FlyEntry,
+		},
+		ListSHA256: sha256Hex(list),
+	}, list)
+	before := snapshot(t, paths.dir)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(300))),
+			},
+		},
+	})
+
+	code, _, stderr := runAutomatic(t, paths, origin)
+	if code == exitSuccess {
+		t.Fatal("a refresh ran against a lock naming a repository it does not know")
+	}
+	if !strings.Contains(stderr, "attacker/domain-list") {
+		t.Errorf("the refusal does not name the repository it refused: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
 }
 
 // The repository a commit is resolved against comes from the pin, and a MEASURED pin
