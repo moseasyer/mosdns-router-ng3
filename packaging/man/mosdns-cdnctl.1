@@ -190,6 +190,45 @@ about. Publishing without one is the only outcome here that is unrecoverable: th
 rollback target is destroyed by the very operation that needed it. A lock that is
 not there at all is not that case \em it is the first pin.
 .TP
+.B \-\-pin\-source\ \fIREPOSITORY\fR
+Names the reviewed repository to pin from. It is accepted only with
+.BR \-\-pin\-remote ,
+and only with one of these two values:
+.BR v2fly/domain\-list\-community
+or
+.BR felixonmars/dnsmasq\-china\-list .
+Anything else is refused at the command line, before the name is used to build a
+request \em the allowlist is what makes a repository name a record of something
+this gateway reviewed, and a name outside it would put the lock at the service of
+a stranger.
+.br
+Without this flag the repository is read from the published lock. That is what a
+machine with a readable lock wants, and it is also why the flag exists: a lock
+this build cannot read \em a schema version 1 document is the one an upgraded
+machine carries \em cannot say which repository the machine was running. So a
+machine on such a lock is told to run
+.BR "mosdns\-cdnctl update\-lists \-\-pin\-remote HEAD \-\-pin\-source"
+.IR repository ,
+and that is the only command that gets it out: the refusal on screen and the
+command in it are the same path, and the flag is what makes the second one
+succeed. A pair that cannot be read is replaced deliberately when this flag is
+given, and the refusal still goes to standard error so you see what you replaced.
+.br
+Naming the source widens which lock may be replaced; it does not silence the
+checks. A published list that disagrees with the digest its own lock records is
+still reported on standard error, because that is a different problem from the one
+this flag solves.
+.br
+A run with this flag still archives the outgoing lock, re\-encoded the way this
+package writes locks when the outgoing lock parses and copied byte for byte when
+it does not \em so the record of what was running survives even when this build
+cannot read it. To go back, read the commit out of
+.I /var/lib/mosdns/lists/source-lock.previous.json
+and pin it by name:
+.BR "mosdns\-cdnctl update\-lists \-\-pin\-remote\ \fICOMMIT\fR\ \-\-pin\-source\ \fIREPOSITORY\fR" .
+A rollback has to name both, because a commit id is only meaningful in the
+repository that issued it.
+.TP
 .B \-\-refresh\-ranges
 Fetches the published ranges and publishes their prefix list. Measures nothing and
 spends no bandwidth budget, which is what makes it the mode an installation runs

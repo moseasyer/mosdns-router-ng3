@@ -465,11 +465,19 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 func runCheckLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	published, _, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
-		writeCLIError(stderr, "update-lists: %v", err)
+		// This is the first thing an unattended run does, so it is the refusal an
+		// operator meets when a migration leaves a lock this build cannot read --
+		// and --automatic stops here, before it ever reaches the refresh. It
+		// names the flag for the same reason the pin's refusal does: the state it
+		// describes has exactly one way out, and a message that does not name it
+		// leaves the operator to find it.
+		writeCLIError(stderr, "update-lists: %v. Name the source to publish with "+
+			"`mosdns-cdnctl update-lists --pin-remote HEAD --pin-source %s` (or %q)",
+			err, rules.RepositoryV2Fly, rules.RepositoryChina)
 		return exitStateUnavailable
 	}
 	if !found {
-		writeCLIError(stderr, "update-lists: no pinned China domain list at %s, nothing to compare against; pin one with update-lists --pin-remote HEAD", options.sourceLock)
+		writeCLIError(stderr, "update-lists: no pinned China domain list at %s, nothing to compare against; pin one with update-lists --pin-remote HEAD --pin-source %s", options.sourceLock, rules.RepositoryV2Fly)
 		return exitStateUnavailable
 	}
 
@@ -729,7 +737,18 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 
 	pinned, current, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
-		writeCLIError(stderr, "update-lists: %v", err)
+		// An unattended run cannot ask which source to install, so it stops here
+		// -- and the pair it cannot read is exactly the state a schema migration
+		// leaves behind. The refusal therefore names the command an operator runs
+		// to get past it: a scheduled job that says only what is wrong leaves the
+		// operator to work out that the answer is a flag, and the path from "my
+		// daily refresh is failing" to the fix is exactly the one Review Focus 2
+		// is about. It names the flag, not a command that would refuse the same
+		// lock this message is describing.
+		writeCLIError(stderr, "update-lists: %v. An unattended refresh cannot choose which source to "+
+			"install, so a published pair it cannot read stops it. Name the source with "+
+			"`mosdns-cdnctl update-lists --pin-remote HEAD --pin-source %s` (or %q)",
+			err, rules.RepositoryV2Fly, rules.RepositoryChina)
 		return exitStateUnavailable
 	}
 	published := countListRules(current)
@@ -843,21 +862,31 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	}
 	defer func() { _ = release() }()
 
-	// Two checks read the outgoing lock, and both refuse a lock this build cannot
+	// Two checks read the outgoing pair, and both refuse one this build cannot
 	// parse -- which is what a published schema version 1 lock is, and what the
-	// refusal ParseSourceLock prints names this command to recover from. An
-	// operator who named the source has said what replaces it, so the pair is
-	// overwritten deliberately rather than by accident, and both checks give way.
-	// The archive does not: it is the record of what was running, and it is
-	// written verbatim so a lock this build cannot read is still preserved.
-	namedSource := options.pinSource != ""
-	if !namedSource {
-		if _, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err != nil {
+	// refusal ParseSourceLock prints names this command to recover from.
+	//
+	// What a named source widens is WHICH lock may be replaced, not whether a
+	// disagreement is reported. So the pair is still read: if it parses, a list
+	// that disagrees with its own lock is reported, because that is a different
+	// failure from the one --pin-source exists for -- a hand-edited published
+	// list, and the operator is the one who can say whether it was deliberate.
+	// A v1 document cannot parse, so on the path that needed the flag there is
+	// nothing to report and the warning costs nothing.
+	if _, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err != nil {
+		if options.pinSource == "" && options.pinRepository == "" {
+			// No source was named and none was measured, so there is no
+			// repository to pin without the pair -- including on an unattended
+			// refresh, where the measured repository is what makes this reachable.
 			writeCLIError(stderr, "update-lists: %v. Name the source to pin with `--pin-source %s` "+
 				"(or %q) to publish over a lock this build cannot read",
 				err, rules.RepositoryV2Fly, rules.RepositoryChina)
 			return exitStateUnavailable
 		}
+		// A source IS known, so the pair is being replaced deliberately. The
+		// refusal still goes to stderr: an operator who asked for this deserves
+		// to know what they are replacing.
+		writeCLIError(stderr, "update-lists: replacing a published pair this build cannot read: %v", err)
 	}
 	// Archived before the publish and replaced by it, and the order is the mechanism:
 	// once the new lock is renamed into place the old one no longer exists anywhere,
@@ -869,14 +898,18 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// A failure here stops the pin rather than being warned about. Publishing without
 	// an archive is the one outcome this cannot be recovered from: the rollback target
 	// is destroyed by the very operation that needed it.
-	archive := rules.Archive
-	if namedSource {
-		archive = rules.ArchiveVerbatim
-	}
-	if err := archive(options.previousLock, options.sourceLock); err != nil {
-		writeCLIError(stderr, "update-lists: archive the outgoing pin, so publishing would leave "+
-			"no way back: %v", err)
-		return exitStateUnavailable
+	//
+	// The canonical archiver is tried FIRST and the verbatim one is a fallback for
+	// the lock it cannot parse. Choosing on whether the outgoing lock parses rather
+	// than on which flag was typed is what keeps a healthy machine's archive
+	// re-encoded -- the property Archive exists to preserve, and one that a
+	// --pin-source run has no reason to give up.
+	if err := rules.Archive(options.previousLock, options.sourceLock); err != nil {
+		if verbatimErr := rules.ArchiveVerbatim(options.previousLock, options.sourceLock); verbatimErr != nil {
+			writeCLIError(stderr, "update-lists: archive the outgoing pin, so publishing would leave "+
+				"no way back: %v", verbatimErr)
+			return exitStateUnavailable
+		}
 	}
 	if err := rules.Publish(options.sourceLock, options.listFile, pinned, list); err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)

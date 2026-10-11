@@ -3407,6 +3407,54 @@ class PinnedRangeSnapshotTests(_Staged):
                     f"{because} with nothing written down to explain it",
                 )
 
+    def test_the_manual_documents_the_flag_that_leaves_a_v1_lock(self):
+        """The escape hatch has to be where an operator looks, not only in stderr.
+
+        A machine upgraded onto a build that reads schema version 2 is refused a
+        version 1 lock, and the refusal names one command: `update-lists
+        --pin-remote HEAD --pin-source <repository>`. postinst points operators at
+        this manual for exactly the question of how to re-pin deliberately, so a
+        manual that documents `--pin-remote` without `--pin-source` describes a
+        command that cannot follow its own advice.
+
+        The two reviewed repositories are read out of the source rather than
+        restated, so a third source without a manual entry fails here.
+        """
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-cdnctl.1")
+        self.assertIn(
+            "--pin-source", manual,
+            "mosdns-cdnctl(1) does not document --pin-source, so the only way out of a "
+            "published lock this build refuses is a flag a reader has to find in a Go "
+            "error string",
+        )
+        self.assertIn(
+            "schema version 1", manual,
+            "mosdns-cdnctl(1) documents --pin-source without saying WHY it exists, so an "
+            "operator cannot tell whether the command they were told to run needs it",
+        )
+        constants = (REPO / "internal" / "rules" / "download.go").read_text(encoding="utf-8")
+        repositories = sorted(set(re.findall(
+            r'^\tRepository(?:China|V2Fly) = "([\w.-]+/[\w.-]+)"$', constants, re.M)))
+        self.assertTrue(repositories, "no reviewed repository was read out of the source")
+        for repository in repositories:
+            with self.subTest(repository=repository):
+                self.assertIn(
+                    repository, manual,
+                    f"mosdns-cdnctl(1) does not name {repository!r}, so --pin-source accepts a "
+                    f"value the operator has to guess or read out of a source file",
+                )
+        # And the way back, which is the other half: an operator who migrates
+        # needs to be told how to undo it without editing a file.
+        self.assertIn(
+            "--pin-remote", manual,
+            "mosdns-cdnctl(1) documents --pin-source without the --pin-remote it requires",
+        )
+        self.assertIn(
+            "previous", manual.lower(),
+            "mosdns-cdnctl(1) does not say where the outgoing pin is archived, so an "
+            "operator has no path back from a migration",
+        )
+
     def test_the_manual_documents_the_selector_modes_and_how_to_stop_the_feature(self):
         """Three ways to stop it, none of them equivalent, and all three were absent.
 

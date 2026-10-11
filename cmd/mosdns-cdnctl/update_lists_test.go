@@ -1256,6 +1256,154 @@ func TestAMachineOnAV1LockCanFollowTheRefusalItIsGiven(t *testing.T) {
 	}
 }
 
+// A healthy machine that names its source must get the SAME archive every other
+// pin gets. Choosing the archiver on which flag was typed rather than on whether
+// the outgoing lock parses gives up the property Archive re-encodes for -- that
+// the archive is a lock this package writes, not the bytes someone left on disk
+// -- and it gives it up silently, on a machine where nothing is wrong.
+func TestPinSourceOverAHealthyPairLeavesAnArchiveThisBuildCanReadBack(t *testing.T) {
+	// Two properties in one run, because the run is what produces both: it
+	// publishes, and the archive it leaves behind is usable. An archive this
+	// build cannot parse is a rollback target it cannot roll back to.
+	paths := newListPaths(t)
+	installed := []byte("domain:previous.cn\n")
+	publishPair(t, paths, lockedCommit, installed)
+	// Rewritten on one line, which still parses: a lock is a lock whatever its
+	// whitespace. The fixture is what makes the archive comparison below mean
+	// something -- a pair written by Encode() looks the same either way, so a
+	// test using one cannot tell a copy from a re-encode.
+	oneline, err := os.ReadFile(paths.sourceLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compact := bytes.ReplaceAll(bytes.ReplaceAll(oneline, []byte("\n"), nil), []byte("  "), nil)
+	if err := os.WriteFile(paths.sourceLock, compact, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// The compact lock has to be readable, or this fixture is testing the v1
+	// path again under a different name.
+	if _, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile); err != nil {
+		t.Fatalf("the compact fixture is not a readable pair: %v", err)
+	}
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote over a healthy pair exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+
+	published, _, found, readErr := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if readErr != nil || !found {
+		t.Fatalf("the published pair cannot be read after the pin: %v", readErr)
+	}
+	if published.Primary.Commit != remoteCommit {
+		t.Errorf("published %+v, want the remote commit %s", published.Primary, remoteCommit)
+	}
+
+	// The archive is the rollback target, and ReadPrevious is how it is read.
+	// A v1 or otherwise unparseable archive is a file this build can see and
+	// cannot use, which is the failure this asserts has not happened here.
+	archived, err := rules.ReadPrevious(paths.previousLock)
+	if err != nil {
+		t.Fatalf("the archive is not a lock this build can read back: %v", err)
+	}
+	if archived.Primary.Commit != lockedCommit || archived.Primary.Repository != rules.RepositoryV2Fly {
+		t.Errorf("the archive names %+v, want the outgoing pin at %s", archived.Primary, lockedCommit)
+	}
+	// And it is the canonical encoding, not the bytes that were on disk. The
+	// outgoing lock here was written on one line, so a copy would be visibly
+	// different from what this package writes -- which is the whole reason
+	// Archive re-encodes rather than copies, and the reason choosing the
+	// archiver on WHICH FLAG WAS TYPED is wrong: a compact lock parses, so the
+	// machine is healthy and the canonical archive is the one that should
+	// happen.
+	raw, err := os.ReadFile(paths.previousLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := archived.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Canonical is the expectation, and a verbatim copy is the failure. The
+	// fixture makes them different documents, so exactly one of these two
+	// comparisons can hold and the test says which.
+	if bytes.Equal(raw, compact) {
+		t.Errorf("the archive is a verbatim copy of the outgoing lock, which is the property this test exists to catch:\n%s", raw)
+	}
+	if !bytes.Equal(raw, canonical) {
+		t.Errorf("the archive is not what this package writes:\n%s\nwant\n%s", raw, canonical)
+	}
+	if !strings.Contains(stdout, "pinned-commit: "+remoteCommit) {
+		t.Errorf("the pin did not report the commit it published:\n%s", stdout)
+	}
+}
+
+// The digest tripwire guards against a published list somebody edited by hand.
+// Naming a source is not a reason to lose it: the flag widens WHAT may be
+// replaced, not whether a disagreement is reported.
+func TestPinSourceOverAHandEditedListStillReportsTheDisagreement(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	// Someone edited the published list; the lock still records the old digest.
+	if err := os.WriteFile(paths.listFile, []byte("domain:tampered.cn\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	if !strings.Contains(stderr, "tampered") && !strings.Contains(stderr, "does not match the list_sha256") {
+		t.Fatalf("a hand-edited published list was replaced with no report of the disagreement: %q", stderr)
+	}
+}
+
+// Without the flag, an unreadable pair is a refusal. It is also the only way
+// that path is reachable on an UNATTENDED run: refreshChinaList sets the
+// repository it measured, so its pin never consults a published lock for one,
+// and this is the refusal that has to hold when a scheduled run finds the pair
+// broken. A path no test constructs is a path no test holds.
+func TestTheUnattendedRefreshRefusesAPairItCannotRead(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	// The lock is truncated into something this build will not read: the
+	// scheduled run must stop rather than publish over a pair it cannot account
+	// for, because there is no operator at the keyboard to say what should
+	// replace it.
+	if err := os.WriteFile(paths.sourceLock, []byte("{ this is not a lock"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, paths.dir)
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, true, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code == exitSuccess {
+		t.Fatal("an unattended refresh published over a pair it could not read")
+	}
+	if !strings.Contains(stderr, "not a lock") && !strings.Contains(stderr, "decode source lock") {
+		t.Errorf("the refusal does not name the problem: %q", stderr)
+	}
+	if !strings.Contains(stderr, "--pin-source") {
+		t.Errorf("the refusal does not say what an operator could do about it: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
 // The flag's value becomes a path in a URL, so it is checked against the
 // allowlist where a caller supplies it rather than where the fetch would use it.
 func TestTheSourceFlagIsRefusedUnlessItNamesAReviewedRepository(t *testing.T) {
