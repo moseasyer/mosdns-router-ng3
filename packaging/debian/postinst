@@ -34,13 +34,15 @@
 # tmpfiles.d entry is the only thing that brings it back after a reboot, because
 # /run is a tmpfs and the group, the setgid bit and the default ACL are all gone.
 #
-# STEP 3 is the pinned data this package ships. It is TWO pairs now. The China
+# STEP 3 is the pinned data this package ships. It is THREE pairs now. The China
 # list is placed and its digest is verified against the list_sha256 in the lock
 # that describes it; the Cloudflare range document is verified against the sha256
-# in the lock beside it and is never written at all. NEITHER is ever re-pinned
-# here. A re-pin at install time is how an operator's reviewed pin becomes
-# something nobody reviewed, and a refusal to install because a reviewed pin
-# cannot be verified is a machine that is left exactly as it was.
+# in the lock beside it and is never written at all; the China FALLBACK pair is
+# verified against the lock beside it and placed on the same rule as the first.
+# NONE of the three is ever re-pinned here. A re-pin at install time is how an
+# operator's reviewed pin becomes something nobody reviewed, and a refusal to
+# install because a reviewed pin cannot be verified is a machine that is left
+# exactly as it was.
 #
 # The range pair is what makes an installation on a machine with no route to the
 # internet possible at all: the prefix list the response rewriter refuses to
@@ -97,10 +99,14 @@ LEGACY_RESOLVER_USER=dnscrypt-proxy
 INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
 SOURCE_LIST=/usr/share/mosdns-router/cn-domains.txt
 SOURCE_LOCK=/usr/share/mosdns-router/source-lock.json
+FALLBACK_SOURCE_LIST=/usr/share/mosdns-router/cn-domains-fallback.txt
+FALLBACK_SOURCE_LOCK=/usr/share/mosdns-router/source-lock-fallback.json
 SOURCE_RANGES=/usr/share/mosdns-router/cloudflare-ranges.json
 SOURCE_RANGES_LOCK=/usr/share/mosdns-router/cloudflare-ranges.lock.json
 PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains.txt
 PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock.json
+FALLBACK_PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains-fallback.txt
+FALLBACK_PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock-fallback.json
 
 # Debian Policy 6.5 lists four ways dpkg may call this script. `configure` is the one
 # that does the work; the other three are error unwinds, and all three still unpack
@@ -369,9 +375,10 @@ install -d -o root -g root -m 0700 /run/mosdns/watchdog
 
 # --- STEP 3: the pinned data this package ships ------------------------------
 
-# Two pairs are verified here and NEITHER is ever re-pinned, and the second pair
-# is what makes an installation on a machine with no route to the internet
-# possible at all.
+# Three pairs are verified here and NONE of the three is ever re-pinned. The
+# second is what gives a machine with no route to either repository something to
+# publish at all, and the third is what makes an installation on a machine with no
+# route to the internet possible in the first place.
 #
 # The first is the China list. Two files under /var/lib/mosdns/lists are the
 # OPERATOR's, not this package's:
@@ -436,7 +443,97 @@ if [ "$actual_digest" != "$expected_digest" ]; then
 	exit 1
 fi
 
-# ...and the second is the Cloudflare range document, which the response rewriter
+# ...and the second is the China FALLBACK pair: a second list, pinned from the other
+# reviewed source, and the lock that describes it. It exists for one machine shape
+# -- one that can reach NEITHER repository -- and for that machine it is the whole
+# of what there is to publish, which is why it is on the disk from the install and
+# not fetched on demand. Two things about it are the same as the primary pair and
+# one is not, and the difference is worth naming rather than repeating.
+#
+# It is NOT the primary list under a second name. Shipping the primary twice would
+# put 111,000 rules of a repository this machine never fetched on its disk under a
+# name that says it is the fallback, and the first run that published it would look
+# like a successful cold start. So it is a different list from a different pin, its
+# lock carries its own repository and no supplement, and the two files are separate
+# on disk rather than one file copied to two paths.
+#
+# Placed on the SAME rule as the pair above -- whole or not at all, only when it is
+# absent or unreadable -- because a hand-placed fallback is as much an operator's
+# pin as the primary is, and an upgrade that overwrote it would be re-pinning it by
+# another name. And `install` rather than `cp` for the reason it is above: the mode
+# and the group are the published ones rather than whatever the caller's umask left.
+#
+# The check below comes FIRST, and it reads the SHIPPED pair rather than the
+# published one. That is the one thing about the fallback which is not the same as
+# the pair above, and both halves of it are deliberate.
+#
+# It reads the shipped pair because the pair above compares the files on disk for a
+# reason that does not apply here: the router is about to read them, so it checks
+# whatever is there -- the operator's list or this package's. Nothing has read the
+# fallback on a machine that just installed it, so the only claim this step can make
+# about it is the narrower one: the bytes this .deb carries are the bytes the lock
+# beside them records. A mismatch is then a damaged archive rather than an
+# operator's state, which is why the way out below is reinstalling the package and
+# NOT a re-pin -- `dpkg` owns both files.
+#
+# And it happens before the placement rather than after it, because refusing after
+# publishing would put a list this project cannot account for on the disk and then
+# complain about it, and a machine whose fallback pair was written once, unreadable
+# and half-replaced is worse than one with no fallback at all.
+if [ ! -r "$FALLBACK_SOURCE_LIST" ] || [ ! -r "$FALLBACK_SOURCE_LOCK" ]; then
+	echo "postinst: $FALLBACK_SOURCE_LIST and $FALLBACK_SOURCE_LOCK are the pinned China" >&2
+	echo "postinst: fallback this package ships, and one or both of them is not readable" >&2
+	echo "postinst: at $FALLBACK_SOURCE_LIST. It is what a machine with no route to either" >&2
+	echo "postinst: repository has to publish, so this package will not complete an install" >&2
+	echo "postinst: over a fallback list it cannot account for. Nothing has been changed on" >&2
+	echo "postinst: this machine's DNS. Both files belong to dpkg rather than to an operator's" >&2
+	echo "postinst: pin, so nothing has to be re-pinned: reinstall the package from wherever" >&2
+	echo "postinst: you install it, which puts both back, and then:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+expected_fallback_digest=$(sed -n 's/.*"list_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$FALLBACK_SOURCE_LOCK")
+if [ -z "$expected_fallback_digest" ]; then
+	echo "postinst: $FALLBACK_SOURCE_LOCK names no list_sha256, so the fallback list beside" >&2
+	echo "postinst: it cannot be verified, and a list this project cannot account for is not" >&2
+	echo "postinst: one this package installs. Nothing has been changed on this machine's DNS." >&2
+	echo "postinst: Both files belong to dpkg, so reinstall the package from wherever you" >&2
+	echo "postinst: install it, which puts both back, and then:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+actual_fallback_digest=$(sha256sum "$FALLBACK_SOURCE_LIST" | cut -d' ' -f1)
+if [ "$actual_fallback_digest" != "$expected_fallback_digest" ]; then
+	echo "postinst: $FALLBACK_SOURCE_LIST is $actual_fallback_digest and" >&2
+	echo "postinst: $FALLBACK_SOURCE_LOCK records $expected_fallback_digest for it, so this" >&2
+	echo "postinst: package cannot account for the fallback list it carries. Refusing to" >&2
+	echo "postinst: install over a pair it cannot name. Nothing has been changed on this" >&2
+	echo "postinst: machine's DNS, and no fallback pair has been published. Compare the two" >&2
+	echo "postinst: digests, and reinstall the package from wherever you install it, which" >&2
+	echo "postinst: puts both files back, if the pair is not what you expected:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+echo "postinst: the pinned fallback list at $FALLBACK_SOURCE_LIST is" >&2
+echo "postinst: $actual_fallback_digest, as $FALLBACK_SOURCE_LOCK records. It is verified" >&2
+echo "postinst: here and placed only when absent; 'mosdns-cdnctl update-lists --check'" >&2
+echo "postinst: prints how old the live pin is, and this is the list a machine with no" >&2
+echo "postinst: route to either repository has to fall back to." >&2
+
+# ...and only now, with the bytes accounted for, is it published -- on the pair's
+# rule, the pair's unit and the pair's install pattern.
+if [ ! -r "$FALLBACK_PUBLISHED_LIST" ] || [ ! -r "$FALLBACK_PUBLISHED_LOCK" ]; then
+	install -o root -g "$STATE_GROUP" -m 0640 "$FALLBACK_SOURCE_LIST" "$FALLBACK_PUBLISHED_LIST"
+	install -o root -g "$STATE_GROUP" -m 0640 "$FALLBACK_SOURCE_LOCK" "$FALLBACK_PUBLISHED_LOCK"
+	echo "postinst: placed the reviewed fallback snapshot this package ships at" >&2
+	echo "postinst: $FALLBACK_PUBLISHED_LIST, because the published fallback pair was" >&2
+	echo "postinst: absent or unreadable. Nothing has been re-pinned." >&2
+else
+	echo "postinst: $FALLBACK_PUBLISHED_LIST and $FALLBACK_PUBLISHED_LOCK are already" >&2
+	echo "postinst: published and readable, so they are left exactly as they are." >&2
+fi
+
+# ...and the third is the Cloudflare range document, which the response rewriter
 # refuses to CONSTRUCT without: it builds its prefix watcher before anything else
 # and returns the error, so a router with no published ranges binds nothing on
 # port 53. Its only producer fetches from one endpoint, so without a snapshot of
