@@ -814,6 +814,18 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// primary's size may be compared against what is on disk -- and it is decided
 	// here, once, rather than inferred from two unequal numbers further down.
 	migrating := found && pinned.Primary.Repository != destination
+	// gaining is this machine published a dnsmasq primary with NO supplement beside
+	// it -- what a first migration from the fallback leaves behind, and what a
+	// manual `--pin-source` install of the primary leaves behind. It is the same
+	// shape as migrating: the published pair holds nothing of the source, so there
+	// is no previous contribution of it to compare a new one against.
+	//
+	// It is a separate name rather than an extra arm of `migrating` because the two
+	// guards are skipped for different sources. A migration moves the PRIMARY, so
+	// the primary's baseline is missing; a gaining machine is already on the
+	// primary, so the SUPPLEMENT's baseline is the missing one, and the primary's
+	// guardrail runs normally against a like-for-like count.
+	gaining := pinned.Supplement == nil
 
 	client := services.newHTTPClient()
 	resolved, err := rules.ResolveHEAD(ctx, client, destination)
@@ -832,17 +844,27 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 			len(rules.SupplementKinds()), err)
 		return exitStateUnavailable
 	}
-	if !migrating && found &&
+	// "Already at" means BOTH sources are where this machine left them.
+	//
+	// `gaining` is what keeps this safe as well as honest. This build's refresh
+	// always resolves a supplement beside a dnsmasq primary, so `supplement` is
+	// never nil here and asking whether IT is nil says nothing about the machine.
+	// The question is whether the PUBLISHED pair held one, and `pinned.Supplement`
+	// is nil exactly then -- so the comparison below is the one that has a value to
+	// dereference. Short-circuit order matters and is the whole safety property:
+	// `!gaining` is tested before `pinned.Supplement.Commit` is read.
+	//
+	// The run must act rather than report already-at on a gaining machine, because
+	// a source this machine has never published is not a source it is up to date
+	// with. Its ~70 rules are simply absent from the published list -- the dnsmasq
+	// syntax cannot express them -- and reporting a no-op would freeze the machine
+	// on the short list for as long as the primary's own HEAD stays quiet.
+	if !migrating && !gaining && found &&
 		resolved.Primary.Commit == pinned.Primary.Commit &&
-		(supplement == nil || supplement.Commit == pinned.Supplement.Commit) {
-		// Already there -- and "there" means BOTH sources, because the second one
-		// moves on its own schedule. Reporting already-at because the primary is
-		// unchanged would freeze the supplement's rules for as long as the other
-		// repository stayed quiet, which is not a state anybody chose.
-		//
-		// Nothing to do and nothing to say beyond the fact, because re-downloading and
-		// re-publishing an identical commit is how a daily job turns a no-op into wear
-		// on the disk the machine is running from.
+		supplement.Commit == pinned.Supplement.Commit {
+		// Already there. Nothing to do and nothing to say beyond the fact, because
+		// re-downloading and re-publishing an identical commit is how a daily job
+		// turns a no-op into wear on the disk the machine is running from.
 		writeReportLine(stdout, "china-list: already at %s\n", pinned.Primary.Commit)
 		return exitSuccess
 	}
@@ -892,14 +914,23 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	} else if err := guardSize(stderr, "primary", &published.Primary, isPrimary, wasPrimary, minimumRetained); err != nil {
 		return exitStateUnavailable
 	}
-	if supplement != nil {
-		// The supplement guard needs no exemption of its own. On a migration and on
-		// a cold start this machine published no supplement, so wasSupplement is
-		// zero and guardSize reads a published count of zero as nothing to compare
-		// against rather than as a count of nothing.
-		if err := guardSize(stderr, "supplement", supplement, isSupplement, wasSupplement, minimumRetained); err != nil {
-			return exitStateUnavailable
-		}
+	// The supplement is not optional for a dnsmasq primary, so this is a guardrail
+	// and never a question about whether one exists. The `supplement != nil` test
+	// that used to be here was unreachable: resolveSupplement always returns one,
+	// and reading a reachable test as a live one is what let a nil published
+	// supplement reach the comparison above.
+	if gaining {
+		// No previous supplement on this machine to weigh against, so the
+		// guardrail cannot run at all -- and that is not a failure of the guard
+		// skipping a real check, because there is no check to make. Said out loud
+		// for the reason the migration says it: a guardrail that is skipped in
+		// silence is indistinguishable from one that passed, and this is the run
+		// that first puts ~70 rules into the list.
+		writeReportLine(stdout, "china-list: adding the %s supplement for the first time; its collapse "+
+			"guardrail was skipped on this run, because it is judged per source and this machine has "+
+			"published no supplement to compare against\n", supplement.Repository)
+	} else if err := guardSize(stderr, "supplement", supplement, isSupplement, wasSupplement, minimumRetained); err != nil {
+		return exitStateUnavailable
 	}
 
 	// Publish what was MEASURED, not whatever HEAD has become since. This is the

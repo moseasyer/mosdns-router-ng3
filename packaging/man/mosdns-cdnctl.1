@@ -175,7 +175,11 @@ second primary, it is what this gateway falls back to. That migration is the one
 run with no previous count to measure against \em the number on disk belongs to the
 source being left, and weighing the new primary against it would be exactly the
 cross\-source comparison the guardrail above exists to refuse \em so the collapse
-guardrail is skipped on that run, and the report says so by name. A machine whose
+guardrail is skipped on that run, and the report says so by name. The same applies
+to the supplement on the run that installs one for the first time: a list published
+from the dnsmasq primary with no supplement beside it has no previous contribution
+of that source to weigh a new one against, and the report names that skip too. A
+machine whose
 list names a repository this build does not know is refused with that name, rather
 than being moved onto a source nobody reviewed.
 .TP

@@ -2214,33 +2214,41 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 			},
 		},
 	})
-	// Upstream answers `measured` for its first three resolutions of HEAD and
-	// `collapsed` from the fourth on. Three is the drift report's two plus the
-	// refresh's one, so `measured` is what this run measures; a fourth resolution is
-	// a caller that ignored that measurement and asked again, which is the defect
-	// this case is about -- and since the measured ref is now handed to the
-	// publication as it stands rather than re-resolved, a correct run never reaches
-	// a fourth at all. The scenario still says what it means to say: if a
-	// re-resolution ever comes back, it gets the collapsed commit and this fails.
+	// Upstream answers `measured` for the first THREE resolutions of the PRIMARY's
+	// HEAD and `collapsed` from the fourth on. Three is the drift report's two --
+	// a cheap commit check, then the archive digest it reports -- plus the
+	// refresh's one measurement. A fourth primary resolution is therefore a caller
+	// that ignored that measurement and asked again, which is the defect this case
+	// is about; since the measured ref is handed to the publication as it stands
+	// rather than re-resolved, a correct run never reaches one.
 	//
-	// The count is anchored to the code and that is stated rather than hidden. Two
-	// earlier anchors were tried and both failed the same way -- they fired during the
-	// drift report, so the thing that got measured was already the collapsed commit and
-	// both implementations refused. A case whose scenario depends on this number
-	// staying 3 says so in a comment; if the report's resolution count changes, this
-	// gate fails loudly rather than quietly testing nothing.
+	// The count is of the PRIMARY's resolutions ONLY, and the supplement's is
+	// deliberately excluded. A run also resolves the supplement against its own
+	// repository, so counting every HEAD request put the fourth at the SUPPLEMENT
+	// -- which meant the gate fired on every correct run and therefore said nothing
+	// about the defect it names, while a real re-resolution of the primary would
+	// have been the fifth and tripped nothing either. The gate was decorative; the
+	// scenario behind it was not, and this is the count that says so.
+	//
+	// The number is ASSERTED below rather than assumed, which is what the earlier
+	// version of this comment claimed and did not do: if the flow ever stops
+	// resolving the primary exactly three times, this fails with that fact instead
+	// of quietly going on testing nothing.
 	//
 	// The flip takes effect on the request that sets it, because the origin answers
 	// from the field after the hook runs. Getting that backwards makes the FIRST
 	// resolution the collapsed one, which is how the first attempt at this case
 	// refused a run that was doing exactly the right thing.
-	resolutions := 0
+	primaryResolutions := 0
 	origin.onServe = func(o *fakeOrigin, request *http.Request) {
 		if !strings.HasSuffix(request.URL.Path, "/commits/HEAD") {
 			return
 		}
-		resolutions++
-		if resolutions >= 4 {
+		if !strings.Contains(request.URL.Path, rules.RepositoryChina) {
+			return
+		}
+		primaryResolutions++
+		if primaryResolutions >= 4 {
 			o.setHead(rules.RepositoryChina, collapsed)
 		}
 	}
@@ -2250,6 +2258,15 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--automatic exited %d (stderr: %s)", code, stderr)
+	}
+	// The anchor, checked. A correct run resolves the primary three times; if that
+	// number moves, the gate above is no longer sitting where a re-resolution would
+	// land, and every assertion below it would pass without ever being threatened.
+	if primaryResolutions != 3 {
+		t.Fatalf("this case is anchored to the primary being resolved 3 times and it was "+
+			"resolved %d times, so the gate that flips the origin to the collapsed commit no "+
+			"longer fires on a caller that re-resolves after measuring: update the anchor",
+			primaryResolutions)
 	}
 	lock, list, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
 	if err != nil {
@@ -2357,6 +2374,100 @@ func TestThePrimaryIsJudgedByItsOwnCountRatherThanTheUnion(t *testing.T) {
 		t.Fatalf("the refusal does not name the source that collapsed: %s", stderr)
 	}
 	assertUnchanged(t, before, paths.dir, "")
+}
+
+// A machine published from the dnsmasq primary with NO supplement gains one even
+// though its primary has not moved.
+//
+// This is the state a first migration from the fallback leaves behind: a dnsmasq
+// primary published without the second source, because the fallback publication it
+// replaced had none and the refresh that installed the primary refused to carry one it
+// could not find. A manual `--pin-source felixonmars/dnsmasq-china-list` first install
+// publishes the same shape.
+//
+// Reporting "already at" here would freeze the machine on a list that is missing every
+// rule the supplement carries -- the dnsmasq syntax cannot express `full:` or `regexp:`,
+// so those ~70 rules are simply not on disk -- for as long as the primary's own HEAD
+// stays quiet. So "already at" has to mean "both sources are where this machine left
+// them", and a source this machine has never published is not where it left it.
+func TestAMachineWithNoSupplementGainsOneEvenWhenThePrimaryHasNotMoved(t *testing.T) {
+	paths := newListPaths(t)
+	// No supplement beside the primary: this is the pair a first migration and a
+	// manual first install both leave behind.
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			// The primary has NOT moved. That is the whole point of the case: the
+			// run must still act, because the second source is new to this machine.
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
+	})
+
+	code, stdout, stderr := runAutomatic(t, paths, origin)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exited %d (stdout: %s, stderr: %s)", code, stdout, stderr)
+	}
+	lock, list, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatalf("the refresh published a pair that does not describe itself: %v", err)
+	}
+	if strings.Contains(stdout, "already at") {
+		t.Fatalf("the refresh reported already-at while the machine had never published a "+
+			"supplement, so the rules only it can express stay missing for good:\n%s", stdout)
+	}
+	if lock.Supplement == nil {
+		t.Errorf("the refresh left a dnsmasq primary published without a supplement, so the "+
+			"list it wrote is missing every rule the dnsmasq syntax cannot express: %+v", lock)
+	}
+	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
+		if !strings.Contains(string(list), want) {
+			t.Errorf("the published list lost %q, which only the second source can express:\n%s", want, list)
+		}
+	}
+	// The primary did not move, so it must not have been re-pointed at anything.
+	if lock.Primary.Commit != lockedCommit {
+		t.Errorf("the primary moved to %s although its own HEAD did not", lock.Primary.Commit)
+	}
+}
+
+// The same run has to say that the supplement's guardrail was skipped, because there
+// is no previous supplement on this machine to weigh it against -- the same argument
+// the migration report makes for the primary, applied to the other source.
+func TestANewlyGainedSupplementSaysItsGuardrailWasSkipped(t *testing.T) {
+	paths := newListPaths(t)
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
+	})
+
+	code, stdout, stderr := runAutomatic(t, paths, origin)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exited %d (stdout: %s, stderr: %s)", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "supplement") || !strings.Contains(stdout, "guardrail") {
+		t.Errorf("the report does not say the supplement's guardrail was skipped and why, so a "+
+			"reader cannot tell it from a run that weighed it: %s", stdout)
+	}
 }
 
 // The supplement is a source in its own right, so it is refreshed when it moves --
