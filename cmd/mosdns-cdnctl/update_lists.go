@@ -259,6 +259,13 @@ type updateListOptions struct {
 	// the lock had to hand over a repository too. Task 4 replaces this string
 	// with the primary/supplement refs the lock actually carries.
 	pinRepository string
+	// force answers exactly one question: "the published pair disagrees with
+	// itself, and I mean to publish over it anyway". It is not a general override.
+	// It waives no other refusal in this command -- not the collapse guardrail,
+	// not the repository allowlist, not the archive-before-publish ordering -- so
+	// a flag that made every refusal here decorative is deliberately not what
+	// this is.
+	force         bool
 	refreshRanges bool
 	sourceLock    string
 	listFile      string
@@ -312,6 +319,7 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
 	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from, as `--pin-source "+rules.RepositoryV2Fly+"`. Without it the repository is read from the published lock, which is what a machine with a readable lock wants; with it the pin does not read that lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
+	force := flags.Bool("force", false, "publish over a published pair that disagrees with itself -- a list whose digest the lock beside it does not record. That is the state a crash between this command's two renames leaves behind, and it is refused without this flag because nothing here archives the list, so publishing over it destroys the only trace of what was on disk. This waives NOTHING else: a collapsed list, an unreviewed repository and a lock that cannot be read are refused with or without it")
 	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
 	listFile := flags.String("list-file", defaultListFilePath, "path to the converted list")
@@ -394,6 +402,7 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 		policy:           *policy,
 		pinRemote:        selectedPin,
 		pinSource:        selectedSource,
+		force:            *force,
 		refreshRanges:    *refreshRanges,
 		sourceLock:       *sourceLock,
 		listFile:         *listFile,
@@ -822,11 +831,46 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	if repository == "" {
 		// Nothing named one, so the published lock does.
 		published, _, found, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile)
+		if readErr != nil && rules.PublishedPairRefuses(readErr) && options.force {
+			// A pair that disagrees with itself still NAMES a repository -- the
+			// lock beside it parsed, and its primary is right there. It is the LIST
+			// that does not match, so the repository is known and only the pair is
+			// broken. ReadPublishedPair returns a zero lock on any error, so the
+			// lock is read directly rather than recovered from its refusal.
+			//
+			// Refusing to read it here would leave --force with no way to run: this
+			// read is where the repository comes from, and stranding the operator a
+			// second time is the defect this whole flag exists to fix.
+			if raw, readLockErr := os.ReadFile(options.sourceLock); readLockErr == nil {
+				if lock, parseErr := rules.ParseSourceLock(raw); parseErr == nil {
+					published = lock
+					found = true
+					readErr = nil
+				}
+			}
+		}
 		if readErr != nil {
 			// There is no repository to pin without the lock, so this refusal has
 			// to say which flag supplies one. A refusal that names no way forward
 			// leaves the operator to edit a file by hand, which is the outcome the
 			// v1 lock's own refusal names this command to avoid.
+			//
+			// A pair that DISAGREES is a different state and needs a different
+			// answer: the lock beside it parsed, so the repository is known and
+			// only the pair is broken -- which is what a crash between the two
+			// renames leaves, and --force is what publishes over it. Naming
+			// --pin-source here would send the operator down a path that cannot
+			// work, because the pin would still refuse the disagreement below.
+			if rules.PublishedPairRefuses(readErr) {
+				writeCLIError(stderr, "update-lists: %v.\n"+
+					"This is the state a crash between this command's two renames leaves behind, and no "+
+					"hand edit is needed to reach it: the list was renamed into place and the lock was not.\n"+
+					"Nothing was published, and the pair on disk is exactly as you found it.\n"+
+					"Publish a fresh pair with `--pin-remote HEAD --force`, which replaces both files "+
+					"together and leaves a pair that describes itself.",
+					readErr)
+				return exitStateUnavailable
+			}
 			writeCLIError(stderr, "update-lists: %v. Name the source to pin with `--pin-source %s` "+
 				"(or %q) to pin without reading the published lock", readErr, rules.RepositoryV2Fly, rules.RepositoryChina)
 			return exitStateUnavailable
@@ -868,27 +912,47 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// A lock this build cannot PARSE is the case --pin-source exists for: the
 	// pair says nothing about which repository to pin, the operator has named
 	// one, and the publication replaces a document this build was never able to
-	// read. It goes to stderr and continues \em there is no disagreement to
+	// read. It goes to stderr and continues -- there is no disagreement to
 	// preserve, because a document that does not parse cannot disagree with
 	// anything.
 	//
-	// A pair that PARSES and disagrees with itself is the opposite: the lock is
-	// fine and the list beside it is not the one the lock records, which means
-	// the list was changed out of band. That is refused rather than reported,
-	// for two reasons. The archive covers the lock alone \em nothing here
-	// archives cn-domains.txt, so publishing over it destroys the only trace of
-	// the change and a line on stderr is the whole record of it. And a refusal
-	// costs nothing legitimate: the lock Publish writes records the digest of
-	// the list Publish wrote, so a published pair can never disagree, and the
-	// only way to reach this is to have changed a file by hand.
+	// A pair that PARSES and disagrees with itself is the opposite, and the most
+	// important thing to say about it is that NOBODY has to have edited anything.
+	// Publish cannot rename the two files as one operation, so it publishes the
+	// list first and the lock second, and a crash between those renames leaves
+	// the previous lock beside a new list -- a state this project creates by
+	// design, which Publish's own doc comment states. An earlier version of this
+	// comment claimed the only way here was a hand edit, which was false, and
+	// the refusal built on it turned a transient state the publisher produces
+	// into a permanent one.
+	//
+	// So it is refused by default, and --force publishes over it. The refusal
+	// earns that default: nothing here archives cn-domains.txt, so publishing
+	// over the list destroys the only trace of what was on disk, and a line on
+	// stderr is the whole record. The flag is the whole answer to that, and it
+	// waives nothing else -- the collapse guardrail, the allowlist and the
+	// archive ordering are all upstream of this and none of them consults it.
 	if _, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err != nil {
-		if rules.PublishedPairRefuses(err) {
-			writeCLIError(stderr, "update-lists: %v. Nothing was published, and the list this lock "+
-				"describes is the one still on disk; if you changed it deliberately, replace the "+
-				"pair with a fresh pin from the source that produced it", err)
+		switch {
+		case rules.PublishedPairRefuses(err) && !options.force:
+			writeCLIError(stderr, "update-lists: %v.\n"+
+				"This is the state a crash between this command's two renames leaves behind, and no "+
+				"hand edit is needed to reach it: the list was renamed into place and the lock was not. "+
+				"Nothing was published, and the pair on disk is exactly as you found it.\n"+
+				"Publish a fresh pair with `--pin-remote HEAD --force`, which replaces both files "+
+				"together and leaves a pair that describes itself. If you have no route out, restore "+
+				"the list from the lock instead: its digest is the list_sha256 the refusal above prints.",
+				err)
 			return exitStateUnavailable
+		case rules.PublishedPairRefuses(err):
+			// Forced, and said so: the operator replaced a list whose previous
+			// contents are in no archive, and that is worth a line in the record.
+			writeCLIError(stderr, "update-lists: --force: publishing over a pair that disagrees with "+
+				"itself. The list being replaced is archived nowhere, so %s is the last copy of it.",
+				options.listFile)
+		default:
+			writeCLIError(stderr, "update-lists: replacing a published lock this build cannot read: %v", err)
 		}
-		writeCLIError(stderr, "update-lists: replacing a published lock this build cannot read: %v", err)
 	}
 	// Archived before the publish and replaced by it, and the order is the mechanism:
 	// once the new lock is renamed into place the old one no longer exists anywhere,

@@ -43,30 +43,45 @@ func TestOnlyAnUnparseableLockIsReportedAsErrLockUnreadable(t *testing.T) {
 		t.Error("an empty lock path is reported as an unreadable lock")
 	}
 
-	// And a lock this build CAN read is archived rather than reported, whatever
-	// else is true of it: the split is about the document, not about validity.
-	// A lock that parses but fails Validate is accepted here and re-encoded --
-	// Archive does not call Validate, and refusing it would mean a lock that is
-	// wrong in some other way could not be rolled back from.
-	parsed := SourceLock{
+	// And a lock that PARSES but is not VALID is archived and re-encoded, not
+	// reported: the split is about the document, not about whether the document
+	// is correct. Archive does not call Validate, and refusing an invalid lock
+	// here would mean a machine that published one could not roll back from it.
+	//
+	// The fixture has to actually fail Validate, or it proves nothing -- and the
+	// obvious way to make one (a lock with a bad digest) is refused by
+	// ParseSourceLock's caller rather than by Archive, so it would test nothing
+	// either. `kinds` on a primary parses and is refused by validateRef, which is
+	// the shape this wants.
+	invalid := SourceLock{
 		SchemaVersion: schemaVersion,
 		Primary: SourceRef{
 			Repository: RepositoryV2Fly,
 			Commit:     strings.Repeat("a", 40),
 			SHA256:     strings.Repeat("b", 64),
 			Entry:      V2FlyEntry,
+			Kinds:      []string{"full"}, // a supplement field on a primary
 		},
 		ListSHA256: strings.Repeat("e", 64),
 	}
-	encoded, err := parsed.Encode()
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("the fixture is a valid lock, so it cannot show that validity is not what Archive keys on")
+	}
+	encoded, err := invalid.Encode()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := ParseSourceLock(encoded); err != nil {
+		t.Fatalf("the fixture does not parse, so it is testing the other case: %v", err)
 	}
 	if err := os.WriteFile(current, encoded, 0o640); err != nil {
 		t.Fatal(err)
 	}
 	if err := Archive(filepath.Join(dir, "previous.json"), current); err != nil {
-		t.Errorf("a lock this build can read is not archived: %v", err)
+		t.Errorf("a lock that parses but does not validate is not archived, so a machine that published "+
+			"one could not roll back from it: %v", err)
+	} else if errors.Is(err, ErrLockUnreadable) {
+		t.Error("a lock that parses was reported as unreadable")
 	}
 }
 

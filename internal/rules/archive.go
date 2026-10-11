@@ -49,7 +49,13 @@ func Archive(previousLockPath, currentLockPath string) error {
 		// nor anything that could have failed here. Everything after this point is
 		// a failure of the archive itself, and a caller that fell back to copying
 		// on those would be reporting success for an archive that is not there.
-		return fmt.Errorf("rules: %s is not a lock this package can archive: %w", currentLockPath, ErrLockUnreadable)
+		//
+		// Joined rather than replaced, so the CAUSE survives alongside the
+		// sentinel: a caller that copies the bytes wants to tell a schema version
+		// 1 document from a truncated file, and that distinction is the whole
+		// difference between a migration and something gone wrong.
+		return fmt.Errorf("rules: %s is not a lock this package can archive: %w",
+			currentLockPath, errors.Join(err, ErrLockUnreadable))
 	}
 	// Re-encoded rather than the bytes copied. A lock that was hand-edited and still
 	// parses would otherwise be archived verbatim, and the archive would be the one

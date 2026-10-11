@@ -1384,7 +1384,12 @@ func TestPinSourceOverAHandEditedListIsRefused(t *testing.T) {
 	if _, err := os.Stat(paths.previousLock); err == nil {
 		t.Error("a refused pin left an archive, so the next rollback target is a pin that was never published")
 	}
-	_ = before
+	// The snapshot taken before the run is asserted on, rather than taken and
+	// discarded: a refusal that wrote something the two file checks above happen
+	// to miss would still be a refusal that wrote something. The control lock is
+	// excepted because this refusal happens while holding it, and creating it is
+	// what holding it means.
+	assertUnchanged(t, before, paths.dir, "control.lock")
 }
 
 // The v1 migration the flag exists for is UNAFFECTED by the refusal: a schema
@@ -1426,6 +1431,167 @@ func TestPinSourceOverAV1LockStillPublishesWhereAParsingPairIsRefused(t *testing
 			t.Errorf("the refusal does not say that nothing was written: %q", stderr)
 		}
 	})
+}
+
+// leaveCrashWindow publishes a pair and then replaces ONLY the list, which is
+// byte for byte the state Publish leaves when the machine loses power between
+// its two renames -- and it is the reason the digest refusal needs an escape.
+//
+// It is not a hand-edited file. Publish cannot rename the two files as one
+// operation, so it publishes the list first and the lock second, and the window
+// between them is a state this project creates on purpose. A refusal with no way
+// past it would turn a transient state the publisher produces by design into a
+// permanent one, and the only recovery would be a human editing a file under
+// /var/lib -- which update-lists says is the outcome it exists to prevent.
+func leaveCrashWindow(t *testing.T, paths listPaths, commit string, published, replaced string) {
+	t.Helper()
+	publishPair(t, paths, commit, []byte(published))
+	if err := os.WriteFile(paths.listFile, []byte(replaced), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile); err == nil {
+		t.Fatal("the fixture is a pair that agrees, so it is not the crash window")
+	} else if !rules.PublishedPairRefuses(err) {
+		t.Fatalf("the fixture does not produce the state --force answers: %v", err)
+	}
+}
+
+// The escape exists. Without it the crash window Publish creates on purpose is
+// a state nothing can publish over, and the recovery is a human editing a file
+// under /var/lib.
+func TestForcePublishesOverTheStateACrashBetweenRenamesLeaves(t *testing.T) {
+	paths := newListPaths(t)
+	leaveCrashWindow(t, paths, lockedCommit, "domain:previous.cn\n", "domain:halfwritten.cn\n")
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--force could not publish over the crash window, so the state Publish creates has no recovery: %s", stderr)
+	}
+	// The pair agrees again: that is the whole point, and a lock that parses is
+	// not enough -- it has to describe the list actually on disk.
+	published, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("the pair still does not describe itself after --force: %v", err)
+	}
+	if published.Primary.Commit != remoteCommit {
+		t.Errorf("published %+v, want the remote commit %s", published.Primary, remoteCommit)
+	}
+}
+
+// The refusal has to NAME the escape. A refusal that names a re-pin, which then
+// refuses the same state, is the defect this task has now been round for twice.
+func TestTheRefusalNamesTheCommandThatRecoversFromIt(t *testing.T) {
+	paths := newListPaths(t)
+	leaveCrashWindow(t, paths, lockedCommit, "domain:previous.cn\n", "domain:halfwritten.cn\n")
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code == exitSuccess {
+		t.Fatal("a disagreeing pair was published over without --force")
+	}
+	for _, want := range []string{"--force", "--pin-remote"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the refusal does not mention %q, so the operator is left with no way past it: %q", want, stderr)
+		}
+	}
+	// And it has to say what the state IS. An operator who lost power
+	// recognises "between the two renames"; one who did not should not conclude
+	// from this message that they corrupted something.
+	if !strings.Contains(strings.ToLower(stderr), "crash") && !strings.Contains(strings.ToLower(stderr), "power") {
+		t.Errorf("the refusal does not say this is the state a crash leaves, so an operator who hit one "+
+			"reads it as corruption: %q", stderr)
+	}
+}
+
+// --force answers exactly one question. It is not a general override: a flag
+// that also waved through a collapsed list or an unreviewed repository would
+// make every other refusal in this command decorative.
+func TestForceAnswersOnlyTheDisagreement(t *testing.T) {
+	t.Run("it does not waive the collapse guardrail", func(t *testing.T) {
+		paths := newListPaths(t)
+		publishPair(t, paths, lockedCommit, rulesOf(200))
+		// Upstream now publishes a fraction of the list. That is refused on size
+		// alone, and --force is not in the conversation.
+		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+			remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(4))),
+		})
+		before := snapshot(t, paths.dir)
+		code, _, stderr := runCLI(t, origin.services(), "--automatic",
+			"--policy", automaticPolicy(t, true, false), "--force",
+			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+		if code == exitSuccess {
+			t.Fatal("--force published a list that lost 98% of its rules")
+		}
+		if !strings.Contains(stderr, "refusing") {
+			t.Errorf("the collapse refusal is not in the output: %q", stderr)
+		}
+		assertUnchanged(t, before, paths.dir, "")
+	})
+	t.Run("it does not waive the repository allowlist", func(t *testing.T) {
+		// The allowlist is checked in the parser, before a URL exists, so no
+		// combination of flags can reach the fetch with an unreviewed name.
+		for _, args := range [][]string{
+			{"--pin-remote", "HEAD", "--force", "--pin-source", "attacker/domain-list"},
+			{"--pin-remote", "HEAD", "--force", "--pin-source", "../v2fly/domain-list-community"},
+		} {
+			if _, err := parseUpdateListOptions(io.Discard, args); err == nil {
+				t.Errorf("%v was accepted, so --force reaches past the allowlist", args)
+			}
+		}
+	})
+	t.Run("it does not waive an unreadable v1 lock", func(t *testing.T) {
+		// A v1 lock is replaced deliberately rather than forced, because naming
+		// --pin-source already said it. --force changes nothing about it, and the
+		// refusal for a pair that is BOTH unparseable and disagreeing is the
+		// unreadable one: there is nothing to compare a digest against.
+		paths := newListPaths(t)
+		publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+		})
+		code, _, _ := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+			"--pin-source", rules.RepositoryV2Fly,
+			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+		if code != exitSuccess {
+			t.Errorf("--force broke the v1 migration it was not meant to touch (exit %d)", code)
+		}
+	})
+}
+
+// A flag that is refused where it has nothing to do teaches an operator that
+// the command is fussy. --force on a healthy machine is a no-op that publishes.
+func TestForceOnAPairThatAgreesIsHarmless(t *testing.T) {
+	paths := newListPaths(t)
+	installed := []byte("domain:previous.cn\n")
+	publishPair(t, paths, lockedCommit, installed)
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--force on a healthy pair exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	published, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("the pair does not describe itself after --force: %v", err)
+	}
+	if published.Primary.Commit != remoteCommit {
+		t.Errorf("published %+v, want %s", published.Primary, remoteCommit)
+	}
 }
 
 // The flag's value becomes a path in a URL, so it is checked against the
@@ -1988,7 +2154,7 @@ func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing
 		{name: "branch instead of HEAD", args: []string{"--pin-remote", "master"}},
 		{name: "tag instead of HEAD", args: []string{"--pin-remote", "v1.0.0"}},
 		{name: "empty ref", args: []string{"--pin-remote", ""}},
-		{name: "unknown flag", args: []string{"--check", "--force"}},
+		{name: "unknown flag", args: []string{"--check", "--fource"}},
 		{name: "unknown flag with a value", args: []string{"--check", "--repository", rules.RepositoryV2Fly}},
 		{name: "positional argument", args: []string{"--check", "extra"}},
 		{name: "positional ref", args: []string{"--pin-remote", "HEAD", "extra"}},
