@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"path"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -480,7 +481,7 @@ func ResolvePinned(ctx context.Context, client *http.Client, repository, ref str
 	if err != nil {
 		return SourceLock{}, err
 	}
-	archive, err := fetchArchive(ctx, client, resolved)
+	archive, err := fetchArchive(ctx, client, &resolved.Primary)
 	if err != nil {
 		return SourceLock{}, err
 	}
@@ -515,11 +516,11 @@ func normalizeCommitRef(ref string) (string, bool) {
 	return trimmed, true
 }
 
-// Download fetches the source archive a fully pinned lock names, verifies its
-// digest before a byte of it is extracted, converts the entries the lock names,
-// and returns the lock extended with the digest of the exact list bytes it
-// produced. A failure at any step returns no lock and no list, so a caller
-// cannot mistake a partial update for a pin.
+// Download fetches the source archives a fully pinned lock names, verifies each
+// digest before a byte of it is extracted, converts the pinned entries, merges
+// the supplement when the lock names one, and returns the lock extended with the
+// digest of the exact list bytes it produced. A failure at any step returns no
+// lock and no list, so a caller cannot mistake a partial update for a pin.
 //
 // The repository, the archive root and the converter all come from the lock
 // rather than from a package constant. A download that asked for the default
@@ -527,96 +528,133 @@ func normalizeCommitRef(ref string) (string, bool) {
 // else entirely, and the two would agree only while the default happened to be
 // the source the lock named.
 //
-// It publishes ONE source. A lock that names a supplement is refused, even
-// though Validate accepts it: this build reads one archive and the document
-// shape for two is ahead of what it can satisfy. Carrying on would publish the
-// primary alone beside a lock that says the supplement's rules are in it, and
-// every domain the supplement contributes would silently take the foreign
-// branch. The union that makes such a lock satisfiable is the change that
-// removes the refusal -- and until it lands, refusing is the honest answer.
+// The two sources are verified and converted SEPARATELY, each against its own
+// ref, and merged only once both have been read: a digest is a claim about one
+// archive, and a union built before either was checked would publish a list no
+// single pin describes.
+//
+// `list_sha256` covers the merged bytes, because that is what ships. It is
+// therefore not any one archive's digest, and two runs that read the same two
+// commits publish the same bytes: the merge is sorted and deduplicated, so the
+// list is a function of the two sets rather than of the order they arrived in.
 func Download(ctx context.Context, client *http.Client, lock SourceLock) (SourceLock, []byte, error) {
 	if err := lock.validatePinnedSource(); err != nil {
 		return SourceLock{}, nil, fmt.Errorf("source lock: %w", err)
 	}
-	if lock.Supplement != nil {
-		// This build reads one archive and publishes one list. A lock naming two
-		// is a lock this build cannot satisfy, and the failure mode for carrying
-		// on is the worst one available: a list missing every rule the supplement
-		// contributes, published beside a lock that says it has them. Each of
-		// those domains would take the foreign branch with nothing reporting it.
-		//
-		// The refusal is therefore here and not in Validate, which still accepts
-		// a two-source lock: the document shape is right and a later union is
-		// what makes it satisfiable.
-		return SourceLock{}, nil, fmt.Errorf("source lock: supplement %q is a second source and this build publishes one; the union that satisfies the lock has not landed", lock.Supplement.Repository)
-	}
 	if client == nil {
 		return SourceLock{}, nil, errors.New("an HTTP client is required to download the source archive")
 	}
-	archive, err := fetchArchive(ctx, client, lock)
+
+	fsys, err := fetchVerifiedArchive(ctx, client, &lock.Primary)
 	if err != nil {
 		return SourceLock{}, nil, err
 	}
-	if actual := digestHex(archive); actual != lock.Primary.SHA256 {
-		return SourceLock{}, nil, fmt.Errorf("archive sha256 %s does not match the pinned %s", actual, lock.Primary.SHA256)
-	}
-	fsys, err := extractArchive(archive, lock.Primary.Repository, lock.Primary.Commit)
-	if err != nil {
-		return SourceLock{}, nil, err
-	}
-	expressions, err := convertSource(fsys, lock.Primary)
+	expressions, comments, err := convertSource(fsys, lock.Primary)
 	if err != nil {
 		return SourceLock{}, nil, fmt.Errorf("convert %s at %s: %w", lock.Primary.Repository, lock.Primary.Commit, err)
 	}
-	list := renderList(expressions)
+
+	if lock.Supplement != nil {
+		supplementFS, err := fetchVerifiedArchive(ctx, client, lock.Supplement)
+		if err != nil {
+			return SourceLock{}, nil, err
+		}
+		// The kinds come from the lock, not from here. They are what the lock
+		// says went into the published list, and this build refuses any other
+		// set before a byte is fetched -- so reading them back out of
+		// V2FlySupplementKinds here would publish what the document says rather
+		// than what it claims, and the two drifting apart is exactly the
+		// untrue-document failure validateSupplementKinds exists to prevent.
+		contribution, err := ConvertFSKinds(supplementFS, lock.Supplement.Entry, lock.Supplement.Kinds)
+		if err != nil {
+			return SourceLock{}, nil, fmt.Errorf("convert supplement %s at %s: %w", lock.Supplement.Repository, lock.Supplement.Commit, err)
+		}
+		expressions = mergeExpressions(expressions, contribution)
+	}
+
+	list := renderList(expressions, comments)
 	pinned := lock
 	pinned.ListSHA256 = digestHex(list)
 	return pinned, list, nil
 }
 
+// fetchVerifiedArchive downloads one source's archive and refuses it unless its
+// digest is the one that source's own ref records. The digest is verified
+// BEFORE extraction, so an archive that does not match is never unpacked -- which
+// is the same guarantee for the supplement that it has always been for the
+// primary, and the reason the two cannot share one code path that checked only
+// the lock's primary.
+func fetchVerifiedArchive(ctx context.Context, client *http.Client, ref *SourceRef) (fs.FS, error) {
+	archive, err := fetchArchive(ctx, client, ref)
+	if err != nil {
+		return nil, err
+	}
+	if actual := digestHex(archive); actual != ref.SHA256 {
+		return nil, fmt.Errorf("%s archive sha256 %s does not match the pinned %s", ref.Repository, actual, ref.SHA256)
+	}
+	return extractArchive(archive, ref.Repository, ref.Commit)
+}
+
 // convertSource converts the entries a reviewed source names, in the shape that
-// source has.
+// source has, and returns the upstream's own record of what it disabled
+// alongside them.
 //
 // It dispatches on the repository rather than on the entry, because the two
 // reviewed sources are different formats and nothing else in a lock says which
 // parser a file is written for. Dispatching on the entry would mean letting a
 // lock field choose the code that reads it, and a lock is the one file this
 // package refuses to take anything on trust.
-func convertSource(fsys fs.FS, ref SourceRef) ([]string, error) {
+func convertSource(fsys fs.FS, ref SourceRef) (expressions, comments []string, err error) {
 	switch ref.Repository {
 	case RepositoryChina:
 		result, err := ConvertChinaConfFS(fsys, ref.Entries)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		// The comments come first because that is also their order: a comment
-		// begins with '#', which sorts before any rule kind, and both halves are
-		// sorted by the converter. Concatenating them keeps the whole document
-		// sorted, which is what the published list's own gate checks.
+		// The comments come back beside the expressions rather than in front of
+		// them because they are not rules: renderList writes them as a block
+		// above the list, which keeps the whole document sorted without the
+		// expressions having to be sorted around them.
 		//
 		// They are in the list rather than beside it because the list is the only
 		// artifact that ships: a lock has no field for them, and dropping them
 		// would drop the record of which domains upstream turned off and why.
-		return append(append([]string(nil), result.Comments...), result.Expressions...), nil
+		return result.Expressions, result.Comments, nil
 	case RepositoryV2Fly:
-		return ConvertFS(fsys, ref.Entry)
+		// No filter: a primary contributes everything its repository holds. Only
+		// a supplement narrows what it contributes, and a v2fly primary is the
+		// fallback publication, where there is nothing to merge it with.
+		converted, err := ConvertFS(fsys, ref.Entry)
+		if err != nil {
+			return nil, nil, err
+		}
+		return converted, nil, nil
 	}
-	return nil, fmt.Errorf("repository %q is not a reviewed source this build can convert", ref.Repository)
+	return nil, nil, fmt.Errorf("repository %q is not a reviewed source this build can convert", ref.Repository)
 }
 
-// renderList renders converted expressions as the exact bytes a list file
-// holds: one expression per line, each line terminated.
+// renderList renders converted expressions and the upstream's disabled-entry
+// reasons as the exact bytes a list file holds.
 //
-// A line beginning with '#' is an upstream's own disabled entry and the reason
-// it gave, kept so the published list carries upstream's record rather than only
-// its rules. It is written by the same line rule, and it is NOT a rule: the
-// loader truncates at '#' and skips what is left empty, so a comment line
-// contributes no domain to the matcher. `validateRenderedRule` -- the gate the
+// The comments come first so that a reader opening the file sees what upstream
+// turned off before seeing what is on. They sort before every expression ('#'
+// precedes any letter), so the document stays sorted whole, and they are inert
+// to the matcher: MOSDNS truncates every line at the first '#', leaving
+// nothing on the line, and skips what is left empty.
+//
+// A comment line is not a rule. `validateRenderedRule` -- the gate the
 // committed list is held to -- does not accept a '#' at all, so a list carrying
-// comments is refused by that gate until it is taught the shape. That is a known
-// conflict, not a contradiction here.
-func renderList(expressions []string) []byte {
+// comments is refused by that gate until it is taught the shape. That is a
+// known conflict, not a contradiction here.
+func renderList(expressions, comments []string) []byte {
 	var rendered bytes.Buffer
+	for _, comment := range comments {
+		rendered.WriteString(comment)
+		rendered.WriteByte('\n')
+	}
+	if len(comments) > 0 && len(expressions) > 0 {
+		rendered.WriteByte('\n')
+	}
 	for _, expression := range expressions {
 		rendered.WriteString(expression)
 		rendered.WriteByte('\n')
@@ -624,20 +662,49 @@ func renderList(expressions []string) []byte {
 	return rendered.Bytes()
 }
 
-// fetchArchive downloads the source archive of a lock's commit from the fixed
+// mergeExpressions unions two converted sets and renders them sorted, so the
+// published bytes are a function of the two SETS and not of the order the
+// archives were converted in.
+//
+// Both arguments are already sorted and deduplicated by their own converter,
+// which is why the dedupe here is about the overlap between them: the dnsmasq
+// source and v2fly both carry some of the same domains, and a repeated line is
+// a rule the loader would count twice.
+func mergeExpressions(first, second []string) []string {
+	seen := make(map[string]bool, len(first)+len(second))
+	merged := make([]string, 0, len(first)+len(second))
+	for _, set := range [][]string{first, second} {
+		for _, expression := range set {
+			if seen[expression] {
+				continue
+			}
+			seen[expression] = true
+			merged = append(merged, expression)
+		}
+	}
+	sort.Strings(merged)
+	return merged
+}
+
+// fetchArchive downloads the source archive of one ref's commit from the fixed
 // codeload endpoint, enforcing the download bound before and while reading.
 //
-// The repository comes from the lock and is checked against the allowlist HERE,
+// The repository comes from the ref and is checked against the allowlist HERE,
 // before it is concatenated into the URL rather than by the caller: this is the
-// one function every archive fetch goes through, and a repository name is a path
-// segment under a host this package chose. A caller that had already validated
-// the lock would make this check redundant, which is exactly why a redundant
-// check in the place a string becomes a URL is the one worth keeping.
-func fetchArchive(ctx context.Context, client *http.Client, lock SourceLock) ([]byte, error) {
-	if !KnownRepository(lock.Primary.Repository) {
-		return nil, fmt.Errorf("repository %q is not one of the reviewed sources %q and %q", lock.Primary.Repository, RepositoryChina, RepositoryV2Fly)
+// one function every archive fetch goes through, and a repository name is a
+// path segment under a host this package chose. A caller that had already
+// validated the lock would make this check redundant, which is exactly why a
+// redundant check in the place a string becomes a URL is the one worth keeping.
+//
+// It takes the ref rather than the lock BECAUSE there are two of them. Reading
+// lock.Primary here would check the primary's repository and then build the
+// supplement's URL out of whatever the caller passed, so the second source
+// would reach the network through a gate that never looked at it.
+func fetchArchive(ctx context.Context, client *http.Client, ref *SourceRef) ([]byte, error) {
+	if !KnownRepository(ref.Repository) {
+		return nil, fmt.Errorf("repository %q is not one of the reviewed sources %q and %q", ref.Repository, RepositoryChina, RepositoryV2Fly)
 	}
-	endpoint := archiveBaseURL + "/" + lock.Primary.Repository + "/tar.gz/" + lock.Primary.Commit
+	endpoint := archiveBaseURL + "/" + ref.Repository + "/tar.gz/" + ref.Commit
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s: build request: %w", endpoint, err)

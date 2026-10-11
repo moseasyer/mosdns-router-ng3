@@ -147,13 +147,15 @@ func fixtureArchive(t *testing.T) []byte {
 type fakeRemote struct {
 	server *httptest.Server
 	client *http.Client
-	commit string
-	// archives is the archive each repository's tar.gz path serves. It is keyed
-	// by repository rather than held as one value because an origin that answers
-	// for exactly one repository cannot observe a request for another one at
-	// all: the request 404s, and a gate written against that fixture reads as
-	// coverage it does not have.
-	archives map[string][]byte
+	// sources is what this origin can answer for, keyed by repository.
+	//
+	// It is keyed by repository, and each source names its own head and its own
+	// archives, rather than being one archive served at one commit: an origin
+	// that answers for exactly one repository cannot observe a request for
+	// another one at all -- the request 404s and the test passes either way --
+	// which is how a fixture ends up modelling a machine that has only ever had
+	// one source.
+	sources map[string]fakeSource
 
 	// commitBody, when set (rawBody true), is served verbatim by the commit
 	// endpoint instead of a commit document.
@@ -168,18 +170,31 @@ type fakeRemote struct {
 	requests    []string
 }
 
+// fakeSource is one repository the origin will answer for.
+type fakeSource struct {
+	// head is what the repository's commit endpoint answers.
+	head string
+	// archives maps a 40-character commit to that repository's archive bytes.
+	archives map[string][]byte
+}
+
 // newFakeRemote serves one repository's archive, which is all most tests in
 // this file need.
 func newFakeRemote(t *testing.T, commit string, archive []byte) *fakeRemote {
 	t.Helper()
-	return newFakeRemoteSources(t, commit, map[string][]byte{RepositoryV2Fly: archive})
+	return newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryV2Fly: {head: commit, archives: map[string][]byte{commit: archive}},
+	})
 }
 
-// newFakeRemoteSources serves the named repositories' archives at the same
-// commit, and 404s every other repository.
-func newFakeRemoteSources(t *testing.T, commit string, archives map[string][]byte) *fakeRemote {
+// newFakeRemoteSources serves the named repositories from one origin, and 404s
+// every path naming a repository it holds nothing for.
+func newFakeRemoteSources(t *testing.T, sources map[string]fakeSource) *fakeRemote {
 	t.Helper()
-	remote := &fakeRemote{commit: commit, archives: archives, status: http.StatusOK}
+	remote := &fakeRemote{sources: make(map[string]fakeSource, len(sources)), status: http.StatusOK}
+	for repository, source := range sources {
+		remote.sources[repository] = source
+	}
 	remote.server = httptest.NewServer(http.HandlerFunc(remote.serve))
 	t.Cleanup(remote.server.Close)
 	remote.client = hostRewritingClient(t, remote.server.URL)
@@ -194,6 +209,11 @@ func (r *fakeRemote) serve(writer http.ResponseWriter, request *http.Request) {
 	}
 	switch {
 	case strings.HasSuffix(request.URL.Path, "/commits/HEAD"):
+		source, known := r.sourceFor(request.URL.Path)
+		if !known {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
 		writer.Header().Set("Content-Type", "application/json")
 		if r.rawBody {
 			_, _ = io.WriteString(writer, r.commitBody)
@@ -201,7 +221,7 @@ func (r *fakeRemote) serve(writer http.ResponseWriter, request *http.Request) {
 		}
 		// The surrounding keys are the ones GitHub sends around the single field
 		// this package reads.
-		_, _ = io.WriteString(writer, fmt.Sprintf(`{"sha":%q,"node_id":"C_1","commit":{"committer":{"date":"2026-09-25T01:39:17Z"}},"parents":[]}`, r.commit))
+		_, _ = io.WriteString(writer, fmt.Sprintf(`{"sha":%q,"node_id":"C_1","commit":{"committer":{"date":"2026-09-25T01:39:17Z"}},"parents":[]}`, source.head))
 	default:
 		archive, known := r.archiveFor(request.URL.Path)
 		if !known {
@@ -227,15 +247,55 @@ func (r *fakeRemote) serve(writer http.ResponseWriter, request *http.Request) {
 	}
 }
 
-// archiveFor returns the archive a codeload path names, and whether this origin
-// holds one for that repository at all.
-func (r *fakeRemote) archiveFor(requestPath string) ([]byte, bool) {
-	repository, _, found := strings.Cut(strings.TrimPrefix(requestPath, "/"), "/tar.gz/")
+// sourceFor returns the repository a path names and what this origin holds for
+// it, and whether it holds anything for that repository at all.
+func (r *fakeRemote) sourceFor(requestPath string) (fakeSource, bool) {
+	repository := repositoryOfPath(requestPath)
+	if repository == "" {
+		return fakeSource{}, false
+	}
+	source, known := r.sources[repository]
+	return source, known
+}
+
+// archivePrefix is the codeload path a repository's source archives live under.
+func archivePrefix(repository string) string {
+	return "/" + repository + "/tar.gz/"
+}
+
+// repositoryOfPath returns the `owner/name` a codeload or API path names, or "".
+//
+// A repository name has two segments, and the API prefixes the pair with
+// `/repos`, so the pair is taken from the front after that prefix is dropped.
+// Reading one segment would yield `felixonmars` for every request and answer
+// with one repository's commit whatever was asked for.
+func repositoryOfPath(requestPath string) string {
+	trimmed := strings.TrimPrefix(requestPath, "/")
+	trimmed = strings.TrimPrefix(trimmed, "repos/")
+	owner, rest, found := strings.Cut(trimmed, "/")
 	if !found {
+		return ""
+	}
+	name, _, _ := strings.Cut(rest, "/")
+	if name == "" {
+		return ""
+	}
+	return owner + "/" + name
+}
+
+// archiveFor returns the archive a codeload path names, and whether this origin
+// holds one for that repository at that commit.
+func (r *fakeRemote) archiveFor(requestPath string) ([]byte, bool) {
+	source, known := r.sourceFor(requestPath)
+	if !known {
 		return nil, false
 	}
-	archive, known := r.archives[repository]
-	return archive, known
+	commit, isArchive := strings.CutPrefix(requestPath, archivePrefix(repositoryOfPath(requestPath)))
+	if !isArchive {
+		return nil, false
+	}
+	archive, held := source.archives[commit]
+	return archive, held
 }
 
 // served reports whether path was requested from this origin.
@@ -321,6 +381,32 @@ func chinaArchive(t *testing.T) []byte {
 		{name: fixtureChinaArchiveTop + "/google.china.conf", body: "server=/three.cn/203.0.113.7\n"},
 		{name: fixtureChinaArchiveTop + "/apple.china.conf", body: "server=/four.cn/203.0.113.7\n"},
 	})
+}
+
+// sourceArchiveFiles builds the source archive one repository publishes at one
+// commit, holding several files. Arguments after the commit are path/body
+// pairs.
+//
+// The top-level directory is derived from the repository and the commit by the
+// production helper, because that is the name extractArchive looks for and a
+// fixture rooted anywhere else would be refused for the wrong reason. The
+// dnsmasq primary needs three files in one archive, which is what this is for:
+// chinaArchive and fixtureArchive are fixed at fixtureCommit, while a two-source
+// download pins each repository at its own commit.
+func sourceArchiveFiles(t *testing.T, repository, commit string, pathAndBody ...string) []byte {
+	t.Helper()
+	if len(pathAndBody)%2 != 0 {
+		t.Fatal("sourceArchiveFiles takes path/body pairs")
+	}
+	root := archiveRoot(repository, commit)
+	entries := make([]archiveEntry, 0, len(pathAndBody)/2)
+	for index := 0; index < len(pathAndBody); index += 2 {
+		entries = append(entries, archiveEntry{
+			name: root + "/" + pathAndBody[index],
+			body: pathAndBody[index+1],
+		})
+	}
+	return buildArchive(t, entries)
 }
 
 // chinaPinnedLock is a complete lock for the dnsmasq fixture archive. It is the
@@ -441,9 +527,9 @@ func TestDownloadRefusesALockThatIsNotFullyPinned(t *testing.T) {
 	// list and record it as reviewed.
 	archive := fixtureArchive(t)
 	china := chinaArchive(t)
-	remote := newFakeRemoteSources(t, fixtureCommit, map[string][]byte{
-		RepositoryV2Fly: archive,
-		RepositoryChina: china,
+	remote := newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryV2Fly: {head: fixtureCommit, archives: map[string][]byte{fixtureCommit: archive}},
+		RepositoryChina: {head: fixtureCommit, archives: map[string][]byte{fixtureCommit: china}},
 	})
 	valid := pinnedLock(t, archive)
 	validChina := chinaPinnedLock(t, china)
@@ -1031,9 +1117,9 @@ func TestThePrimaryArchiveIsFetchedFromTheRepositoryTheLockNames(t *testing.T) {
 	// verify the primary's digest against the other repository's archive; an
 	// extractor that kept using the default root would refuse a real one.
 	archive := chinaArchive(t)
-	remote := newFakeRemoteSources(t, fixtureCommit, map[string][]byte{
-		RepositoryChina: archive,
-		RepositoryV2Fly: fixtureArchive(t),
+	remote := newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryChina: {head: fixtureCommit, archives: map[string][]byte{fixtureCommit: archive}},
+		RepositoryV2Fly: {head: fixtureCommit, archives: map[string][]byte{fixtureCommit: fixtureArchive(t)}},
 	})
 
 	got, list, err := Download(context.Background(), remote.client, chinaPinnedLock(t, archive))
@@ -1043,12 +1129,15 @@ func TestThePrimaryArchiveIsFetchedFromTheRepositoryTheLockNames(t *testing.T) {
 	if want := "/" + RepositoryChina + "/tar.gz/" + fixtureCommit; !remote.served(want) {
 		t.Fatalf("Download fetched %v, want the archive at %q", remote.requests, want)
 	}
-	if other := "/v2fly/domain-list-community/tar.gz/" + fixtureCommit; remote.served(other) {
-		t.Fatalf("Download fetched %q although the lock names %q", other, RepositoryChina)
+	// No supplement was named, so nothing may be fetched from the repository
+	// that could have supplied one.
+	if other := "/" + RepositoryV2Fly + "/tar.gz/" + fixtureCommit; remote.served(other) {
+		t.Fatalf("Download fetched %q although the lock names no supplement", other)
 	}
 	// The upstream address is 203.0.113.7 in every fixture line, so a list
 	// carrying one is a converter that published what the pin says it drops.
 	want := "# disabled upstream: upstream moved it\n" +
+		"\n" +
 		"domain:four.cn\ndomain:one.cn\ndomain:three.cn\n"
 	if string(list) != want {
 		t.Fatalf("Download list =\n%q\nwant\n%q", list, want)
@@ -1060,37 +1149,260 @@ func TestThePrimaryArchiveIsFetchedFromTheRepositoryTheLockNames(t *testing.T) {
 	}
 }
 
-func TestDownloadRefusesALockCarryingASecondSourceRatherThanIgnoringIt(t *testing.T) {
-	// This build converts one archive, so a lock that names two is not a lock it
-	// can satisfy: publishing the primary alone would write a list the lock
-	// says is short, and every domain the supplement contributes would silently
-	// take the foreign branch. The refusal is the honest answer until the union
-	// lands, and it is refused before a byte is fetched.
-	archive := chinaArchive(t)
-	remote := newFakeRemoteSources(t, fixtureCommit, map[string][]byte{
-		RepositoryChina: archive,
-		RepositoryV2Fly: fixtureArchive(t),
+func TestDownloadUnionsThePrimaryAndTheSupplement(t *testing.T) {
+	// The published list is the union of two repositories: the dnsmasq source's
+	// domains plus the 70 v2fly rules its syntax cannot say. The two archives
+	// come from different repositories at different commits, and the digest in
+	// the returned lock has to cover what was actually published -- the union,
+	// not one archive and not the primary.
+	primaryCommit := strings.Repeat("a", 40)
+	supplementCommit := strings.Repeat("b", 40)
+	remote := newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryChina: {head: primaryCommit, archives: map[string][]byte{
+			primaryCommit: sourceArchiveFiles(t, RepositoryChina, primaryCommit,
+				"accelerated-domains.china.conf", "server=/one.cn/203.0.113.7\nserver=/two.cn/203.0.113.7\n",
+				"google.china.conf", "server=/dl.google.com/203.0.113.7\n",
+				"apple.china.conf", "server=/a1.mzstatic.com/203.0.113.7\n"),
+		}},
+		RepositoryV2Fly: {head: supplementCommit, archives: map[string][]byte{
+			supplementCommit: sourceArchiveFiles(t, RepositoryV2Fly, supplementCommit,
+				"data/cn", "include:shared\ndomain:one.cn\nfull:exact.cn\nregexp:^edge\\.cn$\n",
+				"data/shared", "full:included.cn\ndomain:included-sub.cn\n"),
+		}},
 	})
-	lock := chinaPinnedLock(t, archive)
-	lock.Supplement = &SourceRef{
-		Repository: RepositoryV2Fly,
-		Commit:     fixtureCommit,
-		SHA256:     digest(fixtureArchive(t)),
-		Entry:      V2FlyEntry,
-		Kinds:      supplementKinds(),
-	}
-	lock.ListSHA256 = digest([]byte("unused"))
 
-	lockReturned, list, err := Download(context.Background(), remote.client, lock)
-	if err == nil {
-		t.Fatalf("Download accepted a two-source lock and returned %q", list)
+	lock := twoSourceLock(t, remote, primaryCommit, supplementCommit)
+	published, list, err := Download(context.Background(), remote.client, lock)
+	if err != nil {
+		t.Fatalf("download: %v", err)
 	}
-	if list != nil || !sameLock(lockReturned, SourceLock{}) {
-		t.Fatalf("Download returned something on failure: lock %+v, list %q", lockReturned, list)
+
+	// Sorted by expression, so the bytes are a function of the two SETS and not
+	// of which archive was converted first: every `domain:` rule comes from the
+	// dnsmasq source, and the two kinds it cannot say come from v2fly even
+	// though the included list states them and data/cn does not.
+	want := "domain:a1.mzstatic.com\ndomain:dl.google.com\ndomain:one.cn\ndomain:two.cn\n" +
+		"full:exact.cn\nfull:included.cn\nregexp:^edge\\.cn$\n"
+	if string(list) != want {
+		t.Fatalf("the published list is\n%q\nwant\n%q", list, want)
 	}
-	if len(remote.requests) != 0 {
-		t.Fatalf("Download fetched %v before refusing the lock", remote.requests)
+	if published.ListSHA256 != digest(list) {
+		t.Fatal("the lock's list digest does not cover the bytes it published")
 	}
+	// The lock comes back as it went in plus the list digest: a union that
+	// quietly dropped the supplement would leave a document that names one
+	// source and a list that came from two.
+	wantLock := lock
+	wantLock.ListSHA256 = digest(list)
+	if !sameLock(published, wantLock) {
+		t.Fatalf("published lock = %+v, want %+v", published, wantLock)
+	}
+}
+
+func TestEachSourceIsFetchedFromTheRepositoryItsOwnRefNames(t *testing.T) {
+	// Without this, a fetch that always asked for one repository would still
+	// pass the union test whenever the two archives happened to agree, and the
+	// repository each archive is verified against is the whole of the security
+	// claim here: the lock says which bytes are the reviewed ones.
+	primaryCommit := strings.Repeat("a", 40)
+	supplementCommit := strings.Repeat("b", 40)
+	remote := newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryChina: {head: primaryCommit, archives: map[string][]byte{
+			primaryCommit: sourceArchiveFiles(t, RepositoryChina, primaryCommit,
+				"accelerated-domains.china.conf", "server=/one.cn/203.0.113.7\n",
+				"google.china.conf", "server=/g.cn/203.0.113.7\n",
+				"apple.china.conf", "server=/a.cn/203.0.113.7\n"),
+		}},
+		RepositoryV2Fly: {head: supplementCommit, archives: map[string][]byte{
+			supplementCommit: sourceArchiveFiles(t, RepositoryV2Fly, supplementCommit,
+				"data/cn", "domain:one.cn\nfull:exact.cn\n"),
+		}},
+	})
+
+	if _, _, err := Download(context.Background(), remote.client,
+		twoSourceLock(t, remote, primaryCommit, supplementCommit)); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if !remote.served(archivePrefix(RepositoryChina) + primaryCommit) {
+		t.Fatalf("the primary archive was not fetched from %s: %v", RepositoryChina, remote.requests)
+	}
+	if !remote.served(archivePrefix(RepositoryV2Fly) + supplementCommit) {
+		t.Fatalf("the supplement archive was not fetched from %s: %v", RepositoryV2Fly, remote.requests)
+	}
+}
+
+func TestASourceWithNoSupplementPublishesOnlyItsOwnRules(t *testing.T) {
+	// The fallback publication takes this shape: v2fly as the primary and no
+	// supplement, which is why one lock shape has to cover both roles. Every
+	// rule kind it holds is published, because a primary contributes everything
+	// its repository holds -- `domain:` is not filtered out of it.
+	commit := strings.Repeat("b", 40)
+	archive := sourceArchiveFiles(t, RepositoryV2Fly, commit,
+		"data/cn", "domain:only.cn\nfull:exact.cn\nregexp:^edge\\.cn$\n")
+	remote := newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryV2Fly: {head: commit, archives: map[string][]byte{commit: archive}},
+	})
+	pinned, err := ResolvePinned(context.Background(), remote.client, RepositoryV2Fly, commit)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	_, list, err := Download(context.Background(), remote.client,
+		SourceLock{SchemaVersion: schemaVersion, Primary: pinned.Primary})
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	want := "domain:only.cn\nfull:exact.cn\nregexp:^edge\\.cn$\n"
+	if string(list) != want {
+		t.Fatalf("the published list is\n%q\nwant\n%q", list, want)
+	}
+}
+
+func TestEachArchivesDigestIsVerifiedBeforeItIsExtracted(t *testing.T) {
+	// Each archive is verified against the digest its OWN ref records, and it is
+	// verified before it is unpacked. The fixture archives here are rooted in the
+	// wrong repository AND hold a rule no converter here can express, so an
+	// implementation that unpacked first would report the archive's root or its
+	// unknown directive instead of a digest -- which is the whole difference
+	// between "these are not the reviewed bytes" and "these bytes could not be
+	// read".
+	//
+	// It is asked of both sources because a second source is a second archive,
+	// and the primary's guarantee is not automatically the supplement's.
+	primaryCommit := strings.Repeat("a", 40)
+	supplementCommit := strings.Repeat("b", 40)
+	// A readable archive for each source, and one that is rooted in the OTHER
+	// repository's directory -- which is what a substituted archive looks like,
+	// and what extractArchive refuses on its own. Only the source under test
+	// gets the unusable one, so the other one converts and the refusal can only
+	// be about the archive that was checked.
+	readableChina := sourceArchiveFiles(t, RepositoryChina, primaryCommit,
+		"accelerated-domains.china.conf", "server=/one.cn/203.0.113.7\n",
+		"google.china.conf", "server=/g.cn/203.0.113.7\n",
+		"apple.china.conf", "server=/a.cn/203.0.113.7\n")
+	readableV2Fly := sourceArchiveFiles(t, RepositoryV2Fly, supplementCommit,
+		"data/cn", "domain:one.cn\nfull:exact.cn\n")
+	unusableChina := sourceArchiveFiles(t, RepositoryV2Fly, primaryCommit,
+		"accelerated-domains.china.conf", "ip4:1.2.3.4\n",
+		"google.china.conf", "server=/g.cn/203.0.113.7\n",
+		"apple.china.conf", "server=/a.cn/203.0.113.7\n")
+	unusableV2Fly := sourceArchiveFiles(t, RepositoryChina, supplementCommit,
+		"data/cn", "ip4:1.2.3.4\n")
+
+	tests := []struct {
+		name string
+		// china and v2fly are what the origin serves for each repository.
+		china []byte
+		v2fly []byte
+		// which says whose digest was replaced, and hands back the one the
+		// refusal has to name.
+		which func(*SourceLock) string
+	}{
+		{
+			name:  "the primary's",
+			china: unusableChina,
+			v2fly: readableV2Fly,
+			which: func(l *SourceLock) string {
+				l.Primary.SHA256 = digest([]byte("a different primary archive"))
+				return l.Primary.SHA256
+			},
+		},
+		{
+			name:  "a supplement's",
+			china: readableChina,
+			v2fly: unusableV2Fly,
+			which: func(l *SourceLock) string {
+				l.Supplement.SHA256 = digest([]byte("a different supplement archive"))
+				return l.Supplement.SHA256
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			remote := newFakeRemoteSources(t, map[string]fakeSource{
+				RepositoryChina: {head: primaryCommit, archives: map[string][]byte{
+					primaryCommit:    test.china,
+					supplementCommit: test.china,
+				}},
+				RepositoryV2Fly: {head: supplementCommit, archives: map[string][]byte{
+					primaryCommit:    test.v2fly,
+					supplementCommit: test.v2fly,
+				}},
+			})
+			lock := twoSourceLock(t, remote, primaryCommit, supplementCommit)
+			wantDigest := test.which(&lock)
+
+			lockReturned, list, err := Download(context.Background(), remote.client, lock)
+			if err == nil {
+				t.Fatalf("Download accepted a mismatched archive and returned %q", list)
+			}
+			if list != nil || !sameLock(lockReturned, SourceLock{}) {
+				t.Fatalf("Download returned something on failure: lock %+v, list %q", lockReturned, list)
+			}
+			if !strings.Contains(err.Error(), "archive sha256") || !strings.Contains(err.Error(), wantDigest) {
+				t.Fatalf("error = %v, want it to name %s pinned archive digest %s", test.name, wantDigest, err)
+			}
+			if strings.Contains(err.Error(), "top-level directory") {
+				t.Fatalf("error came from extraction, so the digest was not checked first: %v", err)
+			}
+			if strings.Contains(err.Error(), "ip4") {
+				t.Fatalf("error came from conversion, so the archive was not checked first: %v", err)
+			}
+		})
+	}
+}
+
+func TestThePublishedBytesDoNotDependOnTheOrderTheTwoSourcesWereConvertedIn(t *testing.T) {
+	// The digest in the lock is a promise about bytes, and those bytes have to
+	// be a function of the two sets rather than of the order the archives were
+	// read in: two runs that fetched the same two commits could otherwise
+	// publish different lists beside the same list_sha256.
+	first := []string{"domain:b.cn", "domain:a.cn", "full:exact.cn"}
+	second := []string{"full:included.cn", "domain:a.cn", "regexp:^edge\\.cn$"}
+	want := []string{"domain:a.cn", "domain:b.cn", "full:exact.cn", "full:included.cn", "regexp:^edge\\.cn$"}
+
+	forward := mergeExpressions(first, second)
+	backward := mergeExpressions(second, first)
+	if strings.Join(forward, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("merged = %q, want %q", forward, want)
+	}
+	if strings.Join(backward, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("merged the other way round = %q, want %q", backward, want)
+	}
+	// A rule both sources state appears once: the dnsmasq source and v2fly both
+	// carry domain:a.cn, and a duplicate line is a list the pinned loader would
+	// load twice.
+	if len(forward) != len(want) {
+		t.Fatalf("the union repeats a rule both sources state: %q", forward)
+	}
+	// Neither input is rewritten: the converter's own slice belongs to the
+	// primary, and sorting in place would reorder what the caller handed over.
+	if strings.Join(first, ",") != "domain:b.cn,domain:a.cn,full:exact.cn" {
+		t.Fatalf("mergeExpressions wrote to the first set: %q", first)
+	}
+}
+
+// twoSourceLock resolves both fixtures through the origin and returns the lock
+// the published list derives from: the dnsmasq source as the primary, and the
+// 70 rules its syntax cannot say as a supplement.
+//
+// The supplement's kinds come from supplementKinds, never from the exported
+// slice: a lock that shared the backing array of a package-level value would
+// hand its holder a way to rewrite the reviewed set in place, and that defence
+// has a test of its own.
+func twoSourceLock(t *testing.T, remote *fakeRemote, primaryCommit, supplementCommit string) SourceLock {
+	t.Helper()
+	primary, err := ResolvePinned(context.Background(), remote.client, RepositoryChina, primaryCommit)
+	if err != nil {
+		t.Fatalf("resolve the primary: %v", err)
+	}
+	supplement, err := ResolvePinned(context.Background(), remote.client, RepositoryV2Fly, supplementCommit)
+	if err != nil {
+		t.Fatalf("resolve the supplement: %v", err)
+	}
+	ref := supplement.Primary
+	ref.Kinds = supplementKinds()
+	return SourceLock{SchemaVersion: schemaVersion, Primary: primary.Primary, Supplement: &ref}
 }
 
 func TestASupplementNamesOnlyTheKindsThePrimaryCannotCarry(t *testing.T) {
@@ -1200,8 +1512,14 @@ func TestASupplementHasToBeTheOneRepositoryThatMaySupplement(t *testing.T) {
 func TestResolveCommitNamesTheEntriesItsRepositoryConverts(t *testing.T) {
 	// The lock a pin writes has to say what will be read, or a later run is
 	// guessing: a commit and a repository alone do not say whether the source is
-	// one file or three.
-	remote := newFakeRemote(t, fixtureCommit, fixtureArchive(t))
+	// one file or three. The origin answers for both repositories, because an
+	// origin that knows only one would refuse the other's HEAD and the test
+	// would be about the fixture rather than about the lock.
+	archive := fixtureArchive(t)
+	remote := newFakeRemoteSources(t, map[string]fakeSource{
+		RepositoryV2Fly: {head: fixtureCommit, archives: map[string][]byte{fixtureCommit: archive}},
+		RepositoryChina: {head: fixtureCommit, archives: map[string][]byte{fixtureCommit: chinaArchive(t)}},
+	})
 
 	china, err := ResolveCommit(context.Background(), remote.client, RepositoryChina, "")
 	if err != nil {
@@ -1228,12 +1546,27 @@ func TestAFetchRefusesARepositoryTheAllowlistDoesNotHoldBeforeBuildingAURL(t *te
 	// against the allowlist before it is concatenated rather than after: a name
 	// is not a URL fragment, and this is the one function every fetch goes
 	// through.
-	remote := newFakeRemote(t, fixtureCommit, fixtureArchive(t))
-	lock := pinnedLock(t, fixtureArchive(t))
-	lock.Primary.Repository = "attacker/domain-list"
+	//
+	// Both refs are exercised because both reach this function. Once the fetch
+	// took a lock rather than a ref it read lock.Primary, which would leave the
+	// supplement's repository reaching the URL ungated -- a gate that checks
+	// one ref and is handed two is a gate on one of them.
+	archive := fixtureArchive(t)
+	remote := newFakeRemote(t, fixtureCommit, archive)
 
-	if _, err := fetchArchive(context.Background(), remote.client, lock); err == nil {
-		t.Fatal("fetchArchive requested an archive for a repository nobody reviewed")
+	tests := []struct {
+		name string
+		ref  *SourceRef
+	}{
+		{name: "a primary's", ref: &SourceRef{Repository: "attacker/domain-list", Commit: fixtureCommit, Entries: ChinaConfEntries}},
+		{name: "a supplement's", ref: &SourceRef{Repository: "attacker/domain-list", Commit: fixtureCommit, Entry: V2FlyEntry, Kinds: supplementKinds()}},
+	}
+	for _, test := range tests {
+		if _, err := fetchArchive(context.Background(), remote.client, test.ref); err == nil {
+			t.Errorf("fetchArchive requested an archive for %s repository nobody reviewed", test.name)
+		} else if !strings.Contains(err.Error(), "attacker/domain-list") {
+			t.Errorf("the refusal for %s repository does not name it: %v", test.name, err)
+		}
 	}
 	if len(remote.requests) != 0 {
 		t.Fatalf("an unreviewed repository reached the network: %v", remote.requests)

@@ -110,7 +110,7 @@ type resolver struct {
 }
 
 // ConvertFS converts the list at entry in fsys into sorted, deduplicated
-// MOSDNS domain expressions.
+// MOSDNS domain expressions, with no kind filter.
 //
 // The entry is a path inside the filesystem (the pinned archive after its
 // single top-level directory has been stripped), inclusions resolve relative to
@@ -119,6 +119,55 @@ type resolver struct {
 // that resolves to no rule is an error rather than an empty result, because an
 // empty China set would silently send every query to the foreign branch.
 func ConvertFS(fsys fs.FS, entry string) ([]string, error) {
+	return ConvertFSKinds(fsys, entry, nil)
+}
+
+// ConvertFSKinds is ConvertFS with a filter on which resolved rule kinds reach
+// the result. An empty or nil filter keeps every kind.
+//
+// The filter exists because dnsmasq-china-list cannot express a `full:` or a
+// `regexp:` rule -- `server=/<domain>/` means the domain and every subdomain,
+// which is `domain:` -- so those 70 v2fly rules are merged into the same
+// published file. It applies to what the entry RESOLVED TO, after inclusions
+// have been followed, because upstream states most of those rules in lists that
+// the entry includes rather than in the entry itself: a filter applied while
+// the lists are being read would drop exactly the rules it was added to keep.
+//
+// A filter that resolves to nothing is an error, not an empty contribution: a
+// supplement that silently contributed nothing would leave the published list
+// missing rules the lock says it has.
+func ConvertFSKinds(fsys fs.FS, entry string, kinds []string) ([]string, error) {
+	allowed := make(map[string]bool, len(kinds))
+	for _, kind := range kinds {
+		if !supportedRuleKinds[kind] {
+			return nil, fmt.Errorf("entry %q: %q is not a rule type this converter can express", entry, kind)
+		}
+		allowed[kind] = true
+	}
+	expressions, err := convertFS(fsys, entry, allowed)
+	if err != nil {
+		return nil, err
+	}
+	if len(expressions) == 0 {
+		// The two cases are reported differently because they are different
+		// faults: an entry that resolved to nothing is an upstream change, while
+		// a filter that matched nothing is a lock asking for a contribution this
+		// source cannot make.
+		if len(kinds) > 0 {
+			return nil, fmt.Errorf("%s: no rule of the requested kinds %v resolved", entry, kinds)
+		}
+		return nil, fmt.Errorf("%s: entry resolved to no rules", entry)
+	}
+	return expressions, nil
+}
+
+// convertFS is ConvertFSKinds with the filter already reduced to a set. An
+// empty set keeps every kind.
+//
+// An empty result is returned rather than refused here, because only the
+// caller knows whether the filter emptied it or the entry was empty to begin
+// with, and it says so in its own message.
+func convertFS(fsys fs.FS, entry string, allowed map[string]bool) ([]string, error) {
 	if !fs.ValidPath(entry) {
 		return nil, fmt.Errorf("entry %q is not a path inside the source archive", entry)
 	}
@@ -143,6 +192,9 @@ func ConvertFS(fsys fs.FS, entry string) ([]string, error) {
 		if current.hasAttribute(notCNAttribute) {
 			continue
 		}
+		if len(allowed) != 0 && !allowed[current.kind] {
+			continue
+		}
 		expression := current.expression()
 		// Two rules that differ only by attribute collapse onto one MOSDNS
 		// expression, so uniqueness is decided on the rendered form.
@@ -154,9 +206,6 @@ func ConvertFS(fsys fs.FS, entry string) ([]string, error) {
 		}
 		seen[expression] = true
 		expressions = append(expressions, expression)
-	}
-	if len(expressions) == 0 {
-		return nil, fmt.Errorf("%s: entry resolved to no rules", entry)
 	}
 	sort.Strings(expressions)
 	return expressions, nil

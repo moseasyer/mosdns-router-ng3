@@ -601,3 +601,90 @@ func TestConvertedListLoadsInMOSDNSAndMatchesTheIntendedQueries(t *testing.T) {
 		}
 	}
 }
+
+// The fixtures below carry an included list on purpose. The dnsmasq source
+// cannot express a `full:` or a `regexp:` rule, so the 70 v2fly rules of those
+// kinds are merged into the same published file, and the filter that keeps them
+// is applied to a RESOLVED rule set -- after inclusions have been followed. A
+// filter applied while the lists are being read would drop exactly those rules,
+// because upstream states most of them in lists that data/cn includes rather
+// than in data/cn itself.
+
+func TestAKindsFilterSelectsOnlyTheRuleTypesItNames(t *testing.T) {
+	fsys := convertFixture(map[string]string{
+		"data/cn": strings.Join([]string{
+			"domain:plain.cn",
+			"full:exact.cn",
+			"keyword:kw",
+			"regexp:^x\\.cn$",
+			"include:shared",
+			"",
+		}, "\n"),
+		// One rule of each kind the filter does NOT name, so a filter that
+		// returned the whole resolved set is distinguishable from one that
+		// returned what it was asked for.
+		"data/shared": strings.Join([]string{
+			"full:shared-exact.cn",
+			"domain:shared-sub.cn",
+			"",
+		}, "\n"),
+	})
+
+	all, err := ConvertFSKinds(fsys, "data/cn", nil)
+	if err != nil {
+		t.Fatalf("convert all: %v", err)
+	}
+	if len(all) != 6 {
+		t.Fatalf("fixture produced %d rules, want one of each kind plus the included one: %v", len(all), all)
+	}
+
+	filtered, err := ConvertFSKinds(fsys, "data/cn", []string{"full", "regexp"})
+	if err != nil {
+		t.Fatalf("convert filtered: %v", err)
+	}
+	for _, expression := range filtered {
+		if !strings.HasPrefix(expression, "full:") && !strings.HasPrefix(expression, "regexp:") {
+			t.Fatalf("the filter returned %q, which is not a kind it named", expression)
+		}
+	}
+	// The included `full:` rule is in the result, which is the whole point: the
+	// filter runs on what the entry resolved to, not on the entry's own lines.
+	want := []string{"full:exact.cn", "full:shared-exact.cn", "regexp:^x\\.cn$"}
+	if strings.Join(filtered, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("filtered = %q, want exactly %q", filtered, want)
+	}
+}
+
+func TestAKindsFilterThatNamesNothingThisSourceHasIsAFailure(t *testing.T) {
+	fsys := convertFixture(map[string]string{"data/cn": "domain:only.cn\n"})
+	_, err := ConvertFSKinds(fsys, "data/cn", []string{"regexp"})
+	if err == nil {
+		t.Fatal("a filter matching nothing was accepted, which would publish an empty contribution")
+	}
+	if !strings.Contains(err.Error(), "regexp") {
+		t.Fatalf("error = %v, want it to name the kinds it was asked for", err)
+	}
+}
+
+func TestAKindsFilterRefusesAKindThisConverterCannotExpress(t *testing.T) {
+	fsys := convertFixture(map[string]string{"data/cn": "domain:only.cn\n"})
+	if _, err := ConvertFSKinds(fsys, "data/cn", []string{"ipcidr"}); err == nil {
+		t.Fatal("a filter named a rule type no converter here emits, so the lock would promise a contribution nothing produces")
+	}
+}
+
+func TestAnEmptyKindsFilterKeepsEveryKind(t *testing.T) {
+	// `kinds` is a supplement's record of what it contributed, and an empty set
+	// is refused before it reaches here -- but ConvertFSKinds is exported, so
+	// the empty filter has to mean "no filter" rather than "keep nothing".
+	fsys := convertFixture(map[string]string{"data/cn": "domain:only.cn\nfull:exact.cn\n"})
+	for _, kinds := range [][]string{nil, {}} {
+		got, err := ConvertFSKinds(fsys, "data/cn", kinds)
+		if err != nil {
+			t.Fatalf("ConvertFSKinds(%v): %v", kinds, err)
+		}
+		if strings.Join(got, "\n") != "domain:only.cn\nfull:exact.cn" {
+			t.Fatalf("ConvertFSKinds(%v) = %q, want every kind", kinds, got)
+		}
+	}
+}
