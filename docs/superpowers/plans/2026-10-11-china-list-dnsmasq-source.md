@@ -34,8 +34,8 @@ spec 说了软件必须做到什么，没说的输入不等于可以破坏它。
 1. **上游某个 commit 改名或删除了三个 entry 之一** —— 刷新必须**指名那个 entry 失败**，而不是发布一份只剩两个文件的列表、悄悄丢掉一万条规则。
 2. **升级机器上遗留的 v1 lock** —— 必须被拒绝并给出迁移命令，不得被解读成 v2（那会让一份 lock 读起来完整而含义已变）。
 3. **上游某天把地址换成别的 IP** —— 仍然丢弃，产物不变。测试必须用**非 114 的地址**做夹具，才能证明"丢弃"是行为而不是"恰好等于那个常量"。
-4. **仅大小写不同的重复域名** —— 必须**两条都保留**，不做 case folding，产物逐字节确定。
-5. **6 条停用行** —— 只能以 `# disabled upstream: <链接>` 出现，绝不能变成活动的 `domain:` 规则；且注释里不得含地址。
+4. **仅大小写不同的重复域名** —— **折叠成一条，且折叠后的拼写必须与 matcher 实际持有的那条一致**。`SubDomainMatcher.Add` 用 `NormalizeDomain` 归一化每一个载入的值，所以发布 `domain:Example.CN` 会发布出与真正进入 trie 的规则不同的字节。**这一条在初稿里是写反的**：我当时把 `sort -u` 在 `LANG=zh_CN.UTF-8` 下少算 140 条的locale陷阱推广成了"Go 实现不许折叠"。那个陷阱在**统计**里，不在**转换语义**里——Go 用 map 精确比较，所以计数必须是字节精确的，而转换必须折叠。两者不是同一件事。
+5. **6 条停用行** —— 只能以 `# disabled upstream: <原因>` 出现，绝不能变成活动的 `domain:` 规则；且注释里不得含地址。
 6. **两个仓库的请求是否真的分别发出了** —— 双源下载的成败取决于取的是不是各自的仓库，一个只按调用顺序分发的夹具会让"取错仓库"这个缺陷看起来是绿的。
 
 各条的落点（按 Review Focus 编号）：
@@ -45,7 +45,7 @@ spec 说了软件必须做到什么，没说的输入不等于可以破坏它。
 | 1 | Task 1 | `TestAMissingEntryNamesTheEntryItCouldNotRead` |
 | 2 | Task 2 | `TestAV1LockIsRefusedAndTheRefusalNamesTheWayOut` |
 | 3 | Task 1 | `TestAChinaConfLineBecomesOneDomainExpression`（夹具地址是 `203.0.113.7`，**不是** 114DNS） |
-| 4 | Task 1 | `TestDomainsDifferingOnlyByCaseAreBothKept` |
+| 4 | Task 1 | `TestTwoSpellingsCollapseToTheOneRuleMOSDNSWillMatch`（初稿名为 `...AreBothKept`，**断言是错的**，已改） |
 | 5 | Task 1 | `TestADisabledEntryBecomesACommentAndNeverARule` |
 | 6 | Task 3 | `TestThePrimaryArchiveIsFetchedFromTheRepositoryTheLockNames`；配套把 `fakeRemote` 与 `fakeOrigin` 从单仓库改成按仓库分发 |
 
@@ -379,11 +379,15 @@ func ConvertChinaConfFS(fsys fs.FS, entries []string) (ChinaConfResult, error) {
 	var result ChinaConfResult
 	seen := make(map[string]bool)
 	comments := make(map[string]bool)
+	// Every entry that could not be read is named, not just the first: a caller
+	// told about one of three has to go and find the other two itself.
+	var missing []string
 
 	for _, entry := range entries {
 		body, err := fs.ReadFile(fsys, entry)
 		if err != nil {
-			return ChinaConfResult{}, fmt.Errorf("%s: this entry is named by the pin and could not be read: %w", entry, err)
+			missing = append(missing, entry)
+			continue
 		}
 		countBefore := len(result.Expressions)
 		for number, line := range strings.Split(string(body), "\n") {
@@ -392,7 +396,7 @@ func ConvertChinaConfFS(fsys fs.FS, entries []string) (ChinaConfResult, error) {
 				continue
 			}
 			// 注释在第一个 `#` 处开始,与 dnsmasq 与 MOSDNS 都一致。
-			if comment, ok := disabledReason.FindStringSubmatch(text); ok {
+			if comment := disabledReason.FindStringSubmatch(text); comment != nil {
 				reason := strings.TrimSpace(comment[1])
 				if !comments[reason] {
 					comments[reason] = true
@@ -426,6 +430,12 @@ func ConvertChinaConfFS(fsys fs.FS, entries []string) (ChinaConfResult, error) {
 		}
 	}
 
+	if len(missing) > 0 {
+		return ChinaConfResult{}, fmt.Errorf(
+			"%s: these entries are named by the pin and could not be read; publishing the list "+
+				"without them would silently drop every rule they carried",
+			strings.Join(missing, ", "))
+	}
 	if len(result.Expressions) == 0 {
 		return ChinaConfResult{}, errors.New("the named entries resolved to no rules at all")
 	}
