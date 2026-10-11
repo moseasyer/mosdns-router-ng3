@@ -1718,7 +1718,46 @@ func publishFallback(ctx context.Context, options updateListOptions, stdout, std
 }
 ```
 
-`updateListOptions` 增加 `supplementPin *rules.SourceRef`，`runPinRemote` 在构造候选锁时带上它。
+`updateListOptions` 增加两个字段：
+
+```go
+	// primaryPin 与 supplementPin 是本次要发布的两个源，由调用方决定
+	// resolve 哪一个仓库。默认是零值，表示"跟随机器上已发布的锁"。
+	primaryPin    *rules.SourceRef
+	supplementPin *rules.SourceRef
+```
+
+**并且 `runPinRemote` 必须按 `options.primaryPin.Repository` resolve，而不是按常量。** 这是 Task 2 引入的一个不一致：`refreshChinaList` 改成了跟随锁里的仓库，却把结果交给仍然按 `rules.RepositoryV2Fly` 重新 resolve 的 `runPinRemote`。改动之前两处用的是同一个常量，所以它们**按构造**是同一个仓库；改动之后不是了。提交那个 commit 是 Task 2 完成的，运行它的是 Task 4——所以 Task 4 必须把这个洞补上，否则一个"正确"的 commit 会被拿去问另一个仓库，而注释不能替代修复。
+
+```go
+func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	client := services.newHTTPClient()
+	primaryRef := options.primaryPin
+	if primaryRef == nil {
+		pinned, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
+		if err != nil {
+			writeCLIError(stderr, "update-lists: %v", err)
+			return exitStateUnavailable
+		}
+		primaryRef = &pinned.Primary
+	}
+	// The repository comes from the pin, never from a constant: the commit this
+	// publishes is only meaningful at the repository that issued it, and a commit
+	// resolved against a different repository is either absent or, worse, present
+	// and unrelated.
+	resolved, err := rules.ResolvePinned(ctx, client, primaryRef.Repository, options.pinRemote)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	...
+	candidate := rules.SourceLock{SchemaVersion: 2, Primary: resolved.Primary, Supplement: options.supplementPin}
+	pinned, list, err := rules.Download(ctx, client, candidate)
+	...
+}
+```
+
+`refreshChinaList` 在调用前把已测量的 `resolved.Primary` 作为 `primaryPin` 传下去，于是"测量的那个 commit"和"发布的那个 commit"既是同一个 commit，也是同一个仓库。
 
 - [ ] **Step 4: 运行测试并确认通过**
 
@@ -1788,6 +1827,12 @@ FALLBACK_LOCK = DATA_DIRECTORY + "/source-lock-fallback.json"
 ```
 
 > 实现者注意：`configs/cn-domains.txt-fallback` 是**不提交**的构建输入，见 Step 3；若选择直接提交一个 `configs/cn-domains-fallback.txt` 作为来源，则把该断言的右侧改成那个路径。本项目已有的做法是提交来源文件（`configs/cn-domains.txt`），因此推荐新增 `configs/cn-domains-fallback.txt` 并提交它。
+
+- [ ] **Step 1b: 修好 `unpinned_pair()` 这个已经过时的夹具**
+
+`installer/tests/test_package.py` 的 `unpinned_pair()` 写的是 **schema_version 1** 的锁，而它的 docstring 声称"与 `mosdns-cdnctl update-lists --pin-remote` 写出的完全一致"——Task 2 之后这句话是假的。测试仍然通过，是因为 `postinst` 只用 `sed` 取 `list_sha256`，Go 那边根本读不到它。但这正是本项目记过六次的那种夹具：它建模了一份这个构建既写不出也读不进的文档，而它上面的门禁读起来像它具备的覆盖。
+
+把它改成写 v2（primary 为 `rules.RepositoryV2Fly` 那一份，无 supplement），并把 docstring 里"与 pin-remote 完全一致"改成本身就能站住的说法——要么指向生成它的那段代码，要么去掉这个类比。改完删掉那些因为旧形状而存在的断言，确认删掉的是**形状**而不是**行为**。
 
 - [ ] **Step 2: 运行测试并确认失败**
 
@@ -1871,7 +1916,67 @@ git commit -m "feat(packaging): ship the fallback pair, so a cold start needs no
 - Consumes: Task 1 的转换器、Task 3 的并集
 - Produces: 仓库里那份描述 dnsmasq 主源 + v2fly 补充的已提交列表
 
-- [ ] **Step 1: 扩展已提交校验测试**
+- [ ] **Step 1: 让已提交校验认识注释行**
+
+Task 1 的转换器会在发布列表顶部写出 `# disabled upstream: <原因>` 注释行。MOSDNS 的加载器在第一个 `#` 处截断，所以注释对它不可见；但 `convert.go` 的 `validateRenderedRule` 拒绝任何含 `#` 的行，而 `committed_test.go:96` 把**每一行**都喂给它。**不先修这里，Step 3 的重新 pin 必然失败**——而且失败在一个与本 task 无关的断言上。
+
+这不是把守卫放宽：`validateRenderedRule` 守的是"发布出去的每一行都是 MOSDNS 会当成规则读的东西"，而注释行 MOSDNS **根本不当成规则读**，所以它不属于那扇门。门该守的是**规则行**，注释行该由另一条断言守。
+
+在 `committed_test.go` 里把逐行校验改成先分流：
+
+```go
+	forms := make(map[string]int)
+	comments := 0
+	for number, line := range lines {
+		// A comment line is not an expression MOSDNS will read: its loader
+		// truncates every line at the first `#`, so a comment contributes no
+		// rule. It is therefore held to a different requirement -- that it
+		// says where it came from and names no resolver -- rather than fed
+		// to a gate about rule syntax.
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			comments++
+			if !strings.HasPrefix(strings.TrimSpace(line), "# disabled upstream: ") {
+				t.Fatalf("committed list line %d is a comment this package does not write: %q", number+1, line)
+			}
+			if addressShaped.MatchString(line) {
+				t.Fatalf("committed list line %d carries an address in a comment: %q", number+1, line)
+			}
+			continue
+		}
+		if err := validateRenderedRule(line); err != nil {
+			t.Fatalf("committed list line %d is not a MOSDNS expression: %v", number+1, err)
+		}
+		forms[strings.SplitN(line, ":", 2)[0]]++]
+	}
+	if comments == 0 {
+		t.Fatal("the committed list carries no disabled-upstream comment, so the provenance this plan exists to keep was dropped")
+	}
+```
+
+并把排序断言也改掉——注释块在文件顶部，而 `sort.StringsAreSorted(lines)` 覆盖整个文件。排序断言必须只对规则行成立：
+
+```go
+	if !sort.StringsAreSorted(ruleLines) {
+		t.Errorf("the committed list's rules are not sorted:\nfirst out of order: %s", firstUnsorted(ruleLines))
+	}
+```
+
+- [ ] **Step 1b: 删掉 Task 2 留下的值断言**
+
+Task 2 迁移 `committed_test.go` 时，把原本的形状断言改写成了对**当前值**的断言：
+
+```go
+	if lock.Primary.Repository != RepositoryV2Fly { ... }
+	if lock.Primary.Entry != V2FlyEntry { ... }
+	if lock.Supplement != nil { ... }
+	if lock.SchemaVersion != 2 { ... }   // 不可达：ParseSourceLock 已经拒绝其他版本
+```
+
+v1 之下 `lock.Repository != Repository` 是**形状**断言（只有那一个被审核的源）；v2 之下 `Validate()` 已经强制"两个被审核的源之一"，所以忠实的迁移是**什么都不做**。写成值断言的后果是：Task 6 把 primary 换成 dnsmasq、补上 supplement 之后，这四条会同时失败，而计划里没有任何一步说过要改它们。**注释不是所有者。**
+
+Step 2 里新增的 `TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom` 才是正确的形状断言（"primary 是 dnsmasq，且 primary 名为三个 entry"），它取代那四条，而不是和它们并存。删掉上面这四段，并删掉随之不再使用的 `V2FlyEntry` / `RepositoryV2Fly` 引用（`RepositoryChina` 仍要用）。
+
+- [ ] **Step 2: 扩展已提交校验测试**
 
 `internal/rules/committed_test.go` 追加：
 
@@ -1932,7 +2037,7 @@ func TestTheCommittedListKeepsTheRegexpRulesTheDnsmasqSourceCannotExpress(t *tes
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认失败**
+- [ ] **Step 3: 运行测试并确认失败**
 
 ```bash
 export PATH=/tmp/opencode/go1.25.8/bin:$PATH
@@ -1943,7 +2048,7 @@ go test ./internal/rules -run 'TestTheCommitted' -v
 
 Expected: FAIL，`the committed list is pinned to "v2fly/domain-list-community", and the primary source is "felixonmars/dnsmasq-china-list"`。
 
-- [ ] **Step 3: 重新 pin 主源**
+- [ ] **Step 4: 重新 pin 主源**
 
 ```bash
 export PATH=/tmp/opencode/go1.25.8/bin:$PATH
@@ -1972,7 +2077,7 @@ head -3 configs/cn-domains.txt
 cat configs/source-lock.json
 ```
 
-- [ ] **Step 4: 运行测试并确认通过**
+- [ ] **Step 5: 运行测试并确认通过**
 
 ```bash
 go test ./internal/rules -v
@@ -1981,7 +2086,7 @@ go vet ./...
 gofmt -l . | grep -v '^\.gocache-review' || echo "gofmt clean"
 ```
 
-- [ ] **Step 5: 确认产物里没有任何地址**
+- [ ] **Step 6: 确认产物里没有任何地址**
 
 ```bash
 if grep -qE '([0-9]{1,3}\.){3}[0-9]{1,3}' configs/cn-domains.txt; then
@@ -1991,7 +2096,7 @@ echo "no address in the committed list"
 grep -c '^# disabled upstream:' configs/cn-domains.txt
 ```
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
 git add configs/cn-domains.txt configs/source-lock.json internal/rules/committed_test.go
