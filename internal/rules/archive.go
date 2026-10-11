@@ -43,7 +43,13 @@ func Archive(previousLockPath, currentLockPath string) error {
 	}
 	current, err := ParseSourceLock(encoded)
 	if err != nil {
-		return fmt.Errorf("rules: %s is not a lock this package can archive: %w", currentLockPath, err)
+		// The one failure that is about the DOCUMENT rather than the filesystem or
+		// the operation, and the only one a caller may work around: the lock is a
+		// real file this build cannot read, and copying it needs neither the parse
+		// nor anything that could have failed here. Everything after this point is
+		// a failure of the archive itself, and a caller that fell back to copying
+		// on those would be reporting success for an archive that is not there.
+		return fmt.Errorf("rules: %s is not a lock this package can archive: %w", currentLockPath, ErrLockUnreadable)
 	}
 	// Re-encoded rather than the bytes copied. A lock that was hand-edited and still
 	// parses would otherwise be archived verbatim, and the archive would be the one
@@ -54,6 +60,16 @@ func Archive(previousLockPath, currentLockPath string) error {
 	}
 	return writeLockAtomically(previousLockPath, canonical, defaultFileOps())
 }
+
+// ErrLockUnreadable is Archive's one failure that is about the lock as a
+// DOCUMENT: the file is there and readable, and it is not a lock this build can
+// parse.
+//
+// It is named so that a caller can tell it from a failure of the archive -- a
+// disk that is full, a directory that cannot be synced, a path that is both the
+// archive and the lock. Only this one may be answered by copying the bytes
+// instead, because only this one leaves a record that already exists.
+var ErrLockUnreadable = errors.New("the published lock is not a lock this package can read")
 
 // ArchiveVerbatim copies the currently published lock to previousLockPath
 // WITHOUT reading it as a lock: the bytes on disk are what is archived, and a

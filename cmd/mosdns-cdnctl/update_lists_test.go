@@ -1343,16 +1343,22 @@ func TestPinSourceOverAHealthyPairLeavesAnArchiveThisBuildCanReadBack(t *testing
 	}
 }
 
-// The digest tripwire guards against a published list somebody edited by hand.
-// Naming a source is not a reason to lose it: the flag widens WHAT may be
-// replaced, not whether a disagreement is reported.
-func TestPinSourceOverAHandEditedListStillReportsTheDisagreement(t *testing.T) {
+// The digest tripwire REFUSES, it does not warn. The archive covers the lock
+// alone -- nothing here archives cn-domains.txt -- so publishing over a
+// hand-edited list destroys the only trace of the edit, and a line on stderr is
+// the whole record of it. And a refusal costs nothing legitimate: the lock
+// Publish writes records the digest of the list Publish wrote, so a published
+// pair can never disagree, and the only way here is a file changed by hand.
+func TestPinSourceOverAHandEditedListIsRefused(t *testing.T) {
 	paths := newListPaths(t)
-	publishPair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	installed := []byte("domain:previous.cn\n")
+	publishPair(t, paths, lockedCommit, installed)
 	// Someone edited the published list; the lock still records the old digest.
-	if err := os.WriteFile(paths.listFile, []byte("domain:tampered.cn\n"), 0o640); err != nil {
+	tampered := []byte("domain:tampered.cn\n")
+	if err := os.WriteFile(paths.listFile, tampered, 0o640); err != nil {
 		t.Fatal(err)
 	}
+	before := snapshot(t, paths.dir)
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
@@ -1360,48 +1366,66 @@ func TestPinSourceOverAHandEditedListStillReportsTheDisagreement(t *testing.T) {
 	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
-	if code != exitSuccess {
-		t.Fatalf("--pin-remote exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	if code == exitSuccess {
+		t.Fatal("--pin-source published over a published list its own lock does not describe")
 	}
-	if !strings.Contains(stderr, "tampered") && !strings.Contains(stderr, "does not match the list_sha256") {
-		t.Fatalf("a hand-edited published list was replaced with no report of the disagreement: %q", stderr)
+	if !strings.Contains(stderr, "list_sha256") {
+		t.Errorf("the refusal does not name the disagreement: %q", stderr)
 	}
+	// Both files still hold what they held: the list is the one that was edited
+	// and the lock is the one that was published, because nothing was replaced.
+	if list := mustReadFile(t, paths.listFile); !bytes.Equal(list, tampered) {
+		t.Errorf("the published list is %q, want the %q that was on disk", list, tampered)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err == nil && found && lock.Primary.Commit != lockedCommit {
+		t.Errorf("the pin moved to %s although the pair disagreed", lock.Primary.Commit)
+	}
+	if _, err := os.Stat(paths.previousLock); err == nil {
+		t.Error("a refused pin left an archive, so the next rollback target is a pin that was never published")
+	}
+	_ = before
 }
 
-// Without the flag, an unreadable pair is a refusal. It is also the only way
-// that path is reachable on an UNATTENDED run: refreshChinaList sets the
-// repository it measured, so its pin never consults a published lock for one,
-// and this is the refusal that has to hold when a scheduled run finds the pair
-// broken. A path no test constructs is a path no test holds.
-func TestTheUnattendedRefreshRefusesAPairItCannotRead(t *testing.T) {
-	paths := newListPaths(t)
-	publishPair(t, paths, lockedCommit, rulesOf(200))
-	// The lock is truncated into something this build will not read: the
-	// scheduled run must stop rather than publish over a pair it cannot account
-	// for, because there is no operator at the keyboard to say what should
-	// replace it.
-	if err := os.WriteFile(paths.sourceLock, []byte("{ this is not a lock"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	before := snapshot(t, paths.dir)
-	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
-		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+// The v1 migration the flag exists for is UNAFFECTED by the refusal: a schema
+// version 1 lock cannot parse, so the digest comparison never runs and there is
+// nothing to disagree about. If this ever failed, the flag would have stopped
+// being a way out of the state it was written for.
+func TestPinSourceOverAV1LockStillPublishesWhereAParsingPairIsRefused(t *testing.T) {
+	// The two cases side by side, because the fix is a split and a split is
+	// only correct if each side still does what it did.
+	t.Run("an unreadable lock is replaced", func(t *testing.T) {
+		paths := newListPaths(t)
+		publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+		})
+		code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+		if code != exitSuccess {
+			t.Fatalf("the v1 migration was refused, which is the one thing the flag exists to prevent: %s", stderr)
+		}
 	})
-
-	code, _, stderr := runCLI(t, origin.services(), "--automatic",
-		"--policy", automaticPolicy(t, true, false),
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
-		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
-	if code == exitSuccess {
-		t.Fatal("an unattended refresh published over a pair it could not read")
-	}
-	if !strings.Contains(stderr, "not a lock") && !strings.Contains(stderr, "decode source lock") {
-		t.Errorf("the refusal does not name the problem: %q", stderr)
-	}
-	if !strings.Contains(stderr, "--pin-source") {
-		t.Errorf("the refusal does not say what an operator could do about it: %q", stderr)
-	}
-	assertUnchanged(t, before, paths.dir, "")
+	t.Run("a readable pair that disagrees is refused", func(t *testing.T) {
+		paths := newListPaths(t)
+		publishPair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+		if err := os.WriteFile(paths.listFile, []byte("domain:tampered.cn\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+		})
+		code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+		if code == exitSuccess {
+			t.Fatal("a pair that disagrees with itself was published over")
+		}
+		if !strings.Contains(stderr, "Nothing was published") {
+			t.Errorf("the refusal does not say that nothing was written: %q", stderr)
+		}
+	})
 }
 
 // The flag's value becomes a path in a URL, so it is checked against the

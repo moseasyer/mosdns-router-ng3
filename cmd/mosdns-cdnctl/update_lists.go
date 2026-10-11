@@ -862,31 +862,33 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	}
 	defer func() { _ = release() }()
 
-	// Two checks read the outgoing pair, and both refuse one this build cannot
-	// parse -- which is what a published schema version 1 lock is, and what the
-	// refusal ParseSourceLock prints names this command to recover from.
+	// The outgoing pair is read, and the two ways it can be unsatisfiable are
+	// different problems with different answers.
 	//
-	// What a named source widens is WHICH lock may be replaced, not whether a
-	// disagreement is reported. So the pair is still read: if it parses, a list
-	// that disagrees with its own lock is reported, because that is a different
-	// failure from the one --pin-source exists for -- a hand-edited published
-	// list, and the operator is the one who can say whether it was deliberate.
-	// A v1 document cannot parse, so on the path that needed the flag there is
-	// nothing to report and the warning costs nothing.
+	// A lock this build cannot PARSE is the case --pin-source exists for: the
+	// pair says nothing about which repository to pin, the operator has named
+	// one, and the publication replaces a document this build was never able to
+	// read. It goes to stderr and continues \em there is no disagreement to
+	// preserve, because a document that does not parse cannot disagree with
+	// anything.
+	//
+	// A pair that PARSES and disagrees with itself is the opposite: the lock is
+	// fine and the list beside it is not the one the lock records, which means
+	// the list was changed out of band. That is refused rather than reported,
+	// for two reasons. The archive covers the lock alone \em nothing here
+	// archives cn-domains.txt, so publishing over it destroys the only trace of
+	// the change and a line on stderr is the whole record of it. And a refusal
+	// costs nothing legitimate: the lock Publish writes records the digest of
+	// the list Publish wrote, so a published pair can never disagree, and the
+	// only way to reach this is to have changed a file by hand.
 	if _, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err != nil {
-		if options.pinSource == "" && options.pinRepository == "" {
-			// No source was named and none was measured, so there is no
-			// repository to pin without the pair -- including on an unattended
-			// refresh, where the measured repository is what makes this reachable.
-			writeCLIError(stderr, "update-lists: %v. Name the source to pin with `--pin-source %s` "+
-				"(or %q) to publish over a lock this build cannot read",
-				err, rules.RepositoryV2Fly, rules.RepositoryChina)
+		if rules.PublishedPairRefuses(err) {
+			writeCLIError(stderr, "update-lists: %v. Nothing was published, and the list this lock "+
+				"describes is the one still on disk; if you changed it deliberately, replace the "+
+				"pair with a fresh pin from the source that produced it", err)
 			return exitStateUnavailable
 		}
-		// A source IS known, so the pair is being replaced deliberately. The
-		// refusal still goes to stderr: an operator who asked for this deserves
-		// to know what they are replacing.
-		writeCLIError(stderr, "update-lists: replacing a published pair this build cannot read: %v", err)
+		writeCLIError(stderr, "update-lists: replacing a published lock this build cannot read: %v", err)
 	}
 	// Archived before the publish and replaced by it, and the order is the mechanism:
 	// once the new lock is renamed into place the old one no longer exists anywhere,
@@ -900,11 +902,22 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// is destroyed by the very operation that needed it.
 	//
 	// The canonical archiver is tried FIRST and the verbatim one is a fallback for
-	// the lock it cannot parse. Choosing on whether the outgoing lock parses rather
-	// than on which flag was typed is what keeps a healthy machine's archive
-	// re-encoded -- the property Archive exists to preserve, and one that a
-	// --pin-source run has no reason to give up.
+	// the ONE failure that is about the document rather than the archive: a lock
+	// this build cannot parse. Choosing on whether the outgoing lock parses
+	// rather than on which flag was typed is what keeps a healthy machine's
+	// archive re-encoded -- the property Archive exists to preserve, and one that
+	// a --pin-source run has no reason to give up.
+	//
+	// The fallback is deliberately narrow. A disk that is full, a directory that
+	// will not sync, a path that is both the archive and the lock: those are
+	// failures of the archive, and answering them by copying the bytes would
+	// report an archive that is not there.
 	if err := rules.Archive(options.previousLock, options.sourceLock); err != nil {
+		if !errors.Is(err, rules.ErrLockUnreadable) {
+			writeCLIError(stderr, "update-lists: archive the outgoing pin, so publishing would leave "+
+				"no way back: %v", err)
+			return exitStateUnavailable
+		}
 		if verbatimErr := rules.ArchiveVerbatim(options.previousLock, options.sourceLock); verbatimErr != nil {
 			writeCLIError(stderr, "update-lists: archive the outgoing pin, so publishing would leave "+
 				"no way back: %v", verbatimErr)

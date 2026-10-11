@@ -314,6 +314,28 @@ func (b *backupFile) discard(err *error, ops fileOps) {
 	}
 }
 
+// ErrPublishedPairDisagrees is the one failure of ReadPublishedPair that means
+// the pair is intact and WRONG rather than unreadable: the lock parses and
+// validates, and the list beside it is not the one that lock records.
+//
+// It is named because a caller has to tell this apart from a lock it cannot
+// parse, and the two want opposite answers. An unreadable lock says nothing about
+// which repository this machine was running, so a caller that already knows the
+// source has nothing left to learn from it and the pair is being replaced on
+// purpose. A disagreement is a list changed out of band, and only the caller
+// knows whether overwriting that is what the operator meant.
+var ErrPublishedPairDisagrees = errors.New("the published list is not the one its source lock records")
+
+// PublishedPairRefuses reports whether err from ReadPublishedPair is the pair
+// disagreeing with itself rather than a lock this build cannot read.
+//
+// A caller should not have to recover this by matching error text, because the
+// two cases want opposite answers and a substring match on prose is a coupling
+// that breaks the first time the message is reworded for a reader.
+func PublishedPairRefuses(err error) bool {
+	return errors.Is(err, ErrPublishedPairDisagrees)
+}
+
 // ReadPublishedPair reads the published list and the lock that describes it.
 //
 // A directory with neither file is a first install, reported as not found rather
@@ -321,6 +343,9 @@ func (b *backupFile) discard(err *error, ops fileOps) {
 // validate, and a list whose digest the lock does not record are all errors: a
 // pair that disagrees with itself is not something a caller may overwrite on the
 // strength of its own new content.
+//
+// The digest disagreement is wrapped in ErrPublishedPairDisagrees so a caller
+// can tell it from a lock it cannot read; see PublishedPairRefuses.
 func ReadPublishedPair(lockPath, listPath string) (SourceLock, []byte, bool, error) {
 	if lockPath == "" || listPath == "" {
 		return SourceLock{}, nil, false, errors.New("a source lock path and a list path are both required")
@@ -355,7 +380,8 @@ func ReadPublishedPair(lockPath, listPath string) (SourceLock, []byte, bool, err
 		return SourceLock{}, nil, false, fmt.Errorf("%s: validate the source lock: %w", lockPath, err)
 	}
 	if actual := digestHex(list); actual != lock.ListSHA256 {
-		return SourceLock{}, nil, false, fmt.Errorf("%s: list sha256 %s does not match the list_sha256 the source lock at %s records", listPath, actual, lockPath)
+		return SourceLock{}, nil, false, fmt.Errorf("%s: list sha256 %s does not match the list_sha256 "+
+			"the source lock at %s records: %w", listPath, actual, lockPath, ErrPublishedPairDisagrees)
 	}
 	return lock, list, true, nil
 }

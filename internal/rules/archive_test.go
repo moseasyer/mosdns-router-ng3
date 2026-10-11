@@ -2,11 +2,73 @@ package rules
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// The verbatim archiver is a fallback for ONE failure: a lock this build cannot
+// PARSE. Everything else -- a path that is both the archive and the lock, a
+// lock that cannot be read at all -- is a failure of the ARCHIVE, and answering
+// it by copying bytes would report an archive that is not there.
+func TestOnlyAnUnparseableLockIsReportedAsErrLockUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	v1 := []byte(`{"schema_version":1,"repository":"v2fly/domain-list-community","commit":"` +
+		strings.Repeat("a", 40) + `","sha256":"` + strings.Repeat("b", 64) +
+		`","list_sha256":"` + strings.Repeat("e", 64) + `","entry":"data/cn"}`)
+	current := filepath.Join(dir, "source-lock.json")
+	if err := os.WriteFile(current, v1, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	// The document failure: the fallback must be able to see this one.
+	if err := Archive(filepath.Join(dir, "previous.json"), current); !errors.Is(err, ErrLockUnreadable) {
+		t.Errorf("a lock this build cannot parse is not reported as ErrLockUnreadable, so a caller "+
+			"cannot fall back to copying it: %v", err)
+	}
+
+	// The operation failures: a caller must NOT be able to fall back on these,
+	// or a failed archive would be reported as a published one.
+	same := filepath.Join(dir, "same.json")
+	if err := Archive(same, same); errors.Is(err, ErrLockUnreadable) {
+		t.Error("a path that is both the archive and the lock is reported as an unreadable lock, so a " +
+			"caller would fall back to copying a file onto itself")
+	}
+	if err := Archive("", current); errors.Is(err, ErrLockUnreadable) {
+		t.Error("an empty archive path is reported as an unreadable lock")
+	}
+	if err := Archive(filepath.Join(dir, "previous.json"), ""); errors.Is(err, ErrLockUnreadable) {
+		t.Error("an empty lock path is reported as an unreadable lock")
+	}
+
+	// And a lock this build CAN read is archived rather than reported, whatever
+	// else is true of it: the split is about the document, not about validity.
+	// A lock that parses but fails Validate is accepted here and re-encoded --
+	// Archive does not call Validate, and refusing it would mean a lock that is
+	// wrong in some other way could not be rolled back from.
+	parsed := SourceLock{
+		SchemaVersion: schemaVersion,
+		Primary: SourceRef{
+			Repository: RepositoryV2Fly,
+			Commit:     strings.Repeat("a", 40),
+			SHA256:     strings.Repeat("b", 64),
+			Entry:      V2FlyEntry,
+		},
+		ListSHA256: strings.Repeat("e", 64),
+	}
+	encoded, err := parsed.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(current, encoded, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := Archive(filepath.Join(dir, "previous.json"), current); err != nil {
+		t.Errorf("a lock this build can read is not archived: %v", err)
+	}
+}
 
 // TestArchiveVerbatimKeepsALockThisBuildCannotRead pins the property the
 // migration depends on: a schema version 1 lock is refused by everything else in
