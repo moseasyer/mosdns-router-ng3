@@ -325,7 +325,7 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	policy := flags.String("policy", defaultPolicyPath, "path to the policy YAML file, read by --automatic to decide what to refresh")
 	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
-	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from, as `--pin-source "+rules.RepositoryV2Fly+"`. Without it the repository is read from the published lock, which is what a machine with a readable lock wants; with it the pin does not read that lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
+	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from. Without it the repository is the one this machine published, or -- on a machine with nothing published -- the reviewed primary `"+rules.RepositoryChina+"`; `"+rules.RepositoryV2Fly+"` is the fallback and is how you ask for it by name. With the flag the pin does not read the published lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
 	force := flags.Bool("force", false, "publish over a published pair that disagrees with itself -- a list whose digest the lock beside it does not record. That is the state a crash between this command's two renames leaves behind, and it is refused without this flag because nothing here archives the list, so publishing over it destroys the only trace of what was on disk. This waives NOTHING else: a collapsed list, an unreviewed repository and a lock that cannot be read are refused with or without it")
 	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
@@ -493,7 +493,11 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 		return exitStateUnavailable
 	}
 	if !found {
-		writeCLIError(stderr, "update-lists: no pinned China domain list at %s, nothing to compare against; pin one with update-lists --pin-remote HEAD --pin-source %s", options.sourceLock, rules.RepositoryV2Fly)
+		// The repository named is the default a pin would use anyway, so following this
+		// advice cannot take the operator somewhere the command would not have gone
+		// on its own. `--pin-source` still overrides it, which is how an operator
+		// who wants the fallback says so.
+		writeCLIError(stderr, "update-lists: no pinned China domain list at %s, nothing to compare against; pin one with update-lists --pin-remote HEAD --pin-source %s", options.sourceLock, rules.RepositoryChina)
 		return exitStateUnavailable
 	}
 
@@ -1258,12 +1262,27 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 			return exitStateUnavailable
 		}
 		if found {
+			// The published lock outranks the default. A machine that asked for a
+			// source by name got a lock saying so, and a later unqualified pin
+			// re-pins THAT source -- otherwise the first-install default below
+			// would quietly drag a deliberate choice onto whatever it happens to
+			// name, which is the same silent substitution the default is not
+			// allowed to make in the other direction.
 			repository = published.Primary.Repository
 		} else {
 			// Nothing published yet is a first install, and nothing on this
-			// machine says which source to install, so the reviewed default is
+			// machine says which source to install -- so the reviewed PRIMARY is
 			// the whole answer rather than a guess.
-			repository = rules.RepositoryV2Fly
+			//
+			// It is the primary and not the fallback because v2fly is no longer the
+			// primary but is kept as the fallback. Before this change there was one
+			// source and `--pin-remote HEAD` was unambiguous; with two, defaulting
+			// to the demoted one would mean an operator who typed it got v2fly
+			// rather than the China list they asked for, while the automatic cold
+			// start installed the primary on the very same machine. `--pin-source`
+			// is how an operator asks for the fallback deliberately, and it works
+			// here unchanged.
+			repository = rules.RepositoryChina
 		}
 	}
 	// No option means HEAD, and HEAD means the repository's current default-branch

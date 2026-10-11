@@ -716,11 +716,19 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 	// A pin is the only way a new source reaches the router, so it has to leave a
 	// pair that agrees with itself and a report that names exactly what was
 	// published.
+	//
+	// The source is NAMED rather than left to the first-install default. What this
+	// case is about is the shape of a publication -- the list, the lock that
+	// describes it, and a report naming both -- and a fixture leaning on whatever
+	// the default happens to be would be a machine running a source no operator
+	// chose. Naming the fallback says which source is under test and leaves the
+	// default to the case that tests it.
 	paths := newListPaths(t)
 	archive := sourceArchive(t, remoteCommit, firstInstallArchive)
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: archive})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
@@ -760,6 +768,150 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 	}
 	if _, err := os.Stat(paths.controlLock); err != nil {
 		t.Errorf("pin did not take the control lock: %v", err)
+	}
+}
+
+// An unqualified `--pin-remote HEAD` on an empty machine installs the PRIMARY.
+//
+// Before this change there was only one source, so that invocation was
+// unambiguous. After it there are two, and an operator who typed it has asked for
+// "the China list" -- not for v2fly by name, which is what `--pin-source` is for.
+// Defaulting it to the source the spec demotes (v2fly 不再是主源，但保留为回退) would
+// also make the two ways of doing the same thing disagree: the automatic cold start
+// installs the primary on this very machine, and a hand-run pin would not.
+func TestAnUnqualifiedFirstInstallPublishesThePrimary(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		// Served so a run that reached for the fallback would be caught below
+		// rather than failing with a confusing "unexpected status".
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Primary.Repository != rules.RepositoryChina {
+		t.Fatalf("an unqualified first install published %q; the operator asked for the China "+
+			"list and the default is the primary %q. Name the fallback with `--pin-source %s` "+
+			"if that is what you want.", lock.Primary.Repository, rules.RepositoryChina, rules.RepositoryV2Fly)
+	}
+	if lock.Primary.Commit != remoteCommit {
+		t.Errorf("published %s, want the primary's HEAD %s", lock.Primary.Commit, remoteCommit)
+	}
+	if other := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(other) {
+		t.Errorf("the unqualified install fetched %q, so it resolved the fallback as the primary", other)
+	}
+}
+
+// The fallback is still reachable BY NAME. Demoting a source is not deleting it:
+// `--pin-source` is how an operator asks for the fallback deliberately, and it has to
+// keep working on exactly the same empty machine the unqualified command now defaults
+// away from.
+func TestTheFallbackIsStillReachableByNameOnAnEmptyMachine(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryV2Fly,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-source %s exited %d (stderr: %s)", rules.RepositoryV2Fly, code, stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Primary.Repository != rules.RepositoryV2Fly {
+		t.Errorf("asking for the fallback by name published %q, want %q",
+			lock.Primary.Repository, rules.RepositoryV2Fly)
+	}
+	if lock.Supplement != nil {
+		t.Errorf("a v2fly primary was published with a supplement beside it: %+v", lock.Supplement)
+	}
+	if other := origin.archivePath(rules.RepositoryChina, remoteCommit); origin.fetched(other) {
+		t.Errorf("naming the fallback still fetched %q", other)
+	}
+}
+
+// An explicit pin survives a later unqualified run. This is the one way the new default
+// could become a new defect: if the first-install default were consulted whenever the
+// repository is not named on the command line, a machine that deliberately pinned the
+// fallback would be dragged onto the primary by the next bare `--pin-remote HEAD`.
+//
+// The published lock outranks the default, and this case is what holds that: the origin
+// serves BOTH repositories at the same commit, so a run that asked the wrong one would
+// publish a lock naming it and fail here rather than merely looking right.
+func TestADeliberateV2FlyPinSurvivesALaterUnqualifiedPin(t *testing.T) {
+	paths := newListPaths(t)
+	// A machine that asked for the fallback and got it.
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Primary.Repository != rules.RepositoryV2Fly {
+		t.Fatalf("an unqualified re-pin moved a machine off the source its lock names, onto "+
+			"%q: the lock is what says where this machine runs, and the first-install default is "+
+			"only for a machine with nothing published", lock.Primary.Repository)
+	}
+	if lock.Primary.Commit != remoteCommit {
+		t.Errorf("published %s, want the fallback's HEAD %s", lock.Primary.Commit, remoteCommit)
+	}
+	if other := origin.archivePath(rules.RepositoryChina, remoteCommit); origin.fetched(other) {
+		t.Errorf("the re-pin fetched %q, so it asked the primary for a machine pinned to the fallback", other)
 	}
 }
 
@@ -953,7 +1105,11 @@ func TestPinRemotePublishesTheNamedCommitRatherThanTheRemoteHead(t *testing.T) {
 		remoteCommit: newerArchive,
 	})
 
+	// The source is named: this case is about pinning a NAMED COMMIT rather than
+	// whatever HEAD says now, and leaving it to the first-install default would make
+	// it a test of the default as well.
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", lockedCommit,
+		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", filepath.Join(paths.dir, "previous.json"))
 	if code != exitSuccess {
@@ -1151,7 +1307,10 @@ func TestUpdateListsPinRemoteReportsAPublicationFailureInsteadOfSuccess(t *testi
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive)})
 	listFile := filepath.Join(paths.dir, "not-installed", "cn-domains.txt")
 
+	// The source is named: this case is about the refusal a failed PUBLICATION
+	// produces, and the repository the source came from is not part of it.
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitStateUnavailable {
 		t.Fatalf("pin with an unwritable list exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
@@ -1215,7 +1374,10 @@ func TestUpdateListsTakesTheControlLockOnlyAfterTheSourceIsVerified(t *testing.T
 	}
 	t.Cleanup(func() { _ = held.Close() })
 
+	// The source is named: this case is about WHEN the control lock is taken relative
+	// to the conversion, not about which repository the conversion came from.
 	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code == exitLockHeld {
 		t.Fatalf("pin reported the held lock although it never reached publication: %s", stderr)

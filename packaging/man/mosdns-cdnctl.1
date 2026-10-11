@@ -239,8 +239,21 @@ request \em the allowlist is what makes a repository name a record of something
 this gateway reviewed, and a name outside it would put the lock at the service of
 a stranger.
 .br
-Without this flag the repository is read from the published lock. That is what a
-machine with a readable lock wants, and it is also why the flag exists: a lock
+Without this flag the repository is read from the published lock. On a machine
+with nothing published yet there is no lock to read, and the repository is
+.BR felixonmars/dnsmasq\-china\-list \-
+the reviewed primary, and the same one an unattended cold start installs.
+.BR v2fly/domain\-list\-community
+is the fallback, not the default, and naming it here is how you ask for it on a
+machine that has nothing installed.
+.br
+The published lock outranks that default whenever there is one, so a machine
+that deliberately pinned the fallback keeps running it: a later unqualified
+.B \-\-pin\-remote
+re\-pins the source its own lock names. What the default decides is only the
+first install.
+.br
+Reading the lock is also why the flag exists: a lock
 this build cannot read \em a schema version 1 document is the one an upgraded
 machine carries \em cannot say which repository the machine was running. So a
 machine on such a lock is told to run
