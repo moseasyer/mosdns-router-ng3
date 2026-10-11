@@ -127,8 +127,10 @@ type SourceRef struct {
 // The list derives from primary, and optionally from supplement: the dnsmasq
 // source cannot express a `full:` or a `regexp:` rule, so those v2fly rules are
 // merged into the same published file and the lock has to be able to say so.
-// When the primary IS v2fly -- a fallback publication -- supplement is absent,
-// and one document shape covers both roles.
+// When the primary IS v2fly -- a fallback publication -- supplement is absent
+// and one document shape covers both roles. That is enforced rather than
+// described: v2fly already carries every kind a supplement could contribute, so
+// naming one beside it would be a document untrue about how the list was built.
 type SourceLock struct {
 	// SchemaVersion is the shape of this document.
 	SchemaVersion int `json:"schema_version"`
@@ -252,6 +254,21 @@ func (l SourceLock) validatePinnedSource() error {
 		return errors.New("primary: kinds names what a SUPPLEMENT contributes; the primary contributes everything its repository holds")
 	}
 	if l.Supplement != nil {
+		// A supplement carries what the primary CANNOT. The dnsmasq source
+		// cannot express a `full:` or a `regexp:` rule, so the v2fly rules of
+		// those kinds are merged in beside it. The v2fly source is the opposite
+		// case: as the primary it already carries every kind there is, so a
+		// supplement beside it re-reads its own repository and the document
+		// attributes rules to a second source that already held them -- and no
+		// value of `kinds` could make that true.
+		//
+		// Checked here rather than in Download, because the fault is in the
+		// document: a lock like this is untruthful however it is read, including
+		// by Validate on a pair already on disk. One shape covers both roles --
+		// the fallback publication names no supplement at all.
+		if l.Primary.Repository != RepositoryChina {
+			return fmt.Errorf("supplement: primary %q already carries every rule kind a supplement contributes; a v2fly primary is the fallback publication and has nothing to merge", l.Primary.Repository)
+		}
 		if l.Supplement.Repository != RepositoryV2Fly {
 			return fmt.Errorf("supplement: repository %q is not the only source allowed as a supplement", l.Supplement.Repository)
 		}
@@ -276,6 +293,11 @@ func (l SourceLock) validatePinnedSource() error {
 // twice and read the agreement as coverage. A kind this build does not know is
 // worse still: it is a rule form no converter here will ever emit, so the lock
 // promises a contribution nothing can produce.
+//
+// Whether the primary already carries a kind is out of this function's reach --
+// it depends on which repository the primary is -- so the pairing that makes the
+// question unanswerable is refused in validatePinnedSource rather than asked
+// here.
 func validateSupplementKinds(kinds []string) error {
 	if len(kinds) == 0 {
 		return errors.New("a supplement records which rule kinds it contributed")
@@ -667,9 +689,12 @@ func renderList(expressions, comments []string) []byte {
 // archives were converted in.
 //
 // Both arguments are already sorted and deduplicated by their own converter,
-// which is why the dedupe here is about the overlap between them: the dnsmasq
-// source and v2fly both carry some of the same domains, and a repeated line is
-// a rule the loader would count twice.
+// which is why the dedupe here is about the overlap between them: the two
+// repositories state many of the same domains, and the committed-list gate --
+// firstDuplicate in committed_test.go, which refuses a list that repeats a
+// line -- is what that overlap would otherwise fail. That gate is why this is
+// deduped rather than merely appended; the matcher is not the reason, and a
+// duplicate rule would not change what the router answers either way.
 func mergeExpressions(first, second []string) []string {
 	seen := make(map[string]bool, len(first)+len(second))
 	merged := make([]string, 0, len(first)+len(second))

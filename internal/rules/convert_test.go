@@ -620,9 +620,11 @@ func TestAKindsFilterSelectsOnlyTheRuleTypesItNames(t *testing.T) {
 			"include:shared",
 			"",
 		}, "\n"),
-		// One rule of each kind the filter does NOT name, so a filter that
-		// returned the whole resolved set is distinguishable from one that
-		// returned what it was asked for.
+		// One `domain:` rule, which the filter does NOT name, so a filter that
+		// returned everything the entry resolved to is distinguishable from one
+		// that returned what it was asked for -- and one `full:` rule, which it
+		// does name, which is how the filter is shown reaching a rule that
+		// arrived by inclusion rather than from data/cn's own lines.
 		"data/shared": strings.Join([]string{
 			"full:shared-exact.cn",
 			"domain:shared-sub.cn",
