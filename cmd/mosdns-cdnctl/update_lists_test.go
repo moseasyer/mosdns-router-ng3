@@ -2544,6 +2544,140 @@ func TestAPinKeepsTheSupplementThePublishedListAlreadyCarries(t *testing.T) {
 	}
 }
 
+// A pair that disagrees with itself still NAMES a supplement, and --force is the
+// flag an operator reaches for precisely when the machine is in that state.
+//
+// The repository is recovered from the lock file for that case, which is what lets
+// --force run at all. The supplement was not recovered with it, so the publication
+// replaced a list built from two sources with one built from one -- and the seventy
+// rules only the dnsmasq syntax cannot express left with the lock, silently, on the
+// one path an operator took to repair the machine.
+//
+// It starts from a genuinely disagreeing pair rather than a consistent one: the
+// existing carry-over case uses a pair that agrees, so ReadPublishedPair succeeds
+// there and the recovery below is never reached.
+func TestAForcedPinOverAPairThatDisagreesKeepsTheSupplementTheLockNames(t *testing.T) {
+	paths := newListPaths(t)
+	// The digests are the archives the origin can actually serve, because carrying
+	// the supplement across the pin re-fetches it and verifies against the digest
+	// the lock records.
+	primaryLocked := chinaSourceArchive(t, lockedCommit, string(rulesOf(200)))
+	primaryRemote := chinaSourceArchive(t, remoteCommit, string(rulesOf(200)))
+	supplementLocked := supplementArchive(t, lockedSupplementCommit, 2)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: primaryRemote,
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				lockedSupplementCommit: supplementLocked,
+				remoteCommit:           supplementArchive(t, remoteCommit, 2),
+			},
+		},
+	})
+	published := append(rulesOf(200), supplementRules(2)...)
+	writePublishedPair(t, paths, rules.SourceLock{
+		SchemaVersion: 2,
+		Primary: rules.SourceRef{
+			Repository: rules.RepositoryChina,
+			Commit:     lockedCommit,
+			SHA256:     sha256Hex(primaryLocked),
+			Entries:    append([]string(nil), rules.ChinaConfEntries...),
+		},
+		Supplement: &rules.SourceRef{
+			Repository: rules.RepositoryV2Fly,
+			Commit:     lockedSupplementCommit,
+			SHA256:     sha256Hex(supplementLocked),
+			Entry:      rules.V2FlyEntry,
+			Kinds:      rules.SupplementKinds(),
+		},
+		ListSHA256: sha256Hex(published),
+	}, published)
+	// Now break only the list, which is the crash-between-renames state --force
+	// exists to publish over.
+	leaveDisagreement(t, paths, "domain:halfwritten.cn\n")
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--force over a disagreeing two-source pair exited %d (stderr: %s)", code, stderr)
+	}
+	lock, list, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatalf("the forced pin published a pair that does not describe itself: %v", err)
+	}
+	if lock.Supplement == nil {
+		t.Fatalf("the pin published a lock naming no supplement, so the list it wrote dropped "+
+			"every rule only the second source can express: %+v", lock)
+	}
+	if lock.Supplement.Commit != lockedSupplementCommit {
+		t.Errorf("the carried supplement is %s, want the one the lock already named (%s)",
+			lock.Supplement.Commit, lockedSupplementCommit)
+	}
+	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
+		if !strings.Contains(string(list), want) {
+			t.Errorf("the published list lost %q, which only the second source can express:\n%s", want, list)
+		}
+	}
+	if strings.Contains(stdout, "already at") {
+		t.Errorf("the pin reported already-at instead of publishing:\n%s", stdout)
+	}
+}
+
+// leaveDisagreement replaces only the list, leaving the lock beside it describing
+// a list that is no longer there -- the state Publish itself produces when the
+// machine is interrupted between its two renames.
+func leaveDisagreement(t *testing.T, paths listPaths, replaced string) {
+	t.Helper()
+	if err := os.WriteFile(paths.listFile, []byte(replaced), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile); err == nil {
+		t.Fatal("the fixture is a pair that agrees, so it is not the crash window")
+	} else if !rules.PublishedPairRefuses(err) {
+		t.Fatalf("the fixture does not produce the state --force answers: %v", err)
+	}
+}
+
+// The carry-over has to survive a lock this build cannot read at all, and when it
+// cannot it has to say so rather than drop a second source in silence.
+//
+// The recovery reads the lock file directly, which is what makes the disagreement
+// case work. A lock this build refuses outright -- a v1 document, which is the shape
+// every machine upgrading from the previous schema has -- parses to nothing, so
+// there is no supplement to recover and the publication carries none. That is
+// correct, but it is also indistinguishable from the bug above unless the run says
+// which happened.
+func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
+	paths := newListPaths(t)
+	publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:only.cn\n"),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryChina,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("the v1 re-pin exited %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "supplement") {
+		t.Errorf("the run published a lock naming no supplement without saying so, which is "+
+			"what a publication that silently dropped one looks like: %q", stderr)
+	}
+}
+
 // A policy that cannot be loaded stops the run before anything is fetched. The
 // policy is what says whether to refresh, so a run that could not read it has no
 // business resolving a commit.

@@ -1023,6 +1023,49 @@ func publishFallback(ctx context.Context, options updateListOptions, stdout, std
 	return exitSuccess
 }
 
+// carriedSupplement is the supplement an operator's pin publishes beside the
+// primary it re-pins, and it is read the way the repository in runPinRemote is:
+// from the lock file directly.
+//
+// ReadPublishedPair refuses two things, and they want opposite answers. A pair
+// whose list_sha256 disagrees with the list beside it is the state this publisher
+// creates by design -- Publish renames the list first and the lock second -- and it
+// is exactly what --force and --pin-source both exist to publish over. The lock
+// beside it parsed, so the supplement it names is knowable, and the pair being
+// replaced DID carry one: reading the refusal as "there is nothing to carry"
+// removes the seventy-odd rules only the dnsmasq syntax cannot express, silently,
+// on the two paths an operator reaches for when the machine is already broken.
+//
+// A lock this build cannot PARSE is the other refusal, and there the answer really
+// is no supplement: a v1 document has no such field, and a document that does not
+// parse cannot describe one. That is said out loud rather than assumed, because a
+// run that quietly drops a second source is indistinguishable from the bug above --
+// but it is a note and not a refusal, because refusing here would strand the v1
+// re-pin that --pin-source exists to make possible, which is the stranding this
+// file has already been round for twice.
+//
+// A lock that is not there at all is a first install: nothing to carry, nothing to
+// say.
+func carriedSupplement(stderr io.Writer, options updateListOptions) *rules.SourceRef {
+	if published, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err == nil {
+		return published.Supplement
+	}
+	raw, err := os.ReadFile(options.sourceLock)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	lock, err := rules.ParseSourceLock(raw)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: the published source lock could not be read, so this "+
+			"publication names a primary and no supplement: %v.\n"+
+			"A list built from two sources carries the rules only the second one can express, and "+
+			"nothing here can tell whether this machine was running one. Read the list this command "+
+			"publishes, and re-pin with `--pin-source <repository>` if it is short.", err)
+		return nil
+	}
+	return lock.Supplement
+}
+
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	client := services.newHTTPClient()
 	// Which repository the commit is resolved against, in the order the three ways
@@ -1134,14 +1177,11 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// loss the refresh refuses to make by accident, committed deliberately instead.
 	// The commit carried over is the one already published, not a new resolution:
 	// this command was asked about one source.
-	//
-	// A lock this build cannot read has no supplement to carry, and there is nothing
-	// to lose by that: the publication below replaces the whole pair anyway.
-	supplement := options.supplementPin
-	if supplement == nil {
-		if published, _, _, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile); readErr == nil {
-			supplement = published.Supplement
-		}
+	var supplement *rules.SourceRef
+	if options.supplementPin != nil {
+		supplement = options.supplementPin
+	} else {
+		supplement = carriedSupplement(stderr, options)
 	}
 	pinned, list, err := rules.Download(ctx, client, rules.SourceLock{
 		SchemaVersion: 2,
