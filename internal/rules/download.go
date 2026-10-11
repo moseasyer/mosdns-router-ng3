@@ -75,17 +75,22 @@ const (
 // second spelling of a rule the published list already holds.
 //
 // It is a slice, so nothing may put it into a SourceRef directly: see
-// supplementKinds, which is the only way this package hands the set out.
+// SupplementKinds, which is the only way this package hands the set out.
 var V2FlySupplementKinds = []string{"full", "regexp"}
 
-// supplementKinds returns a copy of the kinds a v2fly supplement may contribute.
+// SupplementKinds returns a copy of the kinds a v2fly supplement may contribute.
 //
 // The copy is the same defence entriesFor makes, for the same reason. A lock
 // that shared the backing array of a package-level slice would hand its holder a
 // way to rewrite that slice in place, and the next lock built from it would
 // carry whatever the previous holder wrote there. The lock is the document a
 // later reader trusts, so it must not alias a mutable value.
-func supplementKinds() []string {
+//
+// It is exported because the command that builds a supplement has to name its
+// kinds somewhere, and the alternative -- the exported slice above -- hands out
+// the array this function exists to keep private. Every lock in this package and
+// every lock the command writes goes through here.
+func SupplementKinds() []string {
 	return append([]string(nil), V2FlySupplementKinds...)
 }
 

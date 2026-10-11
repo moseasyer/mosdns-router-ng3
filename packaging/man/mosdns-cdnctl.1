@@ -135,16 +135,34 @@ opening the cheap one opens the expensive one. Both are off in the shipped polic
 is curated by hand, so any upstream commit moves the split, and accepting one
 unattended is a routing change nobody reviewed.
 .br
-The China refresh refuses a list that has lost more than 5% of its rules, and says
-both counts when it does. The digest cannot catch this, because a commit whose
-list is a fraction of its former size verifies perfectly \em it really is the
-upstream document. The refusal leaves the pin, the list and the rollback archive
-exactly as they were, so publishing that commit afterwards is one deliberate
-command an operator runs having read the diff. The threshold is not a refusal to
-ever update: a curated list does lose domains now and then.
+The China list is published from two sources \em the
+.I felixonmars/dnsmasq\-china\-list
+primary, and a
+.I v2fly/domain\-list\-community
+supplement carrying the rule kinds the primary's syntax cannot say \em and the
+refresh follows each of them at its own repository, because a commit id is only
+meaningful in the repository that issued it. It refuses a source that has lost
+more than 5% of the rules this machine published for \fBthat same source\fR, and
+says both counts and which source when it does. The two are never weighed against
+each other, nor against the merged list: the supplement is seventy rules beside
+111,357, so a supplement that lost every one of them moves the merged list by
+0.06% and would sail through a check of the merged list. The digest cannot catch
+this either, because a commit whose list is a fraction of its former size
+verifies perfectly \em it really is the upstream document. The refusal leaves the
+pin, the list and the rollback archive exactly as they were, so publishing that
+commit afterwards is one deliberate command an operator runs having read the diff.
+The threshold is not a refusal to ever update: a curated list does lose domains
+now and then.
 .br
 Everything that can fail happens before anything is written, so a machine with no
-route out fails without having touched the pin, the list or the archive.
+route out fails without having touched the pin, the list or the archive. A machine
+with \em no China list at all, which is the one state the drift report above
+cannot describe \em is given the reviewed
+.I v2fly/domain\-list\-community
+list as its primary instead, and the run says in so many words that that is what
+it was given and what to re\-pin from once the source has been reviewed. A machine
+that already has a list keeps it through a failed refresh: the last good result is
+strictly better than the fallback, which is an eighth the size.
 .TP
 .B \-\-check
 Reports whether the pinned source has moved, and reports the published ranges read

@@ -249,16 +249,21 @@ type updateListOptions struct {
 	// of a published lock this build refuses: a schema version 1 document, whose
 	// own refusal names this flag.
 	pinSource string
-	// pinRepository is the source a pin resolves against. An operator's --pin-source
-	// and refreshChinaList both set it, because a commit and the repository it was
-	// resolved in travel together; it is empty for a pin that names neither, which is
-	// resolved against whatever the published lock says.
+	// primaryPin and supplementPin are the two sources a publication carries, and
+	// they are set by refreshChinaList from what it MEASURED rather than from what
+	// it was asked for. The zero value of either means "take it from the published
+	// lock", which is what an operator's own pin wants: a command that names no
+	// source has to learn which one this machine runs, and the lock is the only
+	// document that says.
 	//
-	// The field exists because the two callers of runPinRemote had no other way
-	// to agree on a repository, and the one that passes a commit resolved from
-	// the lock had to hand over a repository too. Task 4 replaces this string
-	// with the primary/supplement refs the lock actually carries.
-	pinRepository string
+	// The repository is a field rather than a constant because a commit is only
+	// meaningful at the repository that issued it: the same forty characters name
+	// one file in one of them and nothing at all in the other. runPinRemote
+	// resolves against primaryPin.Repository and never against a constant, and a
+	// primaryPin that IS set is not overridable by pinSource -- an operator's flag
+	// reaching past a measurement is the cross-repository bug the measurement
+	// exists to prevent.
+	//
 	// force answers exactly one question: "the published pair disagrees with
 	// itself, and I mean to publish over it anyway". It is not a general override.
 	// It waives no other refusal in this command -- not the collapse guardrail,
@@ -267,6 +272,8 @@ type updateListOptions struct {
 	// this is.
 	force         bool
 	refreshRanges bool
+	primaryPin    *rules.SourceRef
+	supplementPin *rules.SourceRef
 	sourceLock    string
 	listFile      string
 	// previousLock is where the outgoing pin is archived, before the new one replaces
@@ -702,6 +709,25 @@ func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, s
 		return exitInvalidCLI
 	}
 
+	// A machine with no China list at all is the one state the report below cannot
+	// describe: the check refuses a machine that has nothing to compare against, and
+	// a refusal would stop the refresh before it ever ran. So with the China switch
+	// on, a machine that has nothing is given the fallback FIRST and the report then
+	// describes the pair that publication left behind.
+	//
+	// The decision is made HERE rather than inside the refresh because this is where
+	// the policy is known: an operator who turned the refresh off has not asked for
+	// anything to be installed, and one who turned it on has. The read is the one
+	// question that decides it -- is there anything here at all -- and a pair this
+	// build cannot read is not "nothing": the check below refuses that with the
+	// command that gets past it.
+	if policy.Lists.China.Automatic {
+		if _, _, found, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile); readErr == nil && !found {
+			if code := publishFallback(ctx, options, stdout, stderr, services); code != exitSuccess {
+				return code
+			}
+		}
+	}
 	if code := runCheckLists(ctx, options, stdout, stderr, services); code != exitSuccess {
 		return code
 	}
@@ -720,17 +746,18 @@ func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, s
 	return exitSuccess
 }
 
-// refreshChinaList re-pins the China list unattended, and refuses a list that has
+// refreshChinaList re-pins the China list unattended, and refuses a source that has
 // collapsed.
 //
-// The digest cannot catch this. An upstream commit whose data/cn is a fraction of its
+// The digest cannot catch this. An upstream commit whose list is a fraction of its
 // former size verifies perfectly, because it really is the upstream document -- what
 // it changes is how many names take the foreign branch, and nobody reviewed that. So a
 // collapse is refused, loudly, with both counts in the message, and nothing is
 // written: publishing that commit afterwards is then one deliberate command an
 // operator runs having read the diff.
 //
-// The threshold is 95% retained. A hand-curated list does lose domains now and then,
+// The threshold is 95% retained, and it is applied to each source against that
+// source's own published count. A hand-curated list does lose domains now and then,
 // and a guard that trips on that is a guard that means never updating -- which is the
 // same as leaving the switch off, with more machinery and a false promise.
 //
@@ -738,10 +765,17 @@ func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, s
 // remote is resolved, the archive is fetched and converted, and only then is the size
 // compared. A machine with no route out therefore fails without having touched the
 // pin, the list, or the rollback archive.
+//
+// The two sources are followed SEPARATELY, each against its own repository and its
+// own HEAD, and each is measured against its own previously published count. A commit
+// is only meaningful at the repository that issued it, so the supplement is never
+// re-resolved from the primary's side; and a list is a union of two sets whose sizes
+// say nothing about either, so neither is compared against the union.
 func refreshChinaList(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
-	// Retained as a fraction of the published rule count. It is a fraction and not a
-	// difference because a list of 8000 rules and a list of 200 are not comparable by
-	// subtraction, and a fixed count would refuse the second for the wrong reason.
+	// Retained as a fraction of the rules a source published on this machine. It is
+	// a fraction and not a difference because a list of 8000 rules and a list of 200
+	// are not comparable by subtraction, and a fixed count would refuse the second for
+	// the wrong reason.
 	const minimumRetained = 0.95
 
 	pinned, current, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
@@ -760,7 +794,6 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 			err, rules.RepositoryV2Fly, rules.RepositoryChina)
 		return exitStateUnavailable
 	}
-	published := countListRules(current)
 
 	client := services.newHTTPClient()
 	// The refresh re-pins the source the published lock names, so the count it
@@ -770,64 +803,254 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
-	if resolved.Primary.Commit == pinned.Primary.Commit {
-		// Already there. Nothing to do and nothing to say beyond the fact, because
-		// re-downloading and re-publishing an identical commit is how a daily job
-		// turns a no-op into wear on the disk the machine is running from.
+	// The supplement is resolved against ITS OWN repository and its own HEAD, for
+	// the same reason the primary is resolved against the lock's: a document cannot
+	// be looked up in a repository it does not live in.
+	//
+	// An absent supplement stays absent. Adding one is a decision about what this
+	// installation runs, and a refresh is not where that decision is made -- and a
+	// v2fly primary may not carry one at all, because it already holds every kind a
+	// supplement contributes.
+	supplement, err := resolveSupplement(ctx, client, pinned.Supplement)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: the supplement could not be resolved, and publishing "+
+			"the primary without it would drop the %d rules only it can express: %v",
+			len(rules.SupplementKinds()), err)
+		return exitStateUnavailable
+	}
+	if resolved.Primary.Commit == pinned.Primary.Commit &&
+		(supplement == nil || supplement.Commit == pinned.Supplement.Commit) {
+		// Already there -- and "there" means BOTH sources, because the second one
+		// moves on its own schedule. Reporting already-at because the primary is
+		// unchanged would freeze the supplement's rules for as long as the other
+		// repository stayed quiet, which is not a state anybody chose.
+		//
+		// Nothing to do and nothing to say beyond the fact, because re-downloading and
+		// re-publishing an identical commit is how a daily job turns a no-op into wear
+		// on the disk the machine is running from.
 		writeReportLine(stdout, "china-list: already at %s\n", pinned.Primary.Commit)
 		return exitSuccess
 	}
-	_, list, err := rules.Download(ctx, client, resolved)
+
+	candidate := rules.SourceLock{SchemaVersion: 2, Primary: resolved.Primary, Supplement: supplement}
+	published, list, err := rules.Download(ctx, client, candidate)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
 
-	incoming := countListRules(list)
-	if published > 0 && float64(incoming) < float64(published)*minimumRetained {
-		writeCLIError(stderr,
-			"update-lists: refusing %s: it has %s where the published list has %s -- "+
-				"fewer rules than a curated list loses in one commit, which is a mistake "+
-				"upstream made rather than a change anybody reviewed here. Nothing was changed. "+
-				"Read the diff, then publish that commit deliberately with "+
-				"`mosdns-cdnctl update-lists --pin-remote %s`.",
-			resolved.Primary.Commit, ruleCount(incoming), ruleCount(published), resolved.Primary.Commit)
+	// Two guardrails, one per source. A primary compared against the whole published
+	// list would be comparing 111k rules against whatever is on disk, and a supplement
+	// compared against the primary would be comparing a 70-rule contribution against
+	// the list it was merged into.
+	//
+	// The union cannot stand in for either, and the arithmetic says why. The
+	// supplement is seventy rules beside 111,357, so a supplement that lost every one
+	// of them moves the union by 0.06% and sails through a 5% threshold; and a
+	// supplement that GAINED twenty rules can hide a primary that fell from twenty to
+	// four, because the union grew. Comparing each source with what this machine
+	// published for that same source is the only comparison whose two sides mean the
+	// same thing.
+	wasPrimary, wasSupplement := sourceRuleCounts(current, pinned.Supplement)
+	isPrimary, isSupplement := sourceRuleCounts(list, pinned.Supplement)
+	if err := guardSize(stderr, "primary", &published.Primary, isPrimary, wasPrimary, minimumRetained); err != nil {
+		return exitStateUnavailable
+	}
+	if supplement != nil {
+		if err := guardSize(stderr, "supplement", supplement, isSupplement, wasSupplement, minimumRetained); err != nil {
+			return exitStateUnavailable
+		}
+	}
+
+	// Publish what was MEASURED, not whatever HEAD has become since. This is the
+	// whole reason the guard is not advisory: re-resolving here would mean the size
+	// check applied to one commit and the publication applied to another, so upstream
+	// moving during the run would publish an unmeasured list through the mechanism
+	// built to prevent exactly that.
+	//
+	// The repository travels with the commit as a ref rather than a name, so
+	// runPinRemote cannot resolve a measured commit against a constant and an
+	// operator's --pin-source cannot redirect one.
+	measured := options
+	measured.pinRemote = published.Primary.Commit
+	measured.primaryPin = &published.Primary
+	measured.supplementPin = supplement
+	return runPinRemote(ctx, measured, stdout, stderr, services)
+}
+
+// resolveSupplement re-pins the supplement this machine already has, against the
+// repository that issued it, and returns nothing at all when the published lock has
+// no supplement to re-pin.
+func resolveSupplement(ctx context.Context, client *http.Client, current *rules.SourceRef) (*rules.SourceRef, error) {
+	if current == nil {
+		return nil, nil
+	}
+	resolved, err := rules.ResolveHEAD(ctx, client, current.Repository)
+	if err != nil {
+		return nil, err
+	}
+	ref := resolved.Primary
+	// The kinds are the ones the lock already records, copied rather than aliased:
+	// this is a document a later reader trusts, and a lock sharing the backing array
+	// of a package-level slice could be rewritten through it.
+	ref.Kinds = append([]string(nil), current.Kinds...)
+	return &ref, nil
+}
+
+// sourceRuleCounts splits a rendered list into the rules each of the two sources
+// contributed, and returns the primary's first.
+//
+// The split is by the rule's own kind, which is what the lock records: a line whose
+// prefix is one of the supplement's kinds came from the supplement, and every other
+// line came from the primary. It needs no second download of the previous commit and
+// no field added to the lock, and it is exact rather than estimated -- the two
+// sources cannot produce the same line, since a `full:` rule is not a `domain:` one.
+//
+// Comments are not rules and are counted for neither. They come from the primary
+// (it is the only converter that emits them) and they are upstream's prose about
+// entries it turned off, so counting them would let a paragraph stand in for a rule
+// that disappeared.
+func sourceRuleCounts(list []byte, supplement *rules.SourceRef) (primaryRules, secondRules int) {
+	fromSupplement := map[string]bool{}
+	if supplement != nil {
+		for _, kind := range supplement.Kinds {
+			fromSupplement[kind] = true
+		}
+	}
+	for _, line := range strings.Split(string(list), "\n") {
+		text := strings.TrimSpace(line)
+		if text == "" || strings.HasPrefix(text, "#") {
+			continue
+		}
+		kind, _, found := strings.Cut(text, ":")
+		if found && fromSupplement[kind] {
+			secondRules++
+			continue
+		}
+		primaryRules++
+	}
+	return primaryRules, secondRules
+}
+
+// guardSize refuses one source whose rule count fell below the retained fraction of
+// what this machine published for that source, and says which source it was.
+//
+// The remedy is named per source because the two are not the same operation. A
+// collapsed primary is undone by pinning that commit, and the flag that does it is
+// the one a reader would otherwise have to look up: a commit is meaningless without
+// its repository, so a command naming the commit alone cannot run. A collapsed
+// SUPPLEMENT has no such command -- nothing here pins a second source's commit -- so
+// the honest advice is to read the diff and wait, and the refusal says so rather than
+// naming a command that would not touch the thing that collapsed.
+func guardSize(stderr io.Writer, name string, ref *rules.SourceRef, incoming, published int, minimum float64) error {
+	if published <= 0 || float64(incoming) >= float64(published)*minimum {
+		return nil
+	}
+	remedy := fmt.Sprintf("Read the diff, then publish that commit deliberately with "+
+		"`mosdns-cdnctl update-lists --pin-remote %s --pin-source %s`.",
+		ref.Commit, ref.Repository)
+	if name != "primary" {
+		remedy = fmt.Sprintf("Read the diff at %s@%s. No command here pins a commit of a second "+
+			"source, so the next refresh takes that repository's own HEAD again: the decision is "+
+			"whether to wait for its next commit, and nothing on this machine changes until then.",
+			ref.Repository, ref.Commit)
+	}
+	writeCLIError(stderr,
+		"update-lists: refusing the %s at %s: it has %s where this machine published %s -- "+
+			"fewer rules than a curated list loses in one commit, which is a mistake upstream "+
+			"made rather than a change anybody reviewed here. The other source is not weighed "+
+			"against this one; each is measured against its own. Nothing was changed. %s",
+		name, ref.Commit, ruleCount(incoming), ruleCount(published), remedy)
+	return fmt.Errorf("the %s collapsed", name)
+}
+
+// publishFallback publishes the list this project ships with -- v2fly as the
+// PRIMARY and no supplement, because a supplement beside a v2fly primary is a
+// document untrue about how the list was built -- and only on a machine that has no
+// China list at all.
+//
+// "Only when there is nothing" is the whole rule, and it is enforced by the one
+// caller rather than by a condition in here. A machine with a good list keeps it
+// through a failed refresh: the last good result is strictly better than this one,
+// which is an eighth the size, and replacing it would turn an outage into a
+// downgrade. A machine with nothing gets rules rather than a silent hole where every
+// query goes abroad.
+//
+// Publishing here and nowhere else is also what keeps the guardrail honest. The
+// fallback is 8,363 rules where the dnsmasq list is 111,357, so publishing it from a
+// refresh would be a 92.49% drop -- which the 0.95 guardrail refuses, every time,
+// which is exactly the property that lets the refresh promise that a machine with a
+// list never loses it to a failed run.
+//
+// It does not take the control lock's archive step because there is nothing to
+// archive: this branch runs only when nothing is published. It does take the lock
+// itself, because Publish replaces two files by two renames and a concurrent pin
+// must not interleave with this one.
+func publishFallback(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	client := services.newHTTPClient()
+	pinned, err := rules.ResolvePinned(ctx, client, rules.RepositoryV2Fly, "")
+	if err != nil {
+		writeCLIError(stderr, "update-lists: this machine has no China list, and the %s fallback "+
+			"could not be reached either (%v). Run `mosdns-cdnctl update-lists --pin-remote HEAD "+
+			"--pin-source %s` once this machine can reach github.com", rules.RepositoryV2Fly, err, rules.RepositoryChina)
+		return exitStateUnavailable
+	}
+	published, list, err := rules.Download(ctx, client, pinned)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: the fallback could not be fetched or converted: %v", err)
 		return exitStateUnavailable
 	}
 
-	// Publish the commit that was MEASURED, not whatever HEAD has become since. This
-	// is the whole reason the guard is not advisory: re-resolving here would mean the
-	// size check applied to one commit and the publication applied to another, so
-	// upstream moving during the run would publish an unmeasured list through the
-	// mechanism built to prevent exactly that.
-	pinned_ := options
-	pinned_.pinRemote = resolved.Primary.Commit
-	// The repository travels with the commit. Handing over the commit alone would
-	// have runPinRemote resolve it against the v2fly default, and a commit id is
-	// not a repository: the same 40 characters name one file in one of them.
-	pinned_.pinRepository = resolved.Primary.Repository
-	return runPinRemote(ctx, pinned_, stdout, stderr, services)
+	release, err := services.acquireLock(options.controlLock)
+	if err != nil {
+		if errors.Is(err, filelock.ErrLocked) {
+			writeCLIError(stderr, "update-lists: %s: the control lock is held, not publishing the fallback", options.controlLock)
+			return exitLockHeld
+		}
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	defer func() { _ = release() }()
+
+	if err := rules.Publish(options.sourceLock, options.listFile, published, list); err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	writeReportLine(stdout, "china-list: this machine had no China list, so the %s fallback was "+
+		"published at %s (%s). Re-pin with `--pin-remote HEAD --pin-source %s` once you have "+
+		"reviewed that source.\n",
+		rules.RepositoryV2Fly, published.Primary.Commit, ruleCount(countListRules(list)), rules.RepositoryChina)
+	return exitSuccess
 }
 
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
-	// An operator's --pin-source is the one pin that does not consult the
-	// published lock, and it has to come first: a lock this build refuses -- a
-	// schema version 1 document -- cannot say which repository to pin, and reading
-	// it is the refusal the --pin-source operator is here to get past.
-	if options.pinSource != "" {
-		options.pinRepository = options.pinSource
-	}
 	client := services.newHTTPClient()
-	// No option means HEAD, and HEAD means the repository's current default-branch
-	// commit. A 40-character commit means that commit, which is how a pin accepted by
-	// mistake is undone: the rollback has to be able to name where it is going back
-	// to, and "whatever upstream says now" is not an answer to that question.
+	// Which repository the commit is resolved against, in the order the three ways
+	// of naming one are trusted.
 	//
-	// A repository the caller named wins, because a commit and the repository it
-	// was resolved in travel together: refreshChinaList measures one source and
-	// hands this function its commit, and resolving that commit against any other
-	// repository would verify a digest against an archive the commit is not in.
-	repository := options.pinRepository
+	// A primaryPin is what a MEASUREMENT produced: refreshChinaList hands over the
+	// ref it downloaded, verified and converted, and the repository that ref lives
+	// in. It is first and nothing overrides it, because the commit that is about to
+	// be published is the one the guardrail just measured, and asking any other
+	// repository for it would verify a digest against an archive the commit is not
+	// in -- or worse, find a commit that happens to exist there and publish it
+	// under a lock naming a source nobody measured.
+	//
+	// That is also why --pin-source cannot reach past it. The parser already stops
+	// an unattended run from carrying the flag at all, so the ordering below is not
+	// redundant: it is the rule, stated where the resolution happens.
+	repository := ""
+	if options.primaryPin != nil {
+		repository = options.primaryPin.Repository
+	}
+	if repository == "" && options.pinSource != "" {
+		// An operator's --pin-source is the one pin that does not consult the
+		// published lock, and it has to come before that lock is read: a lock this
+		// build refuses -- a schema version 1 document -- cannot say which
+		// repository to pin, and reading it is the refusal the --pin-source
+		// operator is here to get past.
+		repository = options.pinSource
+	}
 	if repository == "" {
 		// Nothing named one, so the published lock does.
 		published, _, found, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile)
@@ -884,12 +1107,47 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 			repository = rules.RepositoryV2Fly
 		}
 	}
-	resolved, err := rules.ResolvePinned(ctx, client, repository, options.pinRemote)
-	if err != nil {
-		writeCLIError(stderr, "update-lists: %v", err)
-		return exitStateUnavailable
+	// No option means HEAD, and HEAD means the repository's current default-branch
+	// commit. A 40-character commit means that commit, which is how a pin accepted by
+	// mistake is undone: the rollback has to be able to name where it is going back
+	// to, and "whatever upstream says now" is not an answer to that question.
+	//
+	// A measured pin is used as it stands. refreshChinaList measured it, which means
+	// the rules.Download that sized it fetched this archive and verified this digest
+	// during this run; resolving it again would re-fetch the same archive to compute
+	// the same number. The condition is the commit the caller measured, so a pin
+	// naming any other commit still goes the long way round and is verified here.
+	var resolved rules.SourceLock
+	if options.primaryPin != nil && options.primaryPin.Commit == options.pinRemote {
+		resolved = rules.SourceLock{SchemaVersion: 2, Primary: *options.primaryPin}
+	} else {
+		pinnedRepository, resolveErr := rules.ResolvePinned(ctx, client, repository, options.pinRemote)
+		if resolveErr != nil {
+			writeCLIError(stderr, "update-lists: %v", resolveErr)
+			return exitStateUnavailable
+		}
+		resolved = pinnedRepository
 	}
-	pinned, list, err := rules.Download(ctx, client, resolved)
+	// The supplement travels with the primary unless the caller measured a new one.
+	// An operator's pin re-pins the PRIMARY, and a publication that dropped the
+	// second source would quietly remove every rule only it can express -- the same
+	// loss the refresh refuses to make by accident, committed deliberately instead.
+	// The commit carried over is the one already published, not a new resolution:
+	// this command was asked about one source.
+	//
+	// A lock this build cannot read has no supplement to carry, and there is nothing
+	// to lose by that: the publication below replaces the whole pair anyway.
+	supplement := options.supplementPin
+	if supplement == nil {
+		if published, _, _, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile); readErr == nil {
+			supplement = published.Supplement
+		}
+	}
+	pinned, list, err := rules.Download(ctx, client, rules.SourceLock{
+		SchemaVersion: 2,
+		Primary:       resolved.Primary,
+		Supplement:    supplement,
+	})
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable

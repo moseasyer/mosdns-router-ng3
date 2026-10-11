@@ -1431,7 +1431,7 @@ func TestThePublishedBytesDoNotDependOnTheOrderTheTwoSourcesWereConvertedIn(t *t
 // the published list derives from: the dnsmasq source as the primary, and the
 // 70 rules its syntax cannot say as a supplement.
 //
-// The supplement's kinds come from supplementKinds, never from the exported
+// The supplement's kinds come from SupplementKinds, never from the exported
 // slice: a lock that shared the backing array of a package-level value would
 // hand its holder a way to rewrite the reviewed set in place, and that defence
 // has a test of its own.
@@ -1446,7 +1446,7 @@ func twoSourceLock(t *testing.T, remote *fakeRemote, primaryCommit, supplementCo
 		t.Fatalf("resolve the supplement: %v", err)
 	}
 	ref := supplement.Primary
-	ref.Kinds = supplementKinds()
+	ref.Kinds = SupplementKinds()
 	return SourceLock{SchemaVersion: schemaVersion, Primary: primary.Primary, Supplement: &ref}
 }
 
@@ -1475,7 +1475,7 @@ func TestTheFallbackPublicationHasNothingToMerge(t *testing.T) {
 		},
 		{
 			name:       "the same repository as a supplement",
-			supplement: &SourceRef{Repository: RepositoryV2Fly, Commit: strings.Repeat("c", 40), SHA256: strings.Repeat("d", 64), Entry: V2FlyEntry, Kinds: supplementKinds()},
+			supplement: &SourceRef{Repository: RepositoryV2Fly, Commit: strings.Repeat("c", 40), SHA256: strings.Repeat("d", 64), Entry: V2FlyEntry, Kinds: SupplementKinds()},
 			wantErr:    true,
 		},
 		{
@@ -1483,7 +1483,7 @@ func TestTheFallbackPublicationHasNothingToMerge(t *testing.T) {
 			// refused for that reason rather than for this one. It is here to
 			// keep the refusal from being read as "the repository is the rule".
 			name:       "the other reviewed repository as a supplement",
-			supplement: &SourceRef{Repository: RepositoryChina, Commit: strings.Repeat("c", 40), SHA256: strings.Repeat("d", 64), Entries: ChinaConfEntries, Kinds: supplementKinds()},
+			supplement: &SourceRef{Repository: RepositoryChina, Commit: strings.Repeat("c", 40), SHA256: strings.Repeat("d", 64), Entries: ChinaConfEntries, Kinds: SupplementKinds()},
 			wantErr:    true,
 		},
 	}
@@ -1611,7 +1611,7 @@ func TestALockHoldingTheSupplementKindsDoesNotHoldTheExportedSet(t *testing.T) {
 	// constant through the lock -- and through the next lock built from it. The
 	// primary's entry set is copied for the same reason, and the two sets end up
 	// in the same document.
-	kinds := supplementKinds()
+	kinds := SupplementKinds()
 	kinds[0] = "domain"
 	if V2FlySupplementKinds[0] != "full" {
 		t.Fatalf("the exported set was written through a lock: %v", V2FlySupplementKinds)
@@ -1630,7 +1630,7 @@ func TestASupplementHasToBeTheOneRepositoryThatMaySupplement(t *testing.T) {
 			Commit:     strings.Repeat("c", 40),
 			SHA256:     strings.Repeat("d", 64),
 			Entries:    ChinaConfEntries,
-			Kinds:      supplementKinds(),
+			Kinds:      SupplementKinds(),
 		},
 		ListSHA256: strings.Repeat("e", 64),
 	}
@@ -1689,7 +1689,7 @@ func TestAFetchRefusesARepositoryTheAllowlistDoesNotHoldBeforeBuildingAURL(t *te
 		ref  *SourceRef
 	}{
 		{name: "a primary's", ref: &SourceRef{Repository: "attacker/domain-list", Commit: fixtureCommit, Entries: ChinaConfEntries}},
-		{name: "a supplement's", ref: &SourceRef{Repository: "attacker/domain-list", Commit: fixtureCommit, Entry: V2FlyEntry, Kinds: supplementKinds()}},
+		{name: "a supplement's", ref: &SourceRef{Repository: "attacker/domain-list", Commit: fixtureCommit, Entry: V2FlyEntry, Kinds: SupplementKinds()}},
 	}
 	for _, test := range tests {
 		if _, err := fetchArchive(context.Background(), remote.client, test.ref); err == nil {
