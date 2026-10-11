@@ -1776,134 +1776,73 @@ git commit -m "feat(cdnctl): refresh the primary, fall back only when there is n
 
 ---
 
-### Task 5: 随包发布四个文件
+### Task 5: 修好一个已经过时的打包测试夹具
+
+> **PLAN CORRECTION (controller ruling, after the implementer reported a scope
+> concern).** This task originally shipped a second pair —
+> `cn-domains-fallback.txt` + `source-lock-fallback.json`, published by `postinst`
+> to `/var/lib/mosdns/lists/` under their own names. That is withdrawn: it
+> contradicts the spec, and nothing reads it.
+>
+> Spec line 121: 「`primary` 恒为"实际产出这份列表的源"，`supplement` 可选。回退发布时
+> `primary` 就是 v2fly、`supplement` 省略——**同一形状覆盖两种情况，不需要第二套文档**。」
+> One shape, two contents, no second document. Spec line 140: `cn-domains.txt` is the
+> only active list. Spec line 199 explicitly refuses an operator-facing way back to
+> v2fly as YAGNI. And the implemented code agrees: `publishFallback` publishes to
+> `options.sourceLock` / `options.listFile` — the same two paths as every other
+> publication — so a second pair on disk would have no reader.
+>
+> The step-3 justification ("两份列表从安装起就在盘上，所以冷启动不依赖网络") is also
+> satisfied without it: `postinst` already places the shipped PRIMARY pair whenever it
+> is absent, so a packaged machine always has a China list and the cold-start
+> fallback branch has nothing to rescue. What remains of this task is the fixture
+> fix, which is independent of the withdrawn pair and is worth doing on its own.
 
 **Files:**
-- Modify: `packaging/debian/postinst:98-103`、`:374-425`
-- Modify: `packaging/mosdns-router.install`
 - Modify: `installer/tests/test_package.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 v2 锁；Task 4 的回退分支
-- Produces: `/usr/share/mosdns-router/{cn-domains.txt,source-lock.json,cn-domains-fallback.txt,source-lock-fallback.json}` 与 `/var/lib/mosdns/lists/` 同名四个文件
-
-- [ ] **Step 1: 写失败测试**
-
-在 `installer/tests/test_package.py` 的常量区加：
-
-```python
-FALLBACK_LIST = DATA_DIRECTORY + "/cn-domains-fallback.txt"
-FALLBACK_LOCK = DATA_DIRECTORY + "/source-lock-fallback.json"
-```
-
-并追加：
-
-```python
-    def test_the_package_ships_a_fallback_list_and_its_own_lock(self):
-        """A cold start with no route has to find something to publish."""
-        self.assertIn(FALLBACK_LIST, self.payload())
-        self.assertIn(FALLBACK_LOCK, self.payload())
-
-    def test_the_fallback_pair_is_a_complete_v2_lock_of_its_own(self):
-        lock = self.read_json(FALLBACK_LOCK)
-        self.assertEqual(lock["schema_version"], 2)
-        self.assertEqual(lock["primary"]["repository"], "v2fly/domain-list-community")
-        self.assertEqual(lock["primary"]["entry"], "data/cn")
-        # A fallback lock that described the primary source would let a reader
-        # believe the fallback and the live list are the same pin.
-        self.assertIsNone(lock["primary"].get("supplement"))
-        self.assertEqual(lock["list_sha256"], hashlib.sha256(self.read(FALLBACK_LIST)).hexdigest())
-
-    def test_neither_list_names_a_resolver_address(self):
-        for path in (CHINA_LIST, FALLBACK_LIST):
-            for finding in china_list_findings(self.read(path)):
-                self.fail(f"{path} carries {finding}")
-
-    def test_the_fallback_is_the_v2fly_list_and_the_primary_is_not(self):
-        # They are two different lists on purpose. Shipping the primary twice
-        # would mean a machine that publishes the fallback publishes 111k rules
-        # of something it never fetched.
-        self.assertEqual(self.read(FALLBACK_LIST), self.read("configs/cn-domains.txt-fallback"))
-```
-
-> 实现者注意：`configs/cn-domains.txt-fallback` 是**不提交**的构建输入，见 Step 3；若选择直接提交一个 `configs/cn-domains-fallback.txt` 作为来源，则把该断言的右侧改成那个路径。本项目已有的做法是提交来源文件（`configs/cn-domains.txt`），因此推荐新增 `configs/cn-domains-fallback.txt` 并提交它。
+- Consumes: Task 2 的 v2 锁
+- Produces: 一个写出 v2 锁的 `unpinned_pair()`，其 docstring 自己站得住
 
 - [ ] **Step 1b: 修好 `unpinned_pair()` 这个已经过时的夹具**
 
-`installer/tests/test_package.py` 的 `unpinned_pair()` 写的是 **schema_version 1** 的锁，而它的 docstring 声称"与 `mosdns-cdnctl update-lists --pin-remote` 写出的完全一致"——Task 2 之后这句话是假的。测试仍然通过，是因为 `postinst` 只用 `sed` 取 `list_sha256`，Go 那边根本读不到它。但这正是本项目记过六次的那种夹具：它建模了一份这个构建既写不出也读不进的文档，而它上面的门禁读起来像它具备的覆盖。
+`installer/tests/test_package.py` 的 `unpinned_pair()`（约 1951 行）写的是
+**schema_version 1** 的锁——`{"schema_version": 1, "repository": ..., "commit": ...,
+"sha256": ..., "list_sha256": ..., "entry": ...}`，锁平铺，而 v2 把 `repository` /
+`commit` / `sha256` / `entry` 收进 `primary`，`supplement` 是 `primary` 的**兄弟**而不是
+子节点。
 
-把它改成写 v2（primary 为 `rules.RepositoryV2Fly` 那一份，无 supplement），并把 docstring 里"与 pin-remote 完全一致"改成本身就能站住的说法——要么指向生成它的那段代码，要么去掉这个类比。改完删掉那些因为旧形状而存在的断言，确认删掉的是**形状**而不是**行为**。
+它的 docstring 声称"与 `mosdns-cdnctl update-lists --pin-remote` 写出的完全一致"——
+Task 2 之后这句话是假的。测试仍然通过，是因为 `postinst` 只用 `sed` 取 `list_sha256`，
+扁平形状恰好也能被那条 `sed` 读到，Go 那边根本读不到它。但这正是本项目记过六次的
+那种夹具：它建模了一份这个构建既写不出也读不进的文档，而它上面的门禁读起来像它
+具备的覆盖。
 
-- [ ] **Step 2: 运行测试并确认失败**
+把它改成写 v2（`primary` 为 `rules.RepositoryV2Fly` 那一份，无 `supplement`），并把
+docstring 里"与 pin-remote 完全一致"改成本身就能站住的说法——要么指向生成它的那段
+代码，要么去掉这个类比。改完删掉那些因为旧形状而存在的断言，确认删掉的是**形状**
+而不是**行为**。
 
-```bash
-export PATH=/tmp/opencode/go1.25.8/bin:$PATH
-cd installer/tests && python3 -m unittest test_package.ControlTests -v 2>&1 | tail -20
-```
-
-Expected: FAIL，`FALLBACK_LIST` 不在清单中。
-
-- [ ] **Step 3: 加来源文件并登记清单**
-
-把当前 `configs/cn-domains.txt`（v2fly 那份）复制为 `configs/cn-domains-fallback.txt`，并提交它——它是回退列表的来源，与主列表一样是经过 pin 的快照。
-
-```bash
-cp configs/cn-domains.txt configs/cn-domains-fallback.txt
-```
-
-`packaging/mosdns-router.install` 增加两行：
-
-```
-/usr/share/mosdns-router/cn-domains-fallback.txt
-/usr/share/mosdns-router/source-lock-fallback.json
-```
-
-`packaging/debian/postinst` 第 98-103 行附近增加：
-
-```sh
-FALLBACK_SOURCE_LIST=/usr/share/mosdns-router/cn-domains-fallback.txt
-FALLBACK_SOURCE_LOCK=/usr/share/mosdns-router/source-lock-fallback.json
-FALLBACK_PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains-fallback.txt
-FALLBACK_PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock-fallback.json
-```
-
-并在发布主列表的同一段里发布回退列表——同样的 install 模式、同样的所有权、同样的原子替换，两份列表从安装起就在盘上，所以冷启动不依赖网络。
-
-- [ ] **Step 4: 生成回退 lock 并跑测试**
+- [ ] **Step 2: 运行测试**
 
 ```bash
-export PATH=/tmp/opencode/go1.25.8/bin:$PATH
-export GOCACHE=$PWD/.gocache-review
-export GOTMPDIR=/home/ubuntu/.gotmp-mosdns TMPDIR=/home/ubuntu/.gotmp-mosdns
-go run ./cmd/mosdns-cdnctl --help >/dev/null 2>&1 || true
-python3 - <<'PY'
-import hashlib, json, pathlib
-lock = {
-    "schema_version": 2,
-    "primary": {
-        "repository": "v2fly/domain-list-community",
-        "commit": "a5731758ed6bc9620b0e146ed24b07b9131893cf",
-        "sha256": "aeebf6b0643490cb8c39243ab57f81ab6c411af14238dd7e9e23409d7526ddda",
-        "entry": "data/cn",
-    },
-}
-body = pathlib.Path("configs/cn-domains-fallback.txt").read_bytes()
-lock["list_sha256"] = hashlib.sha256(body).hexdigest()
-pathlib.Path("configs/source-lock-fallback.json").write_text(json.dumps(lock, indent=2) + "\n")
-print("wrote fallback lock, list_sha256 =", lock["list_sha256"])
-PY
-cd installer/tests && python3 -m unittest test_package -v 2>&1 | tail -12
+cd installer/tests && python3 -m unittest test_package -v 2>&1 | tail -20
 ```
 
-- [ ] **Step 5: 提交**
+Expected: 全绿（本次不新增行为，只修正夹具建模的文档形状）。已知先存在的失败只有
+`test_the_man_stub_is_what_keeps_documentation_from_deciding_the_verdict`，那是本机
+systemd 的环境差异，与本 task 无关。
+
+- [ ] **Step 3: 提交**
 
 ```bash
-git add configs/cn-domains-fallback.txt configs/source-lock-fallback.json \
-        packaging/mosdns-router.install packaging/debian/postinst installer/tests/test_package.py
-git commit -m "feat(packaging): ship the fallback pair, so a cold start needs no route"
+git add installer/tests/test_package.py
+git commit -m "test(packaging): the unpacked-pair fixture writes a lock this build can read"
 ```
 
 ---
+
 
 ### Task 6: 把已提交列表换成主源
 
@@ -2132,10 +2071,14 @@ ls -la build/*.deb
 ```bash
 dpkg-deb --fsys-tarfile build/mosdns-router_*_amd64.deb | tar -xO ./usr/share/mosdns-router/cn-domains.txt | wc -l
 dpkg-deb --fsys-tarfile build/mosdns-router_*_amd64.deb | tar -xO ./usr/share/mosdns-router/source-lock.json
-dpkg-deb --fsys-tarfile build/mosdns-router_*_amd64.deb | tar -xO ./usr/share/mosdns-router/cn-domains-fallback.txt | wc -l
 ```
 
-Expected: 主列表约 111,357 行；锁为 schema 2、primary 为 `felixonmars/dnsmasq-china-list`、带 supplement；回退列表 8,363 行。
+Expected: 主列表约 111,357 行；锁为 schema 2、primary 为 `felixonmars/dnsmasq-china-list`、带 supplement。
+
+包里**只有这一对**。不要再检查 `cn-domains-fallback.txt`——本 plan 原先要求随包发布
+第二对，已按 spec 第 121 行「同一形状覆盖两种情况，不需要第二套文档」撤回（见 Task 5 的
+PLAN CORRECTION）。回退发布写的是同一对文件，只是 `primary` 变成 v2fly、`supplement`
+省略。
 
 - [ ] **Step 3: 全套本地验证**
 
