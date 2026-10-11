@@ -112,7 +112,7 @@ func (o *fakeOrigin) archivePath(commit string) string {
 }
 
 func (o *fakeOrigin) commitPath() string {
-	return "/repos/" + rules.Repository + "/commits/HEAD"
+	return "/repos/" + rules.RepositoryV2Fly + "/commits/HEAD"
 }
 
 // rewritingClient sends every request to the test origin, so the command under
@@ -222,12 +222,14 @@ func mustReadFile(t *testing.T, path string) []byte {
 func publishPair(t *testing.T, paths listPaths, commit string, list []byte) {
 	t.Helper()
 	lock := rules.SourceLock{
-		SchemaVersion: 1,
-		Repository:    rules.Repository,
-		Commit:        commit,
-		SHA256:        sha256Hex([]byte("the archive " + commit)),
-		ListSHA256:    sha256Hex(list),
-		Entry:         rules.Entry,
+		SchemaVersion: 2,
+		Primary: rules.SourceRef{
+			Repository: rules.RepositoryV2Fly,
+			Commit:     commit,
+			SHA256:     sha256Hex([]byte("the archive " + commit)),
+			Entry:      rules.V2FlyEntry,
+		},
+		ListSHA256: sha256Hex(list),
 	}
 	encoded, err := lock.Encode()
 	if err != nil {
@@ -334,7 +336,7 @@ func TestUpdateListsCheckReportsAnUnchangedSourceWithoutFetchingTheArchive(t *te
 	if code != exitSuccess {
 		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
-	for _, want := range []string{lockedCommit, "up-to-date: true", "repository: " + rules.Repository, "entry: " + rules.Entry} {
+	for _, want := range []string{lockedCommit, "up-to-date: true", "repository: " + rules.RepositoryV2Fly, "entry: " + rules.V2FlyEntry} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("check output does not report %q:\n%s", want, stdout)
 		}
@@ -472,7 +474,7 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 	if !found {
 		t.Fatal("pin published no pair")
 	}
-	if lock.Commit != remoteCommit || lock.SHA256 != sha256Hex(archive) {
+	if lock.Primary.Commit != remoteCommit || lock.Primary.SHA256 != sha256Hex(archive) {
 		t.Fatalf("published lock does not name the resolved source: %+v", lock)
 	}
 	if lock.ListSHA256 != sha256Hex(list) {
@@ -521,8 +523,8 @@ func TestUpdateListsPinRemoteReplacesAnInstalledPair(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("published pair: %v found=%t", err, found)
 	}
-	if lock.Commit != remoteCommit {
-		t.Fatalf("published lock still names %s, want %s", lock.Commit, remoteCommit)
+	if lock.Primary.Commit != remoteCommit {
+		t.Fatalf("published lock still names %s, want %s", lock.Primary.Commit, remoteCommit)
 	}
 	if bytes.Equal(list, previous) {
 		t.Fatal("the previous list is still published")
@@ -539,7 +541,7 @@ func TestUpdateListsPinRemoteReplacesAnInstalledPair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the pin wrote no readable archive: %v", err)
 	}
-	if archived.Commit == remoteCommit {
+	if archived.Primary.Commit == remoteCommit {
 		t.Error("the archive names the commit this run just published, which is not a rollback target")
 	}
 	if !strings.Contains(stdout, "pinned-commit: "+remoteCommit) {
@@ -702,12 +704,12 @@ func TestPinRemotePublishesTheNamedCommitRatherThanTheRemoteHead(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("published pair: found=%v err=%v", found, err)
 	}
-	if lock.Commit != lockedCommit {
+	if lock.Primary.Commit != lockedCommit {
 		t.Fatalf("published %s, want the named %s -- a rollback that moved forward is not a rollback",
-			lock.Commit, lockedCommit)
+			lock.Primary.Commit, lockedCommit)
 	}
-	if lock.SHA256 != sha256Hex(olderArchive) {
-		t.Errorf("the lock records archive %s, which is the other commit's", lock.SHA256)
+	if lock.Primary.SHA256 != sha256Hex(olderArchive) {
+		t.Errorf("the lock records archive %s, which is the other commit's", lock.Primary.SHA256)
 	}
 	if !strings.Contains(stdout, "pinned-commit: "+lockedCommit) {
 		t.Errorf("the report does not name the commit it published:\n%s", stdout)
@@ -731,12 +733,14 @@ func TestPublishingArchivesThePinThatWasCurrent(t *testing.T) {
 	publishPair(t, paths, lockedCommit, installed)
 	previous := filepath.Join(paths.dir, "previous.json")
 	stale := rules.SourceLock{
-		SchemaVersion: 1,
-		Repository:    rules.Repository,
-		Commit:        "3333333333333333333333333333333333333333",
-		SHA256:        sha256Hex([]byte("an archive from a run nobody remembers")),
-		ListSHA256:    sha256Hex([]byte("domain:stale.cn\n")),
-		Entry:         rules.Entry,
+		SchemaVersion: 2,
+		Primary: rules.SourceRef{
+			Repository: rules.RepositoryV2Fly,
+			Commit:     "3333333333333333333333333333333333333333",
+			SHA256:     sha256Hex([]byte("an archive from a run nobody remembers")),
+			Entry:      rules.V2FlyEntry,
+		},
+		ListSHA256: sha256Hex([]byte("domain:stale.cn\n")),
 	}
 	encoded, err := stale.Encode()
 	if err != nil {
@@ -760,9 +764,9 @@ func TestPublishingArchivesThePinThatWasCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no readable archive after a successful publish: %v", err)
 	}
-	if archived.Commit != lockedCommit {
+	if archived.Primary.Commit != lockedCommit {
 		t.Errorf("the archive names %s, want the pin that was current (%s); a rollback would "+
-			"land on a commit the operator did not choose", archived.Commit, lockedCommit)
+			"land on a commit the operator did not choose", archived.Primary.Commit, lockedCommit)
 	}
 	if archived.ListSHA256 != sha256Hex(installed) {
 		t.Errorf("the archive records list %s, which is not the list that was installed",
@@ -829,15 +833,15 @@ func TestAFailedPublishLeavesThePinAndTheArchiveIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a failed publish left no readable archive: %v", err)
 	}
-	if archived.Commit != lockedCommit {
-		t.Errorf("the archive names %s, want the pin that was current (%s)", archived.Commit, lockedCommit)
+	if archived.Primary.Commit != lockedCommit {
+		t.Errorf("the archive names %s, want the pin that was current (%s)", archived.Primary.Commit, lockedCommit)
 	}
 	after, _, found, err := rules.ReadPublishedPair(paths.sourceLock, listFile)
 	if err != nil || !found {
 		t.Fatalf("the pair is unreadable after a failed publish: found=%v err=%v", found, err)
 	}
-	if after.Commit != lockedCommit {
-		t.Errorf("a failed publish moved the pin from %s to %s", lockedCommit, after.Commit)
+	if after.Primary.Commit != lockedCommit {
+		t.Errorf("a failed publish moved the pin from %s to %s", lockedCommit, after.Primary.Commit)
 	}
 	if got := string(mustReadFile(t, listFile)); got != string(installed) {
 		t.Errorf("a failed publish changed the list:\n%s", got)
@@ -874,8 +878,8 @@ func TestAFailedArchiveRefusesRatherThanPublishing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != lockedCommit {
-		t.Errorf("the pin moved to %s although the archive failed, so the previous pin is gone", lock.Commit)
+	if lock.Primary.Commit != lockedCommit {
+		t.Errorf("the pin moved to %s although the archive failed, so the previous pin is gone", lock.Primary.Commit)
 	}
 }
 
@@ -1049,8 +1053,8 @@ func TestAutomaticWithBothSwitchesOffIsTheCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != lockedCommit {
-		t.Errorf("the pin moved to %s with both switches off", lock.Commit)
+	if lock.Primary.Commit != lockedCommit {
+		t.Errorf("the pin moved to %s with both switches off", lock.Primary.Commit)
 	}
 }
 
@@ -1078,15 +1082,15 @@ func TestAutomaticStillReportsDriftWhenItRefreshes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != remoteCommit {
-		t.Errorf("lists.china.automatic was on and the pin stayed at %s", lock.Commit)
+	if lock.Primary.Commit != remoteCommit {
+		t.Errorf("lists.china.automatic was on and the pin stayed at %s", lock.Primary.Commit)
 	}
 	archived, err := rules.ReadPrevious(paths.previousLock)
 	if err != nil {
 		t.Fatalf("the refresh left no rollback target: %v", err)
 	}
-	if archived.Commit != lockedCommit {
-		t.Errorf("the archive names %s, want the pin that was current (%s)", archived.Commit, lockedCommit)
+	if archived.Primary.Commit != lockedCommit {
+		t.Errorf("the archive names %s, want the pin that was current (%s)", archived.Primary.Commit, lockedCommit)
 	}
 }
 
@@ -1133,8 +1137,8 @@ func TestAutomaticHonoursEachSwitchSeparately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != lockedCommit {
-		t.Errorf("the China list was re-pinned to %s with lists.china.automatic off", lock.Commit)
+	if lock.Primary.Commit != lockedCommit {
+		t.Errorf("the China list was re-pinned to %s with lists.china.automatic off", lock.Primary.Commit)
 	}
 	if _, err := rules.ReadPrevious(filepath.Join(paths.dir, "source-lock.previous.json")); err == nil {
 		t.Error("refreshing only the ranges left an archive of the China pin")
@@ -1168,8 +1172,8 @@ func TestAListThatShrinksSharplyIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != lockedCommit {
-		t.Errorf("the refused list was published anyway, moving the pin to %s", lock.Commit)
+	if lock.Primary.Commit != lockedCommit {
+		t.Errorf("the refused list was published anyway, moving the pin to %s", lock.Primary.Commit)
 	}
 	if !bytes.Equal(list, published) {
 		t.Error("the refused list replaced the published one")
@@ -1205,8 +1209,8 @@ func TestASmallReductionIsPublished(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != remoteCommit {
-		t.Errorf("the reduced list was not published, the pin is still %s", lock.Commit)
+	if lock.Primary.Commit != remoteCommit {
+		t.Errorf("the reduced list was not published, the pin is still %s", lock.Primary.Commit)
 	}
 }
 
@@ -1235,8 +1239,8 @@ func TestAFailedAutomaticRunTouchesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit != lockedCommit {
-		t.Errorf("the pin changed on a failed run: %s -> %s", lockedCommit, lock.Commit)
+	if lock.Primary.Commit != lockedCommit {
+		t.Errorf("the pin changed on a failed run: %s -> %s", lockedCommit, lock.Primary.Commit)
 	}
 	if !bytes.Equal(list, published) {
 		t.Error("the list changed on a failed run")
@@ -1302,12 +1306,12 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.Commit == collapsed {
+	if lock.Primary.Commit == collapsed {
 		t.Fatalf("published %s, which nothing measured: its list has 1 rule where %d were published",
 			collapsed, countListRules(published))
 	}
-	if lock.Commit != measured {
-		t.Errorf("published %s, want the commit that was measured (%s)", lock.Commit, measured)
+	if lock.Primary.Commit != measured {
+		t.Errorf("published %s, want the commit that was measured (%s)", lock.Primary.Commit, measured)
 	}
 	// And the list that is published is the measured commit's, not the collapsed one.
 	if got := countListRules(list); got != countListRules(published) {
@@ -1381,7 +1385,7 @@ func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing
 		{name: "tag instead of HEAD", args: []string{"--pin-remote", "v1.0.0"}},
 		{name: "empty ref", args: []string{"--pin-remote", ""}},
 		{name: "unknown flag", args: []string{"--check", "--force"}},
-		{name: "unknown flag with a value", args: []string{"--check", "--repository", rules.Repository}},
+		{name: "unknown flag with a value", args: []string{"--check", "--repository", rules.RepositoryV2Fly}},
 		{name: "positional argument", args: []string{"--check", "extra"}},
 		{name: "positional ref", args: []string{"--pin-remote", "HEAD", "extra"}},
 		{name: "missing flag value", args: []string{"--check", "--source-lock"}},

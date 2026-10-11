@@ -30,12 +30,21 @@ const (
 	// but well-formed commit id, not a real one.
 	fixtureCommit = "0123456789abcdef0123456789abcdef01234567"
 	// fixtureArchiveTop is the single top-level directory a GitHub source
-	// archive carries.
+	// archive carries. It is named after the repository and the commit, so the
+	// second reviewed source has its own root rather than sharing this one.
 	fixtureArchiveTop = "domain-list-community-" + fixtureCommit
+	// fixtureChinaArchiveTop is the same for the dnsmasq source.
+	fixtureChinaArchiveTop = "dnsmasq-china-list-" + fixtureCommit
 	// fixtureList is the China list the fixture archive carries. It states one
 	// rule per supported form, a bare domain, an include, an attribute that is
 	// kept, and the attribute upstream casts out of the cn lists.
 	fixtureList = "domain:example.cn @cn\nfull:exact.cn\ninclude:shared\ncast-out.cn @!cn\nads.cn @ads\n"
+	// fixtureChinaList is the China list the dnsmasq fixture archive carries.
+	// The address is 203.0.113.7 and NOT the address upstream really uses, so a
+	// converter that published the address rather than dropping it could not
+	// pass by having published the right value. The second line is an entry
+	// upstream disabled, whose reason has to survive as a comment.
+	fixtureChinaList = "server=/one.cn/203.0.113.7\n#server=/two.cn/203.0.113.7 # Disabled: upstream moved it\n"
 	// fixtureShared is the list the fixture archive's China list includes. Its
 	// plain copy of example.cn is the same MOSDNS expression as the attributed
 	// one in the China list, and must collapse onto it.
@@ -136,10 +145,15 @@ func fixtureArchive(t *testing.T) []byte {
 // archive endpoint, both served from one test server. Every request is
 // recorded so a test can assert that a path was never fetched.
 type fakeRemote struct {
-	server  *httptest.Server
-	client  *http.Client
-	commit  string
-	archive []byte
+	server *httptest.Server
+	client *http.Client
+	commit string
+	// archives is the archive each repository's tar.gz path serves. It is keyed
+	// by repository rather than held as one value because an origin that answers
+	// for exactly one repository cannot observe a request for another one at
+	// all: the request 404s, and a gate written against that fixture reads as
+	// coverage it does not have.
+	archives map[string][]byte
 
 	// commitBody, when set (rawBody true), is served verbatim by the commit
 	// endpoint instead of a commit document.
@@ -154,9 +168,18 @@ type fakeRemote struct {
 	requests    []string
 }
 
+// newFakeRemote serves one repository's archive, which is all most tests in
+// this file need.
 func newFakeRemote(t *testing.T, commit string, archive []byte) *fakeRemote {
 	t.Helper()
-	remote := &fakeRemote{commit: commit, archive: archive, status: http.StatusOK}
+	return newFakeRemoteSources(t, commit, map[string][]byte{RepositoryV2Fly: archive})
+}
+
+// newFakeRemoteSources serves the named repositories' archives at the same
+// commit, and 404s every other repository.
+func newFakeRemoteSources(t *testing.T, commit string, archives map[string][]byte) *fakeRemote {
+	t.Helper()
+	remote := &fakeRemote{commit: commit, archives: archives, status: http.StatusOK}
 	remote.server = httptest.NewServer(http.HandlerFunc(remote.serve))
 	t.Cleanup(remote.server.Close)
 	remote.client = hostRewritingClient(t, remote.server.URL)
@@ -179,14 +202,19 @@ func (r *fakeRemote) serve(writer http.ResponseWriter, request *http.Request) {
 		// The surrounding keys are the ones GitHub sends around the single field
 		// this package reads.
 		_, _ = io.WriteString(writer, fmt.Sprintf(`{"sha":%q,"node_id":"C_1","commit":{"committer":{"date":"2026-09-25T01:39:17Z"}},"parents":[]}`, r.commit))
-	case strings.HasPrefix(request.URL.Path, "/v2fly/domain-list-community/tar.gz/"):
+	default:
+		archive, known := r.archiveFor(request.URL.Path)
+		if !known {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
 		writer.Header().Set("Content-Type", "application/gzip")
 		if r.streamBytes != 0 && r.declaredLength == 0 {
 			// No declared length, so only the reader bound can stop this body.
 			_, _ = io.CopyN(writer, zeroReader{}, r.streamBytes)
 			return
 		}
-		length := int64(len(r.archive))
+		length := int64(len(archive))
 		if r.declaredLength != 0 {
 			length = r.declaredLength
 		}
@@ -195,10 +223,19 @@ func (r *fakeRemote) serve(writer http.ResponseWriter, request *http.Request) {
 			_, _ = io.CopyN(writer, zeroReader{}, r.streamBytes)
 			return
 		}
-		_, _ = writer.Write(r.archive)
-	default:
-		writer.WriteHeader(http.StatusNotFound)
+		_, _ = writer.Write(archive)
 	}
+}
+
+// archiveFor returns the archive a codeload path names, and whether this origin
+// holds one for that repository at all.
+func (r *fakeRemote) archiveFor(requestPath string) ([]byte, bool) {
+	repository, _, found := strings.Cut(strings.TrimPrefix(requestPath, "/"), "/tar.gz/")
+	if !found {
+		return nil, false
+	}
+	archive, known := r.archives[repository]
+	return archive, known
 }
 
 // served reports whether path was requested from this origin.
@@ -231,6 +268,27 @@ func (r rewriteHostTransport) RoundTrip(request *http.Request) (*http.Response, 
 	return r.inner.RoundTrip(next)
 }
 
+// sameLock reports whether two locks are the same document. A lock holds two
+// slices now, so it cannot be compared with ==, and a test that compared only
+// the fields it cared about would stop noticing a lock that came back carrying
+// an entry set it did not have.
+func sameLock(got, want SourceLock) bool {
+	return got.SchemaVersion == want.SchemaVersion &&
+		sameRef(got.Primary, want.Primary) &&
+		(got.Supplement == nil) == (want.Supplement == nil) &&
+		(got.Supplement == nil || sameRef(*got.Supplement, *want.Supplement)) &&
+		got.ListSHA256 == want.ListSHA256
+}
+
+func sameRef(got, want SourceRef) bool {
+	return got.Repository == want.Repository &&
+		got.Commit == want.Commit &&
+		got.SHA256 == want.SHA256 &&
+		got.Entry == want.Entry &&
+		slices.Equal(got.Entries, want.Entries) &&
+		slices.Equal(got.Kinds, want.Kinds)
+}
+
 // digest returns the lowercase hex SHA-256 of b, which is the shape a lock
 // records and a pinned download requires.
 func digest(b []byte) string {
@@ -244,10 +302,40 @@ func pinnedLock(t *testing.T, archive []byte) SourceLock {
 	t.Helper()
 	return SourceLock{
 		SchemaVersion: schemaVersion,
-		Repository:    Repository,
-		Commit:        fixtureCommit,
-		SHA256:        digest(archive),
-		Entry:         Entry,
+		Primary: SourceRef{
+			Repository: RepositoryV2Fly,
+			Commit:     fixtureCommit,
+			SHA256:     digest(archive),
+			Entry:      V2FlyEntry,
+		},
+	}
+}
+
+// chinaArchive is the dnsmasq source archive the fake remote serves: the three
+// files the pin names, under the top-level directory that repository's own
+// source archive is named after.
+func chinaArchive(t *testing.T) []byte {
+	t.Helper()
+	return buildArchive(t, []archiveEntry{
+		{name: fixtureChinaArchiveTop + "/accelerated-domains.china.conf", body: fixtureChinaList},
+		{name: fixtureChinaArchiveTop + "/google.china.conf", body: "server=/three.cn/203.0.113.7\n"},
+		{name: fixtureChinaArchiveTop + "/apple.china.conf", body: "server=/four.cn/203.0.113.7\n"},
+	})
+}
+
+// chinaPinnedLock is a complete lock for the dnsmasq fixture archive. It is the
+// fallback publication's own shape: the reviewed source IS the primary and
+// there is no supplement.
+func chinaPinnedLock(t *testing.T, archive []byte) SourceLock {
+	t.Helper()
+	return SourceLock{
+		SchemaVersion: schemaVersion,
+		Primary: SourceRef{
+			Repository: RepositoryChina,
+			Commit:     fixtureCommit,
+			SHA256:     digest(archive),
+			Entries:    ChinaConfEntries,
+		},
 	}
 }
 
@@ -265,10 +353,10 @@ func TestDownloadRecordsThePinnedSourceAndConvertsTheEntry(t *testing.T) {
 	}
 	wantLock := pinnedLock(t, archive)
 	wantLock.ListSHA256 = digest(list)
-	if got != wantLock {
+	if !sameLock(got, wantLock) {
 		t.Fatalf("Download lock = %+v, want %+v", got, wantLock)
 	}
-	if got.SchemaVersion != schemaVersion || got.Repository != Repository || got.Entry != Entry {
+	if got.SchemaVersion != schemaVersion || got.Primary.Repository != RepositoryV2Fly || got.Primary.Entry != V2FlyEntry {
 		t.Fatalf("Download lock lost its pinned identity: %+v", got)
 	}
 
@@ -326,7 +414,7 @@ func TestDownloadRejectsAChecksumMismatchBeforeConversion(t *testing.T) {
 	remote := newFakeRemote(t, fixtureCommit, archive)
 
 	lock := pinnedLock(t, archive)
-	lock.SHA256 = digest([]byte("a different archive"))
+	lock.Primary.SHA256 = digest([]byte("a different archive"))
 	lockReturned, list, err := Download(context.Background(), remote.client, lock)
 	if err == nil {
 		t.Fatalf("Download accepted a mismatched archive and returned %d bytes", len(list))
@@ -334,10 +422,10 @@ func TestDownloadRejectsAChecksumMismatchBeforeConversion(t *testing.T) {
 	if list != nil {
 		t.Fatalf("Download returned list bytes on failure: %q", list)
 	}
-	if lockReturned != (SourceLock{}) {
+	if !sameLock(lockReturned, SourceLock{}) {
 		t.Fatalf("Download returned a lock on failure: %+v", lockReturned)
 	}
-	if !strings.Contains(err.Error(), "archive sha256") || !strings.Contains(err.Error(), lock.SHA256) {
+	if !strings.Contains(err.Error(), "archive sha256") || !strings.Contains(err.Error(), lock.Primary.SHA256) {
 		t.Fatalf("error = %v, want it to name the expected archive digest", err)
 	}
 	if strings.Contains(err.Error(), "ip4") {
@@ -352,31 +440,72 @@ func TestDownloadRefusesALockThatIsNotFullyPinned(t *testing.T) {
 	// before a byte is fetched, or the gateway would convert someone else's
 	// list and record it as reviewed.
 	archive := fixtureArchive(t)
-	remote := newFakeRemote(t, fixtureCommit, archive)
+	china := chinaArchive(t)
+	remote := newFakeRemoteSources(t, fixtureCommit, map[string][]byte{
+		RepositoryV2Fly: archive,
+		RepositoryChina: china,
+	})
 	valid := pinnedLock(t, archive)
+	validChina := chinaPinnedLock(t, china)
 	tests := []struct {
-		name   string
+		name string
+		// base is the reviewed lock a mutation starts from. The zero value is
+		// the v2fly primary, so a case that does not name one reads as the
+		// ordinary lock broken one way.
+		base   SourceLock
 		mutate func(*SourceLock)
 	}{
-		{name: "empty commit", mutate: func(l *SourceLock) { l.Commit = "" }},
-		{name: "short commit", mutate: func(l *SourceLock) { l.Commit = "0123456789abcdef" }},
-		{name: "non hex commit", mutate: func(l *SourceLock) { l.Commit = strings.Repeat("z", 40) }},
-		{name: "upper case commit", mutate: func(l *SourceLock) { l.Commit = strings.ToUpper(fixtureCommit) }},
-		{name: "commit with a ref", mutate: func(l *SourceLock) { l.Commit = fixtureCommit + "/data/cn" }},
-		{name: "empty archive digest", mutate: func(l *SourceLock) { l.SHA256 = "" }},
-		{name: "short archive digest", mutate: func(l *SourceLock) { l.SHA256 = valid.SHA256[:63] }},
-		{name: "upper case archive digest", mutate: func(l *SourceLock) { l.SHA256 = strings.ToUpper(valid.SHA256) }},
-		{name: "other repository", mutate: func(l *SourceLock) { l.Repository = "attacker/domain-list" }},
-		{name: "empty repository", mutate: func(l *SourceLock) { l.Repository = "" }},
-		{name: "other entry", mutate: func(l *SourceLock) { l.Entry = "data/geolocation-!cn" }},
-		{name: "absolute entry", mutate: func(l *SourceLock) { l.Entry = "/data/cn" }},
-		{name: "empty entry", mutate: func(l *SourceLock) { l.Entry = "" }},
+		{name: "empty commit", mutate: func(l *SourceLock) { l.Primary.Commit = "" }},
+		{name: "short commit", mutate: func(l *SourceLock) { l.Primary.Commit = "0123456789abcdef" }},
+		{name: "non hex commit", mutate: func(l *SourceLock) { l.Primary.Commit = strings.Repeat("z", 40) }},
+		{name: "upper case commit", mutate: func(l *SourceLock) { l.Primary.Commit = strings.ToUpper(fixtureCommit) }},
+		{name: "commit with a ref", mutate: func(l *SourceLock) { l.Primary.Commit = fixtureCommit + "/data/cn" }},
+		{name: "empty archive digest", mutate: func(l *SourceLock) { l.Primary.SHA256 = "" }},
+		{name: "short archive digest", mutate: func(l *SourceLock) { l.Primary.SHA256 = valid.Primary.SHA256[:63] }},
+		{name: "upper case archive digest", mutate: func(l *SourceLock) { l.Primary.SHA256 = strings.ToUpper(valid.Primary.SHA256) }},
+		{name: "other repository", mutate: func(l *SourceLock) { l.Primary.Repository = "attacker/domain-list" }},
+		{name: "empty repository", mutate: func(l *SourceLock) { l.Primary.Repository = "" }},
+		{name: "other entry", mutate: func(l *SourceLock) { l.Primary.Entry = "data/geolocation-!cn" }},
+		{name: "absolute entry", mutate: func(l *SourceLock) { l.Primary.Entry = "/data/cn" }},
+		{name: "empty entry", mutate: func(l *SourceLock) { l.Primary.Entry = "" }},
 		{name: "unknown schema", mutate: func(l *SourceLock) { l.SchemaVersion = schemaVersion + 1 }},
 		{name: "missing schema", mutate: func(l *SourceLock) { l.SchemaVersion = 0 }},
+		{
+			name: "v2fly source naming entries",
+			mutate: func(l *SourceLock) {
+				l.Primary.Entries = []string{V2FlyEntry}
+			},
+		},
+		// The dnsmasq source is three named files, so both shapes a lock can
+		// carry are wrong on it: an entry it does not use, and entries it left
+		// out. The pin is the fixed set, so a lock that names a fourth file is
+		// refused too rather than converted as if it had been reviewed.
+		{
+			name: "dnsmasq source naming a single entry",
+			base: validChina,
+			mutate: func(l *SourceLock) {
+				l.Primary.Entry = V2FlyEntry
+			},
+		},
+		{
+			name:   "dnsmasq source with no entries",
+			base:   validChina,
+			mutate: func(l *SourceLock) { l.Primary.Entries = nil },
+		},
+		{
+			name: "dnsmasq source naming a file outside the reviewed three",
+			base: validChina,
+			mutate: func(l *SourceLock) {
+				l.Primary.Entries = []string{"bogus-nxdomain.china.conf"}
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			lock := valid
+			if test.base.Primary.Repository != "" {
+				lock = test.base
+			}
 			test.mutate(&lock)
 			if _, _, err := Download(context.Background(), remote.client, lock); err == nil {
 				t.Fatal("Download accepted a lock that is not fully pinned")
@@ -517,8 +646,8 @@ func TestDownloadReportsAMissingEntryInsteadOfAnEmptyList(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Download accepted an archive without the entry and returned %q", list)
 	}
-	if !strings.Contains(err.Error(), Entry) {
-		t.Fatalf("error = %v, want it to name the entry %q", err, Entry)
+	if !strings.Contains(err.Error(), V2FlyEntry) {
+		t.Fatalf("error = %v, want it to name the entry %q", err, V2FlyEntry)
 	}
 }
 
@@ -528,18 +657,18 @@ func TestResolveCommitReturnsTheReviewedDefaultBranchCommit(t *testing.T) {
 	archive := fixtureArchive(t)
 	remote := newFakeRemote(t, fixtureCommit, archive)
 
-	lock, err := ResolveCommit(context.Background(), remote.client, Repository, "")
+	lock, err := ResolveCommit(context.Background(), remote.client, RepositoryV2Fly, "")
 	if err != nil {
 		t.Fatalf("ResolveCommit: %v", err)
 	}
-	if lock.Commit != fixtureCommit {
-		t.Fatalf("Commit = %q, want %q", lock.Commit, fixtureCommit)
+	if lock.Primary.Commit != fixtureCommit {
+		t.Fatalf("Commit = %q, want %q", lock.Primary.Commit, fixtureCommit)
 	}
-	if lock.Repository != Repository || lock.Entry != Entry || lock.SchemaVersion != schemaVersion {
+	if lock.Primary.Repository != RepositoryV2Fly || lock.Primary.Entry != V2FlyEntry || lock.SchemaVersion != schemaVersion {
 		t.Fatalf("resolved lock lost its pinned identity: %+v", lock)
 	}
-	if lock.SHA256 != "" || lock.ListSHA256 != "" {
-		t.Fatalf("ResolveCommit claimed digests it has not computed: %+v", lock)
+	if lock.Primary.SHA256 != "" || lock.ListSHA256 != "" || lock.Supplement != nil {
+		t.Fatalf("ResolveCommit claimed a source or a digest it has not read: %+v", lock)
 	}
 	if want := "/repos/v2fly/domain-list-community/commits/HEAD"; !remote.served(want) {
 		t.Fatalf("ResolveCommit fetched %v, want %q", remote.requests, want)
@@ -570,7 +699,7 @@ func TestResolveCommitRefusesAResponseThatIsNotAFortyHexCommit(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			remote := newFakeRemote(t, test.commit, archive)
-			lock, err := ResolveCommit(context.Background(), remote.client, Repository, "")
+			lock, err := ResolveCommit(context.Background(), remote.client, RepositoryV2Fly, "")
 			if err == nil {
 				t.Fatalf("ResolveCommit accepted %q and returned %+v", test.commit, lock)
 			}
@@ -608,7 +737,7 @@ func TestResolveCommitRefusesARemoteFailure(t *testing.T) {
 			remote.status = test.status
 			remote.commitBody = test.commitBody
 			remote.rawBody = test.rawBody
-			if _, err := ResolveCommit(context.Background(), remote.client, Repository, ""); err == nil {
+			if _, err := ResolveCommit(context.Background(), remote.client, RepositoryV2Fly, ""); err == nil {
 				t.Fatal("ResolveCommit accepted a failing remote")
 			} else if !strings.Contains(err.Error(), test.wantSub) {
 				t.Fatalf("error = %v, want it to mention %q", err, test.wantSub)
@@ -628,12 +757,12 @@ func TestResolveHEADRecordsTheArchiveDigestOfTheResolvedCommit(t *testing.T) {
 	archive := fixtureArchive(t)
 	remote := newFakeRemote(t, fixtureCommit, archive)
 
-	lock, err := ResolveHEAD(context.Background(), remote.client, Repository)
+	lock, err := ResolveHEAD(context.Background(), remote.client, RepositoryV2Fly)
 	if err != nil {
 		t.Fatalf("ResolveHEAD: %v", err)
 	}
 	want := pinnedLock(t, archive)
-	if lock != want {
+	if !sameLock(lock, want) {
 		t.Fatalf("ResolveHEAD = %+v, want %+v", lock, want)
 	}
 	if wantArchivePath := "/v2fly/domain-list-community/tar.gz/" + fixtureCommit; !remote.served(wantArchivePath) {
@@ -642,11 +771,22 @@ func TestResolveHEADRecordsTheArchiveDigestOfTheResolvedCommit(t *testing.T) {
 }
 
 func TestResolveHEADRefusesAnotherRepository(t *testing.T) {
-	// There is one reviewed source for this gateway. Accepting a caller-supplied
-	// repository would let a pin record a list nobody reviewed as if it had been.
+	// There are two reviewed sources for this gateway and the list is what makes
+	// them the only two. Accepting any other caller-supplied repository would let
+	// a pin record a list nobody reviewed as if it had been, and the repository
+	// goes into a URL, so a name like a path traversal would also be a way out of
+	// the endpoint this package means to reach.
 	remote := newFakeRemote(t, fixtureCommit, fixtureArchive(t))
 
-	for _, repository := range []string{"attacker/domain-list", "v2fly/domain-list-community/data", "../v2fly/domain-list-community", "V2Fly/domain-list-community", " "} {
+	for _, repository := range []string{
+		"attacker/domain-list",
+		"v2fly/domain-list-community/data",
+		"../v2fly/domain-list-community",
+		"V2Fly/domain-list-community",
+		"felixonmars/dnsmasq-china-list ",
+		"felixonmars/dnsmasq-china-list/../v2fly/domain-list-community",
+		" ",
+	} {
 		if _, err := ResolveHEAD(context.Background(), remote.client, repository); err == nil {
 			t.Errorf("ResolveHEAD accepted repository %q", repository)
 		}
@@ -702,10 +842,10 @@ func TestDownloadRefusesACancelledRequest(t *testing.T) {
 	if _, _, err := Download(ctx, remote.client, pinnedLock(t, archive)); err == nil {
 		t.Fatal("Download ignored a cancelled context")
 	}
-	if _, err := ResolveCommit(ctx, remote.client, Repository, ""); err == nil {
+	if _, err := ResolveCommit(ctx, remote.client, RepositoryV2Fly, ""); err == nil {
 		t.Fatal("ResolveCommit ignored a cancelled context")
 	}
-	if _, err := ResolveHEAD(ctx, remote.client, Repository); err == nil {
+	if _, err := ResolveHEAD(ctx, remote.client, RepositoryV2Fly); err == nil {
 		t.Fatal("ResolveHEAD ignored a cancelled context")
 	}
 }
@@ -738,7 +878,7 @@ func TestSourceLockJSONIsDeterministicAndStrict(t *testing.T) {
 	if err := json.Unmarshal(first, &fields); err != nil {
 		t.Fatalf("decode lock JSON: %v", err)
 	}
-	want := []string{"schema_version", "repository", "commit", "sha256", "list_sha256", "entry"}
+	want := []string{"schema_version", "primary", "list_sha256"}
 	if len(fields) != len(want) {
 		t.Fatalf("lock JSON has fields %v, want exactly %v", fields, want)
 	}
@@ -748,21 +888,24 @@ func TestSourceLockJSONIsDeterministicAndStrict(t *testing.T) {
 		}
 	}
 	// The field order is fixed by the struct, so a reader sees the same shape.
-	if bytes.Index(first, []byte(`"repository"`)) > bytes.Index(first, []byte(`"commit"`)) {
+	if bytes.Index(first, []byte(`"primary"`)) > bytes.Index(first, []byte(`"list_sha256"`)) {
 		t.Errorf("lock JSON is not in its documented order: %s", first)
+	}
+	if bytes.Contains(first, []byte(`"supplement"`)) {
+		t.Errorf("a lock with no supplement named one: %s", first)
 	}
 
 	decoded, err := ParseSourceLock(first)
 	if err != nil {
 		t.Fatalf("ParseSourceLock: %v", err)
 	}
-	if decoded != lock {
+	if !sameLock(decoded, lock) {
 		t.Fatalf("ParseSourceLock = %+v, want %+v", decoded, lock)
 	}
 	if _, err := ParseSourceLock([]byte(string(first) + "\n{}")); err == nil {
 		t.Error("ParseSourceLock accepted a second document")
 	}
-	if _, err := ParseSourceLock([]byte(`{"schema_version":1,"repository":"v2fly/domain-list-community","commit":"` + fixtureCommit + `","sha256":"` + digest([]byte("x")) + `","list_sha256":"` + digest([]byte("x")) + `","entry":"data/cn","future":"value"}`)); err == nil {
+	if _, err := ParseSourceLock([]byte(`{"schema_version":2,"primary":{"repository":"v2fly/domain-list-community","commit":"` + fixtureCommit + `","sha256":"` + digest([]byte("x")) + `","entry":"data/cn"},"list_sha256":"` + digest([]byte("x")) + `","future":"value"}`)); err == nil {
 		t.Error("ParseSourceLock accepted an unknown field")
 	}
 	if _, err := ParseSourceLock([]byte("not json")); err == nil {
@@ -770,6 +913,236 @@ func TestSourceLockJSONIsDeterministicAndStrict(t *testing.T) {
 	}
 	if _, err := ParseSourceLock(nil); err == nil {
 		t.Error("ParseSourceLock accepted an empty document")
+	}
+}
+
+func TestAV2LockRoundTripsThroughItsOwnEncoding(t *testing.T) {
+	lock := SourceLock{
+		SchemaVersion: 2,
+		Primary: SourceRef{
+			Repository: RepositoryChina,
+			Commit:     strings.Repeat("a", 40),
+			SHA256:     strings.Repeat("b", 64),
+			Entries:    ChinaConfEntries,
+		},
+		Supplement: &SourceRef{
+			Repository: RepositoryV2Fly,
+			Commit:     strings.Repeat("c", 40),
+			SHA256:     strings.Repeat("d", 64),
+			Entry:      "data/cn",
+			Kinds:      []string{"full", "regexp"},
+		},
+		ListSHA256: strings.Repeat("e", 64),
+	}
+	if err := lock.Validate(); err != nil {
+		t.Fatalf("a complete v2 lock is refused: %v", err)
+	}
+	encoded, err := lock.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := ParseSourceLock(encoded)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if decoded.Primary.Repository != RepositoryChina || len(decoded.Primary.Entries) != 3 {
+		t.Fatalf("the primary did not survive the round trip: %#v", decoded.Primary)
+	}
+	if decoded.Supplement == nil || decoded.Supplement.Entry != "data/cn" {
+		t.Fatalf("the supplement did not survive the round trip: %#v", decoded.Supplement)
+	}
+}
+
+func TestTheFallbackShapeIsTheSameShapeWithNoSupplement(t *testing.T) {
+	// v2fly as the PRIMARY is how a fallback publication records itself, so
+	// one document shape has to cover both roles.
+	lock := SourceLock{
+		SchemaVersion: 2,
+		Primary: SourceRef{
+			Repository: RepositoryV2Fly,
+			Commit:     strings.Repeat("a", 40),
+			SHA256:     strings.Repeat("b", 64),
+			Entry:      "data/cn",
+		},
+		ListSHA256: strings.Repeat("e", 64),
+	}
+	if err := lock.Validate(); err != nil {
+		t.Fatalf("a v2 lock describing v2fly as the primary is refused: %v", err)
+	}
+}
+
+func TestAV1LockIsRefusedAndTheRefusalNamesTheWayOut(t *testing.T) {
+	v1 := []byte(`{"schema_version":1,"repository":"v2fly/domain-list-community","commit":"` +
+		strings.Repeat("a", 40) + `","sha256":"` + strings.Repeat("b", 64) +
+		`","list_sha256":"` + strings.Repeat("e", 64) + `","entry":"data/cn"}`)
+	_, err := ParseSourceLock(v1)
+	if err == nil {
+		t.Fatal("a v1 lock was accepted, and reading it as v2 would make a document mean something it does not say")
+	}
+	if !strings.Contains(err.Error(), "update-lists --pin-remote") {
+		t.Fatalf("the refusal does not say how to get a v2 lock: %v", err)
+	}
+}
+
+func TestAnUnknownRepositoryIsRefused(t *testing.T) {
+	if KnownRepository("example.test/not-a-source") {
+		t.Fatal("a repository this gateway has never reviewed is accepted")
+	}
+	if !KnownRepository(RepositoryChina) || !KnownRepository(RepositoryV2Fly) {
+		t.Fatal("one of the two reviewed repositories is not in the allowlist")
+	}
+}
+
+func TestAnUnknownFieldInAV2LockIsRefused(t *testing.T) {
+	document := []byte(`{"schema_version":2,"primary":{"repository":"felixonmars/dnsmasq-china-list","commit":"` +
+		strings.Repeat("a", 40) + `","sha256":"` + strings.Repeat("b", 64) +
+		`","entries":["accelerated-domains.china.conf"]},"list_sha256":"` +
+		strings.Repeat("e", 64) + `","future_field":true}`)
+	if _, err := ParseSourceLock(document); err == nil {
+		t.Fatal("a field this build does not understand was dropped while the document still read as a complete pin")
+	}
+}
+
+func TestAnArchiveIsFetchedFromTheLockRepositoryNotThePackageDefault(t *testing.T) {
+	// The fetch must follow the pin. A converter that always asked for the
+	// default repository would verify a digest against an archive from
+	// somewhere else entirely.
+	if strings.Contains(archiveBaseURL+"/"+RepositoryChina, "v2fly") {
+		t.Fatal("the primary repository constant names the wrong source")
+	}
+}
+
+func TestThePrimaryArchiveIsFetchedFromTheRepositoryTheLockNames(t *testing.T) {
+	// This is the shape the fallback publication will have written, so it is
+	// the one case where the repository in the lock, the top-level directory
+	// the archive is named after, and the converter that reads it all differ
+	// from the default. A fetch that kept using the package default would
+	// verify the primary's digest against the other repository's archive; an
+	// extractor that kept using the default root would refuse a real one.
+	archive := chinaArchive(t)
+	remote := newFakeRemoteSources(t, fixtureCommit, map[string][]byte{
+		RepositoryChina: archive,
+		RepositoryV2Fly: fixtureArchive(t),
+	})
+
+	got, list, err := Download(context.Background(), remote.client, chinaPinnedLock(t, archive))
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if want := "/" + RepositoryChina + "/tar.gz/" + fixtureCommit; !remote.served(want) {
+		t.Fatalf("Download fetched %v, want the archive at %q", remote.requests, want)
+	}
+	if other := "/v2fly/domain-list-community/tar.gz/" + fixtureCommit; remote.served(other) {
+		t.Fatalf("Download fetched %q although the lock names %q", other, RepositoryChina)
+	}
+	// The upstream address is 203.0.113.7 in every fixture line, so a list
+	// carrying one is a converter that published what the pin says it drops.
+	want := "# disabled upstream: upstream moved it\n" +
+		"domain:four.cn\ndomain:one.cn\ndomain:three.cn\n"
+	if string(list) != want {
+		t.Fatalf("Download list =\n%q\nwant\n%q", list, want)
+	}
+	wantLock := chinaPinnedLock(t, archive)
+	wantLock.ListSHA256 = digest(list)
+	if !sameLock(got, wantLock) {
+		t.Fatalf("Download lock = %+v, want %+v", got, wantLock)
+	}
+}
+
+func TestDownloadRefusesALockCarryingASecondSourceRatherThanIgnoringIt(t *testing.T) {
+	// This build converts one archive, so a lock that names two is not a lock it
+	// can satisfy: publishing the primary alone would write a list the lock
+	// says is short, and every domain the supplement contributes would silently
+	// take the foreign branch. The refusal is the honest answer until the union
+	// lands, and it is refused before a byte is fetched.
+	archive := chinaArchive(t)
+	remote := newFakeRemoteSources(t, fixtureCommit, map[string][]byte{
+		RepositoryChina: archive,
+		RepositoryV2Fly: fixtureArchive(t),
+	})
+	lock := chinaPinnedLock(t, archive)
+	lock.Supplement = &SourceRef{
+		Repository: RepositoryV2Fly,
+		Commit:     fixtureCommit,
+		SHA256:     digest(fixtureArchive(t)),
+		Entry:      V2FlyEntry,
+		Kinds:      V2FlySupplementKinds,
+	}
+	lock.ListSHA256 = digest([]byte("unused"))
+
+	lockReturned, list, err := Download(context.Background(), remote.client, lock)
+	if err == nil {
+		t.Fatalf("Download accepted a two-source lock and returned %q", list)
+	}
+	if list != nil || !sameLock(lockReturned, SourceLock{}) {
+		t.Fatalf("Download returned something on failure: lock %+v, list %q", lockReturned, list)
+	}
+	if len(remote.requests) != 0 {
+		t.Fatalf("Download fetched %v before refusing the lock", remote.requests)
+	}
+}
+
+func TestASupplementHasToBeTheOneRepositoryThatMaySupplement(t *testing.T) {
+	// The dnsmasq source is the primary or it is nothing: it cannot be the 70
+	// extra rules of a v2fly publication, because those rules are its own kind
+	// and merging it into itself would convert the same domains twice.
+	lock := SourceLock{
+		SchemaVersion: schemaVersion,
+		Primary:       chinaPinnedLock(t, []byte("x")).Primary,
+		Supplement: &SourceRef{
+			Repository: RepositoryChina,
+			Commit:     strings.Repeat("c", 40),
+			SHA256:     strings.Repeat("d", 64),
+			Entries:    ChinaConfEntries,
+			Kinds:      V2FlySupplementKinds,
+		},
+		ListSHA256: strings.Repeat("e", 64),
+	}
+	if err := lock.Validate(); err == nil {
+		t.Fatal("the primary was accepted as its own supplement")
+	}
+}
+
+func TestResolveCommitNamesTheEntriesItsRepositoryConverts(t *testing.T) {
+	// The lock a pin writes has to say what will be read, or a later run is
+	// guessing: a commit and a repository alone do not say whether the source is
+	// one file or three.
+	remote := newFakeRemote(t, fixtureCommit, fixtureArchive(t))
+
+	china, err := ResolveCommit(context.Background(), remote.client, RepositoryChina, "")
+	if err != nil {
+		t.Fatalf("ResolveCommit(china): %v", err)
+	}
+	if china.Primary.Repository != RepositoryChina || !slices.Equal(china.Primary.Entries, ChinaConfEntries) || china.Primary.Entry != "" {
+		t.Fatalf("the dnsmasq lock does not name its three files: %+v", china.Primary)
+	}
+	if want := "/repos/" + RepositoryChina + "/commits/HEAD"; !remote.served(want) {
+		t.Fatalf("ResolveCommit fetched %v, want %q", remote.requests, want)
+	}
+
+	v2fly, err := ResolveCommit(context.Background(), remote.client, RepositoryV2Fly, fixtureCommit)
+	if err != nil {
+		t.Fatalf("ResolveCommit(v2fly): %v", err)
+	}
+	if v2fly.Primary.Entry != V2FlyEntry || len(v2fly.Primary.Entries) != 0 {
+		t.Fatalf("the v2fly lock does not name its one file: %+v", v2fly.Primary)
+	}
+}
+
+func TestAFetchRefusesARepositoryTheAllowlistDoesNotHoldBeforeBuildingAURL(t *testing.T) {
+	// The repository becomes a path under a fixed host, so the name is checked
+	// against the allowlist before it is concatenated rather than after: a name
+	// is not a URL fragment, and this is the one function every fetch goes
+	// through.
+	remote := newFakeRemote(t, fixtureCommit, fixtureArchive(t))
+	lock := pinnedLock(t, fixtureArchive(t))
+	lock.Primary.Repository = "attacker/domain-list"
+
+	if _, err := fetchArchive(context.Background(), remote.client, lock); err == nil {
+		t.Fatal("fetchArchive requested an archive for a repository nobody reviewed")
+	}
+	if len(remote.requests) != 0 {
+		t.Fatalf("an unreviewed repository reached the network: %v", remote.requests)
 	}
 }
 

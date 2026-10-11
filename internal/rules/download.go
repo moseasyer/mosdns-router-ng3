@@ -19,21 +19,31 @@ import (
 )
 
 const (
-	// Repository is the only source this gateway converts. It is not a
-	// parameter: a caller cannot redirect a pin at another repository, and the
-	// archive URL is derived from this value and the pinned commit.
-	Repository = "v2fly/domain-list-community"
+	// RepositoryChina and RepositoryV2Fly are the two sources this gateway has
+	// reviewed. Which of them a published list derives from is the lock's
+	// decision and not a constant's: the primary is whichever the lock names, a
+	// supplement can only be the v2fly one, and a fallback publication names
+	// v2fly as the primary with no supplement at all.
+	//
+	// Neither is a parameter a caller may set to any value. Both entries of this
+	// allowlist were reviewed by hand and anything outside it is refused,
+	// because what a lock records is which source was reviewed -- and the
+	// repository is a path under a fixed host, so an unchecked name is also a
+	// way to aim the download somewhere else.
+	RepositoryChina = "felixonmars/dnsmasq-china-list"
+	RepositoryV2Fly = "v2fly/domain-list-community"
 
-	// Entry is the list inside that repository this gateway publishes: the
-	// China domain set.
-	Entry = "data/cn"
+	// V2FlyEntry is the list inside the v2fly repository this gateway publishes:
+	// the China domain set. It is one file.
+	V2FlyEntry = "data/cn"
 
 	// schemaVersion is the shape of a written lock. A lock carrying any other
 	// version is refused rather than interpreted.
-	schemaVersion = 1
+	schemaVersion = 2
 
 	// apiBaseURL and archiveBaseURL are fixed GitHub endpoints. Neither the
-	// repository nor the host is caller-controlled.
+	// repository nor the host is caller-controlled, and the repository that is
+	// concatenated into them has been through KnownRepository first.
 	apiBaseURL     = "https://api.github.com"
 	archiveBaseURL = "https://codeload.github.com"
 
@@ -53,23 +63,66 @@ const (
 	maxCommitDocumentBytes = 1 << 20
 )
 
-// SourceLock records the reviewed upstream source of a published list, so a
-// later update can be compared against it and a reader can tell exactly which
+// V2FlySupplementKinds are the v2fly rule kinds merged into a primary source
+// when the primary is the dnsmasq list.
+//
+// Only those two, because they are the ones that source cannot say at all:
+// `server=/<domain>/` means the domain and everything under it, which is what a
+// `domain:` rule already means, so the syntax has no room for an exact match or
+// for a regular expression. A kind the primary does carry would contribute a
+// second spelling of a rule the published list already holds.
+var V2FlySupplementKinds = []string{"full", "regexp"}
+
+// KnownRepository reports whether this gateway has reviewed name as a source.
+//
+// It is the one gate every repository name passes through before it reaches a
+// URL, so it is deliberately an equality test against two constants rather than
+// a shape test. A shape test would accept every repository that looks like the
+// two of them, and a lock that records which source was reviewed is worth
+// nothing if a well-formed name is enough to get into one.
+func KnownRepository(name string) bool {
+	return name == RepositoryChina || name == RepositoryV2Fly
+}
+
+// SourceRef is one reviewed upstream source.
+//
+// Entry and Entries are two spellings of the same question -- which files of the
+// archive are converted -- because the two sources answer it differently. The
+// dnsmasq repository's list is three named files and one string cannot say that;
+// the v2fly repository's is one. Which spelling belongs to which repository is
+// checked rather than inferred, because a lock that named both, or named the
+// wrong one, would be a pin of something nobody read.
+//
+// Kinds is only meaningful on a supplement, and is what it contributes rather
+// than what the repository holds.
+type SourceRef struct {
+	Repository string   `json:"repository"`
+	Commit     string   `json:"commit"`
+	SHA256     string   `json:"sha256"`
+	Entry      string   `json:"entry,omitempty"`
+	Entries    []string `json:"entries,omitempty"`
+	Kinds      []string `json:"kinds,omitempty"`
+}
+
+// SourceLock records the reviewed upstream sources of a published list, so a
+// later update can be compared against them and a reader can tell exactly which
 // bytes produced the list it is running.
+//
+// The list derives from primary, and optionally from supplement: the dnsmasq
+// source cannot express a `full:` or a `regexp:` rule, so those v2fly rules are
+// merged into the same published file and the lock has to be able to say so.
+// When the primary IS v2fly -- a fallback publication -- supplement is absent,
+// and one document shape covers both roles.
 type SourceLock struct {
 	// SchemaVersion is the shape of this document.
 	SchemaVersion int `json:"schema_version"`
-	// Repository is the only source this gateway accepts, recorded so a lock is
-	// self-describing.
-	Repository string `json:"repository"`
-	// Commit is the reviewed 40-hex commit id.
-	Commit string `json:"commit"`
-	// SHA256 is the digest of the source archive for that commit.
-	SHA256 string `json:"sha256"`
+	// Primary is the source the published list is converted from.
+	Primary SourceRef `json:"primary"`
+	// Supplement is the second source, when there is one. Absent rather than
+	// empty when the list comes from a single archive.
+	Supplement *SourceRef `json:"supplement,omitempty"`
 	// ListSHA256 is the digest of the published list bytes this lock describes.
 	ListSHA256 string `json:"list_sha256"`
-	// Entry is the list inside the repository that was converted.
-	Entry string `json:"entry"`
 }
 
 // Encode renders the lock as the exact bytes a lock file holds. The field order
@@ -88,7 +141,33 @@ func (l SourceLock) Encode() ([]byte, error) {
 // and any malformed JSON are refused: a lock is the record of what was reviewed,
 // so a field this build does not understand must not be quietly dropped while
 // the document still reads as a complete pin.
+//
+// A document of another schema version is refused too, and with the command that
+// produces one this build can read. That is a separate failure from an unknown
+// field on purpose: the first is a lock written before the list had two sources,
+// and the operator's next step is to re-pin rather than to edit the document.
 func ParseSourceLock(data []byte) (SourceLock, error) {
+	// The version is read first, from a document decoded for nothing else. A v1
+	// lock's fields are not this build's fields -- `repository` and `entry` are
+	// where `primary` is now -- so decoding it strictly would fail on an unknown
+	// field and report a syntax problem, when what the operator has is a lock of
+	// a shape this build does not read, which is a different thing with a
+	// different command that fixes it.
+	var version struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&version); err != nil {
+		return SourceLock{}, fmt.Errorf("decode source lock: %w", err)
+	}
+	if version.SchemaVersion != schemaVersion {
+		return SourceLock{}, fmt.Errorf(
+			"source lock is schema version %d and this build reads version %d. A v1 lock names one "+
+				"repository and one entry; this list is published from two, so reading the old "+
+				"document as the new one would make a lock that reads complete mean something it does "+
+				"not say. Re-pin it with `mosdns-cdnctl update-lists --pin-remote HEAD`",
+			version.SchemaVersion, schemaVersion)
+	}
+
 	lock := SourceLock{}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -117,27 +196,121 @@ func (l SourceLock) Validate() error {
 // validatePinnedSource checks everything a download needs to trust an archive
 // except the list digest: a lock that has not been converted yet has no list
 // digest, and the download is what produces it.
+//
+// A supplement is checked for shape here and refused for substance by Download,
+// which is the one place that knows whether it can read two archives.
 func (l SourceLock) validatePinnedSource() error {
-	if l.SchemaVersion != schemaVersion {
-		return fmt.Errorf("schema_version %d is not the supported version %d", l.SchemaVersion, schemaVersion)
+	if err := l.validateRef(&l.Primary); err != nil {
+		return fmt.Errorf("primary: %w", err)
 	}
-	if l.Repository != Repository {
-		return fmt.Errorf("repository %q is not the reviewed source %q", l.Repository, Repository)
-	}
-	if !isLowerHex(l.Commit, 40) {
-		return fmt.Errorf("commit %q is not a 40 character lower-case hex commit id", l.Commit)
-	}
-	if !isLowerHex(l.SHA256, 64) {
-		return fmt.Errorf("sha256 %q is not a 64 character lower-case hex digest", l.SHA256)
-	}
-	if l.Entry != Entry {
-		return fmt.Errorf("entry %q is not the reviewed list %q", l.Entry, Entry)
+	if l.Supplement != nil {
+		if l.Supplement.Repository != RepositoryV2Fly {
+			return fmt.Errorf("supplement: repository %q is not the only source allowed as a supplement", l.Supplement.Repository)
+		}
+		if err := l.validateRef(l.Supplement); err != nil {
+			return fmt.Errorf("supplement: %w", err)
+		}
+		if l.Supplement.Kinds == nil {
+			return errors.New("supplement: a supplement records which rule kinds it contributed")
+		}
 	}
 	return nil
 }
 
+// validateRef checks one source ref. The schema version is checked here rather
+// than once per document because a v2 document with a v1 version is a document
+// this build cannot account for whatever else it says, and a lock with no
+// sources at all still has to fail for that reason first.
+func (l SourceLock) validateRef(ref *SourceRef) error {
+	if l.SchemaVersion != schemaVersion {
+		return fmt.Errorf("schema_version %d is not the supported version %d", l.SchemaVersion, schemaVersion)
+	}
+	if !KnownRepository(ref.Repository) {
+		return fmt.Errorf("repository %q is not one of the reviewed sources %q and %q", ref.Repository, RepositoryChina, RepositoryV2Fly)
+	}
+	if !isLowerHex(ref.Commit, 40) {
+		return fmt.Errorf("commit %q is not a 40 character lower-case hex commit id", ref.Commit)
+	}
+	if !isLowerHex(ref.SHA256, 64) {
+		return fmt.Errorf("sha256 %q is not a 64 character lower-case hex digest", ref.SHA256)
+	}
+	switch ref.Repository {
+	case RepositoryChina:
+		if len(ref.Entries) == 0 {
+			return errors.New("entries is empty: the dnsmasq source is three named files")
+		}
+		if ref.Entry != "" {
+			return errors.New("entry and entries are both set on the dnsmasq source, which uses entries")
+		}
+		// The three files are the reviewed set rather than a hint. Upstream adds
+		// files -- `bogus-nxdomain.china.conf` among them -- and a lock naming a
+		// fourth would have this build convert a list no review ever covered,
+		// under a lock that claims it was reviewed.
+		if !sameEntries(ref.Entries, ChinaConfEntries) {
+			return fmt.Errorf("entries %v are not the reviewed set %v", ref.Entries, ChinaConfEntries)
+		}
+	case RepositoryV2Fly:
+		if ref.Entry != V2FlyEntry {
+			return fmt.Errorf("entry %q is not the reviewed list %q", ref.Entry, V2FlyEntry)
+		}
+		if len(ref.Entries) != 0 {
+			return errors.New("the v2fly source has one entry and it is named by entry, not entries")
+		}
+	}
+	return nil
+}
+
+// sameEntries reports whether a ref names exactly the reviewed files, in any
+// order. Order carries no meaning -- the converter merges the three results
+// into one list -- but a file that is not in the reviewed set is a refusal
+// rather than a reordering.
+func sameEntries(named, reviewed []string) bool {
+	if len(named) != len(reviewed) {
+		return false
+	}
+	counts := make(map[string]int, len(named))
+	for _, entry := range named {
+		counts[entry]++
+	}
+	for _, entry := range reviewed {
+		counts[entry]--
+		if counts[entry] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// entriesFor returns the entry set a repository's source is converted from, or
+// nil for a repository that names one file by name instead.
+//
+// The set is copied: it comes from a package-level slice, and a lock that
+// shared its backing array with it could be written by a caller mutating the
+// constant out from under the next validation.
+func entriesFor(repository string) []string {
+	if repository == RepositoryChina {
+		return append([]string(nil), ChinaConfEntries...)
+	}
+	return nil
+}
+
+// entryFor returns the single converted list of a repository that has one, and
+// the empty string for the repository whose list is three named files.
+func entryFor(repository string) string {
+	if repository == RepositoryV2Fly {
+		return V2FlyEntry
+	}
+	return ""
+}
+
 // ResolveCommit resolves the commit the repository publishes for ref, and returns a
 // lock pinned to it with no digests: it has read a commit, not an archive.
+//
+// The repository is a parameter and is gated by KnownRepository rather than
+// being a constant, because a lock records which source was reviewed and a
+// build with one hardcoded source could not record a fallback publication at
+// all. The gate is the same allowlist either way, so this widens which reviewed
+// source may be pinned, not who may be pinned.
 //
 // An empty ref or the literal HEAD is the repository's current default-branch commit,
 // read through the fixed GitHub API endpoint -- one request, so a check that finds the
@@ -154,8 +327,8 @@ func (l SourceLock) validatePinnedSource() error {
 // records a commit: accepting one would put something in the lock that is not the
 // thing the lock says it is.
 func ResolveCommit(ctx context.Context, client *http.Client, repository, ref string) (SourceLock, error) {
-	if repository != Repository {
-		return SourceLock{}, fmt.Errorf("repository %q is not the reviewed source %q", repository, Repository)
+	if !KnownRepository(repository) {
+		return SourceLock{}, fmt.Errorf("repository %q is not one of the reviewed sources %q and %q", repository, RepositoryChina, RepositoryV2Fly)
 	}
 	if client == nil {
 		return SourceLock{}, errors.New("an HTTP client is required to resolve the remote commit")
@@ -163,12 +336,15 @@ func ResolveCommit(ctx context.Context, client *http.Client, repository, ref str
 	if named, ok := normalizeCommitRef(ref); ok {
 		return SourceLock{
 			SchemaVersion: schemaVersion,
-			Repository:    Repository,
-			Commit:        named,
-			Entry:         Entry,
+			Primary: SourceRef{
+				Repository: repository,
+				Commit:     named,
+				Entry:      entryFor(repository),
+				Entries:    entriesFor(repository),
+			},
 		}, nil
 	}
-	endpoint := apiBaseURL + "/repos/" + Repository + "/commits/HEAD"
+	endpoint := apiBaseURL + "/repos/" + repository + "/commits/HEAD"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return SourceLock{}, fmt.Errorf("%s: build request: %w", endpoint, err)
@@ -207,9 +383,12 @@ func ResolveCommit(ctx context.Context, client *http.Client, repository, ref str
 	}
 	return SourceLock{
 		SchemaVersion: schemaVersion,
-		Repository:    Repository,
-		Commit:        commit.SHA,
-		Entry:         Entry,
+		Primary: SourceRef{
+			Repository: repository,
+			Commit:     commit.SHA,
+			Entry:      entryFor(repository),
+			Entries:    entriesFor(repository),
+		},
 	}, nil
 }
 
@@ -230,7 +409,7 @@ func ResolvePinned(ctx context.Context, client *http.Client, repository, ref str
 	if err != nil {
 		return SourceLock{}, err
 	}
-	resolved.SHA256 = digestHex(archive)
+	resolved.Primary.SHA256 = digestHex(archive)
 	return resolved, nil
 }
 
@@ -261,14 +440,32 @@ func normalizeCommitRef(ref string) (string, bool) {
 	return trimmed, true
 }
 
-// Download fetches the source archive of a fully pinned lock, verifies its
-// digest before a byte of it is extracted, converts the pinned entry, and
-// returns the lock extended with the digest of the exact list bytes it
+// Download fetches the source archive a fully pinned lock names, verifies its
+// digest before a byte of it is extracted, converts the entries the lock names,
+// and returns the lock extended with the digest of the exact list bytes it
 // produced. A failure at any step returns no lock and no list, so a caller
 // cannot mistake a partial update for a pin.
+//
+// The repository, the archive root and the converter all come from the lock
+// rather than from a package constant. A download that asked for the default
+// repository would verify the pinned digest against an archive from somewhere
+// else entirely, and the two would agree only while the default happened to be
+// the source the lock named.
 func Download(ctx context.Context, client *http.Client, lock SourceLock) (SourceLock, []byte, error) {
 	if err := lock.validatePinnedSource(); err != nil {
 		return SourceLock{}, nil, fmt.Errorf("source lock: %w", err)
+	}
+	if lock.Supplement != nil {
+		// This build reads one archive and publishes one list. A lock naming two
+		// is a lock this build cannot satisfy, and the failure mode for carrying
+		// on is the worst one available: a list missing every rule the supplement
+		// contributes, published beside a lock that says it has them. Each of
+		// those domains would take the foreign branch with nothing reporting it.
+		//
+		// The refusal is therefore here and not in Validate, which still accepts
+		// a two-source lock: the document shape is right and a later union is
+		// what makes it satisfiable.
+		return SourceLock{}, nil, fmt.Errorf("source lock: supplement %q is a second source and this build publishes one; the union that satisfies the lock has not landed", lock.Supplement.Repository)
 	}
 	if client == nil {
 		return SourceLock{}, nil, errors.New("an HTTP client is required to download the source archive")
@@ -277,16 +474,16 @@ func Download(ctx context.Context, client *http.Client, lock SourceLock) (Source
 	if err != nil {
 		return SourceLock{}, nil, err
 	}
-	if actual := digestHex(archive); actual != lock.SHA256 {
-		return SourceLock{}, nil, fmt.Errorf("archive sha256 %s does not match the pinned %s", actual, lock.SHA256)
+	if actual := digestHex(archive); actual != lock.Primary.SHA256 {
+		return SourceLock{}, nil, fmt.Errorf("archive sha256 %s does not match the pinned %s", actual, lock.Primary.SHA256)
 	}
-	fsys, err := extractArchive(archive, lock.Commit)
+	fsys, err := extractArchive(archive, lock.Primary.Repository, lock.Primary.Commit)
 	if err != nil {
 		return SourceLock{}, nil, err
 	}
-	expressions, err := ConvertFS(fsys, lock.Entry)
+	expressions, err := convertSource(fsys, lock.Primary)
 	if err != nil {
-		return SourceLock{}, nil, fmt.Errorf("convert %s at %s: %w", Repository, lock.Commit, err)
+		return SourceLock{}, nil, fmt.Errorf("convert %s at %s: %w", lock.Primary.Repository, lock.Primary.Commit, err)
 	}
 	list := renderList(expressions)
 	pinned := lock
@@ -294,8 +491,40 @@ func Download(ctx context.Context, client *http.Client, lock SourceLock) (Source
 	return pinned, list, nil
 }
 
+// convertSource converts the entries a reviewed source names, in the shape that
+// source has.
+//
+// It dispatches on the repository rather than on the entry, because the two
+// reviewed sources are different formats and nothing else in a lock says which
+// parser a file is written for. Dispatching on the entry would mean letting a
+// lock field choose the code that reads it, and a lock is the one file this
+// package refuses to take anything on trust.
+func convertSource(fsys fs.FS, ref SourceRef) ([]string, error) {
+	switch ref.Repository {
+	case RepositoryChina:
+		result, err := ConvertChinaConfFS(fsys, ref.Entries)
+		if err != nil {
+			return nil, err
+		}
+		// The comments come first because that is also their order: a comment
+		// begins with '#', which sorts before any rule kind, and both halves are
+		// sorted by the converter. Concatenating them keeps the whole document
+		// sorted, which is what the published list's own gate checks.
+		//
+		// They are in the list rather than beside it because the list is the only
+		// artifact that ships: a lock has no field for them, and dropping them
+		// would drop the record of which domains upstream turned off and why.
+		return append(append([]string(nil), result.Comments...), result.Expressions...), nil
+	case RepositoryV2Fly:
+		return ConvertFS(fsys, ref.Entry)
+	}
+	return nil, fmt.Errorf("repository %q is not a reviewed source this build can convert", ref.Repository)
+}
+
 // renderList renders converted expressions as the exact bytes a list file
-// holds: one expression per line, each line terminated.
+// holds: one expression per line, each line terminated. A line beginning with
+// '#' is a comment upstream gave and this package kept, and is written by the
+// same rule as a rule is, because the loader reads both the same way.
 func renderList(expressions []string) []byte {
 	var rendered bytes.Buffer
 	for _, expression := range expressions {
@@ -307,8 +536,18 @@ func renderList(expressions []string) []byte {
 
 // fetchArchive downloads the source archive of a lock's commit from the fixed
 // codeload endpoint, enforcing the download bound before and while reading.
+//
+// The repository comes from the lock and is checked against the allowlist HERE,
+// before it is concatenated into the URL rather than by the caller: this is the
+// one function every archive fetch goes through, and a repository name is a path
+// segment under a host this package chose. A caller that had already validated
+// the lock would make this check redundant, which is exactly why a redundant
+// check in the place a string becomes a URL is the one worth keeping.
 func fetchArchive(ctx context.Context, client *http.Client, lock SourceLock) ([]byte, error) {
-	endpoint := archiveBaseURL + "/" + Repository + "/tar.gz/" + lock.Commit
+	if !KnownRepository(lock.Primary.Repository) {
+		return nil, fmt.Errorf("repository %q is not one of the reviewed sources %q and %q", lock.Primary.Repository, RepositoryChina, RepositoryV2Fly)
+	}
+	endpoint := archiveBaseURL + "/" + lock.Primary.Repository + "/tar.gz/" + lock.Primary.Commit
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s: build request: %w", endpoint, err)
@@ -342,7 +581,7 @@ func fetchArchive(ctx context.Context, client *http.Client, lock SourceLock) ([]
 // one named after the repository and the pinned commit. Anything that is not a
 // regular file, any path that could reach outside the archive, and any archive
 // above the size or entry bounds are refused: an archive is untrusted input.
-func extractArchive(archive []byte, commit string) (fs.FS, error) {
+func extractArchive(archive []byte, repository, commit string) (fs.FS, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return nil, fmt.Errorf("open source archive: %w", err)
@@ -351,7 +590,7 @@ func extractArchive(archive []byte, commit string) (fs.FS, error) {
 
 	files := make(map[string][]byte)
 	tarReader := tar.NewReader(reader)
-	root := archiveRoot(commit)
+	root := archiveRoot(repository, commit)
 	prefix := root + "/"
 	var total int64
 	for entries := 0; ; entries++ {
@@ -418,10 +657,17 @@ func extractArchive(archive []byte, commit string) (fs.FS, error) {
 }
 
 // archiveRoot is the single top-level directory a GitHub source archive for a
-// commit is named after. Requiring it proves the archive is the repository at
-// the pinned commit, so a substituted or repacked archive is refused.
-func archiveRoot(commit string) string {
-	return "domain-list-community-" + commit
+// commit is named after: the repository's own name, then the commit. Requiring
+// it proves the archive is the repository at the pinned commit, so a substituted
+// or repacked archive is refused.
+//
+// It is derived from the reviewed repository rather than written out per
+// repository, because a hardcoded root is how a two-source download ends up
+// extracting the dnsmasq archive under v2fly's directory name and refusing it
+// for being the wrong shape. The value comes from an allowlisted constant, so
+// deriving it does not widen what may be looked for.
+func archiveRoot(repository, commit string) string {
+	return path.Base(repository) + "-" + commit
 }
 
 // archiveFS is a read-only filesystem over the files a source archive held.

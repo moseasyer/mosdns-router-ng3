@@ -46,13 +46,22 @@ func TestCommittedSourceLockIsAFullyPinnedReviewedSource(t *testing.T) {
 	if err := lock.Validate(); err != nil {
 		t.Fatalf("the committed source lock is not a complete pin: %v", err)
 	}
-	if lock.Repository != Repository {
-		t.Errorf("committed repository = %q, want %q", lock.Repository, Repository)
+	// The committed pair is the v2fly fallback publication: one reviewed source
+	// as the primary and no supplement. Task 6 re-pins it to the dnsmasq
+	// primary, which is a different primary rather than a different shape.
+	if lock.SchemaVersion != 2 {
+		t.Errorf("committed schema_version = %d, want 2", lock.SchemaVersion)
 	}
-	if lock.Entry != Entry {
-		t.Errorf("committed entry = %q, want %q", lock.Entry, Entry)
+	if lock.Supplement != nil {
+		t.Errorf("the committed lock names a supplement: %+v", lock.Supplement)
 	}
-	if lock.Commit == strings.Repeat("0", 40) {
+	if lock.Primary.Repository != RepositoryV2Fly {
+		t.Errorf("committed repository = %q, want %q", lock.Primary.Repository, RepositoryV2Fly)
+	}
+	if lock.Primary.Entry != V2FlyEntry {
+		t.Errorf("committed entry = %q, want %q", lock.Primary.Entry, V2FlyEntry)
+	}
+	if lock.Primary.Commit == strings.Repeat("0", 40) {
 		t.Error("the committed commit is all zeroes, which is not a reviewed commit")
 	}
 }

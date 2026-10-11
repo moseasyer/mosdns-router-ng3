@@ -435,10 +435,20 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 
 	client := services.newHTTPClient()
 	var report bytes.Buffer
-	writeReportLine(&report, "repository: %s\n", published.Repository)
-	writeReportLine(&report, "entry: %s\n", published.Entry)
-	writeReportLine(&report, "locked-commit: %s\n", published.Commit)
-	writeReportLine(&report, "locked-archive-sha256: %s\n", published.SHA256)
+	// The report names the primary of the lock that is on disk, and the drift
+	// check asks that repository whether it has moved on. A check that asked a
+	// hardcoded repository would answer "up to date" about a source this list
+	// was not built from, as soon as the two differ.
+	writeReportLine(&report, "repository: %s\n", published.Primary.Repository)
+	if published.Primary.Entry != "" {
+		writeReportLine(&report, "entry: %s\n", published.Primary.Entry)
+	} else {
+		// A source that is three named files has no single entry, and reporting
+		// an empty field would be a report that looks complete and says nothing.
+		writeReportLine(&report, "entries: %s\n", strings.Join(published.Primary.Entries, " "))
+	}
+	writeReportLine(&report, "locked-commit: %s\n", published.Primary.Commit)
+	writeReportLine(&report, "locked-archive-sha256: %s\n", published.Primary.SHA256)
 	writeReportLine(&report, "locked-list-sha256: %s\n", published.ListSHA256)
 
 	// The Cloudflare ranges are reported here, in the same report, and they cost
@@ -450,7 +460,7 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	// an API outage while the files it is reporting about are perfectly fine.
 	reportRanges(&report, options, services.now())
 
-	remote, err := rules.ResolveCommit(ctx, client, rules.Repository, "")
+	remote, err := rules.ResolveCommit(ctx, client, published.Primary.Repository, "")
 	if err != nil {
 		// The half of this report that was read off the disk goes out on the
 		// failure path, and this is why. It needed no request, and the machine
@@ -469,9 +479,9 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 		_, _ = stderr.Write(report.Bytes())
 		return exitStateUnavailable
 	}
-	writeReportLine(&report, "remote-commit: %s\n", remote.Commit)
+	writeReportLine(&report, "remote-commit: %s\n", remote.Primary.Commit)
 
-	if remote.Commit == published.Commit {
+	if remote.Primary.Commit == published.Primary.Commit {
 		// The remote still publishes the commit the list was converted from, so
 		// the archive is not fetched at all.
 		writeReportLine(&report, "up-to-date: true\n")
@@ -479,12 +489,12 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	}
 	// The remote has moved on. The archive is read in memory only to report the
 	// digest the new pin would record; nothing is accepted here.
-	drifted, err := rules.ResolveHEAD(ctx, client, rules.Repository)
+	drifted, err := rules.ResolveHEAD(ctx, client, published.Primary.Repository)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
-	writeReportLine(&report, "remote-archive-sha256: %s\n", drifted.SHA256)
+	writeReportLine(&report, "remote-archive-sha256: %s\n", drifted.Primary.SHA256)
 	writeReportLine(&report, "up-to-date: false\n")
 	return writeReport(stdout, stderr, report.Bytes())
 }
@@ -685,16 +695,18 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	published := countListRules(current)
 
 	client := services.newHTTPClient()
-	resolved, err := rules.ResolveHEAD(ctx, client, rules.Repository)
+	// The refresh re-pins the source the published lock names, so the count it
+	// compares is a count of the same source's rules.
+	resolved, err := rules.ResolveHEAD(ctx, client, pinned.Primary.Repository)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
-	if resolved.Commit == pinned.Commit {
+	if resolved.Primary.Commit == pinned.Primary.Commit {
 		// Already there. Nothing to do and nothing to say beyond the fact, because
 		// re-downloading and re-publishing an identical commit is how a daily job
 		// turns a no-op into wear on the disk the machine is running from.
-		writeReportLine(stdout, "china-list: already at %s\n", pinned.Commit)
+		writeReportLine(stdout, "china-list: already at %s\n", pinned.Primary.Commit)
 		return exitSuccess
 	}
 	_, list, err := rules.Download(ctx, client, resolved)
@@ -711,7 +723,7 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 				"upstream made rather than a change anybody reviewed here. Nothing was changed. "+
 				"Read the diff, then publish that commit deliberately with "+
 				"`mosdns-cdnctl update-lists --pin-remote %s`.",
-			resolved.Commit, ruleCount(incoming), ruleCount(published), resolved.Commit)
+			resolved.Primary.Commit, ruleCount(incoming), ruleCount(published), resolved.Primary.Commit)
 		return exitStateUnavailable
 	}
 
@@ -721,7 +733,7 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// upstream moving during the run would publish an unmeasured list through the
 	// mechanism built to prevent exactly that.
 	pinned_ := options
-	pinned_.pinRemote = resolved.Commit
+	pinned_.pinRemote = resolved.Primary.Commit
 	return runPinRemote(ctx, pinned_, stdout, stderr, services)
 }
 
@@ -731,7 +743,17 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// commit. A 40-character commit means that commit, which is how a pin accepted by
 	// mistake is undone: the rollback has to be able to name where it is going back
 	// to, and "whatever upstream says now" is not an answer to that question.
-	resolved, err := rules.ResolvePinned(ctx, client, rules.Repository, options.pinRemote)
+	//
+	// The repository is the v2fly one because a pin names the source to re-pin and
+	// this command has no published lock in hand to read a source out of. It is
+	// named rather than left implicit so that the choice is visible, because it is
+	// now a choice: refreshChinaList above resolves the source the PUBLISHED lock
+	// names and then hands this function a commit. While the published primary is
+	// v2fly the two are the same repository and the handoff is sound. The day the
+	// published primary is the dnsmasq source, this function would be asked to
+	// fetch that commit from v2fly, so it has to resolve the source rather than
+	// assume one before a pin can be written at all.
+	resolved, err := rules.ResolvePinned(ctx, client, rules.RepositoryV2Fly, options.pinRemote)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
@@ -745,7 +767,7 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	release, err := services.acquireLock(options.controlLock)
 	if err != nil {
 		if errors.Is(err, filelock.ErrLocked) {
-			writeCLIError(stderr, "update-lists: %s: the control lock is held, not publishing %s", options.controlLock, resolved.Commit)
+			writeCLIError(stderr, "update-lists: %s: the control lock is held, not publishing %s", options.controlLock, resolved.Primary.Commit)
 			return exitLockHeld
 		}
 		writeCLIError(stderr, "update-lists: %v", err)
@@ -777,8 +799,8 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 		return exitStateUnavailable
 	}
 
-	writeReportLine(stdout, "pinned-commit: %s\n", pinned.Commit)
-	writeReportLine(stdout, "pinned-archive-sha256: %s\n", pinned.SHA256)
+	writeReportLine(stdout, "pinned-commit: %s\n", pinned.Primary.Commit)
+	writeReportLine(stdout, "pinned-archive-sha256: %s\n", pinned.Primary.SHA256)
 	writeReportLine(stdout, "pinned-list-sha256: %s\n", pinned.ListSHA256)
 	writeReportLine(stdout, "pinned-rules: %d\n", countListRules(list))
 	writeReportLine(stdout, "published-source-lock: %s\n", options.sourceLock)

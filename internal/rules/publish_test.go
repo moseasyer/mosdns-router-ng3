@@ -20,12 +20,14 @@ const (
 	// byte, and oldLock its lock.
 	oldList = "domain:previous.cn\n"
 	oldLock = `{
-  "schema_version": 1,
-  "repository": "v2fly/domain-list-community",
-  "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "list_sha256": "9de01e827107e3574e096a1cf5b72f675bf30af19f86520697b1a6a4726cf3da",
-  "entry": "data/cn"
+  "schema_version": 2,
+  "primary": {
+    "repository": "v2fly/domain-list-community",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "entry": "data/cn"
+  },
+  "list_sha256": "9de01e827107e3574e096a1cf5b72f675bf30af19f86520697b1a6a4726cf3da"
 }
 `
 	// newList is the candidate list, and newLock the lock that describes it.
@@ -34,11 +36,13 @@ const (
 
 var newLock = SourceLock{
 	SchemaVersion: schemaVersion,
-	Repository:    Repository,
-	Commit:        fixtureCommit,
-	SHA256:        digest([]byte("current archive")),
-	ListSHA256:    digest([]byte(newList)),
-	Entry:         Entry,
+	Primary: SourceRef{
+		Repository: RepositoryV2Fly,
+		Commit:     fixtureCommit,
+		SHA256:     digest([]byte("current archive")),
+		Entry:      V2FlyEntry,
+	},
+	ListSHA256: digest([]byte(newList)),
 }
 
 // publishedPair is a directory holding the last known good lock and list.
@@ -187,7 +191,7 @@ func TestPublishWritesTheListAndTheLockThatDescribesIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadPublishedPair: %v", err)
 	}
-	if !found || lock != newLock || string(list) != newList {
+	if !found || !sameLock(lock, newLock) || string(list) != newList {
 		t.Fatalf("ReadPublishedPair = %+v, %q, %t", lock, list, found)
 	}
 
@@ -628,7 +632,7 @@ func TestPublishRefusesBeforeTouchingAnything(t *testing.T) {
 	wrongDigest := newLock
 	wrongDigest.ListSHA256 = digest([]byte("something else"))
 	unpinned := newLock
-	unpinned.SHA256 = ""
+	unpinned.Primary.SHA256 = ""
 	tests := []struct {
 		name  string
 		lock  SourceLock
@@ -703,11 +707,11 @@ func TestReadPublishedPairReportsWhatItFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	invalidLock := writePublishedPair(t)
-	if err := os.WriteFile(invalidLock.lockPath, []byte(`{"schema_version":1,"repository":"v2fly/domain-list-community","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","entry":"data/cn"}`), 0o640); err != nil {
+	if err := os.WriteFile(invalidLock.lockPath, []byte(`{"schema_version":2,"primary":{"repository":"v2fly/domain-list-community","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","entry":"data/cn"}}`), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	futureLock := writePublishedPair(t)
-	if err := os.WriteFile(futureLock.lockPath, []byte(strings.Replace(oldLock, `"schema_version": 1`, `"schema_version": 99`, 1)), 0o640); err != nil {
+	if err := os.WriteFile(futureLock.lockPath, []byte(strings.Replace(oldLock, `"schema_version": 2`, `"schema_version": 99`, 1)), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	tests := []struct {
@@ -722,7 +726,7 @@ func TestReadPublishedPairReportsWhatItFound(t *testing.T) {
 		{name: "a valid pair", dir: pair.dir, lock: "source-lock.json", list: "cn-domains.txt", wantSet: true},
 		{name: "list does not match its lock", dir: mismatched.dir, lock: "source-lock.json", list: "cn-domains.txt", wantErr: "does not match the list_sha256 the source lock"},
 		{name: "lock is incomplete", dir: invalidLock.dir, lock: "source-lock.json", list: "cn-domains.txt", wantErr: "list_sha256"},
-		{name: "lock is a newer shape", dir: futureLock.dir, lock: "source-lock.json", list: "cn-domains.txt", wantErr: "schema_version"},
+		{name: "lock is a newer shape", dir: futureLock.dir, lock: "source-lock.json", list: "cn-domains.txt", wantErr: "schema version 99"},
 		{name: "lock without a list", dir: pair.dir, lock: "source-lock.json", list: "other.txt", wantErr: "without a list file"},
 		{name: "list without a lock", dir: pair.dir, lock: "other.json", list: "cn-domains.txt", wantErr: "without a source lock"},
 	}
@@ -746,7 +750,7 @@ func TestReadPublishedPairReportsWhatItFound(t *testing.T) {
 				t.Fatalf("ReadPublishedPair found = %t, want %t", found, test.wantSet)
 			case test.wantSet && (string(list) != oldList || lock.ListSHA256 != digest([]byte(oldList))):
 				t.Fatalf("ReadPublishedPair = %+v, %q", lock, list)
-			case test.wantSet == false && (len(list) != 0 || lock != (SourceLock{})):
+			case test.wantSet == false && (len(list) != 0 || !sameLock(lock, SourceLock{})):
 				t.Fatalf("ReadPublishedPair returned %+v, %q for an unpublished pair", lock, list)
 			}
 		})
