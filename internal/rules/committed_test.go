@@ -29,6 +29,14 @@ const (
 	// output.
 	chinaDomain   = "baidu.com"
 	foreignDomain = "www.google.com"
+
+	// disabledUpstreamCommentPrefix is the shape the dnsmasq converter writes a
+	// disabled upstream entry's reason as (chinaconf.go, ConvertChinaConfFS). It
+	// is restated here rather than imported because the converter builds it
+	// inline; if the two ever disagree this gate reports a comment line as one
+	// this package does not write, which is the answer a reader of that failure
+	// needs even though the cause is a changed literal.
+	disabledUpstreamCommentPrefix = "# disabled upstream: "
 )
 
 func TestCommittedSourceLockIsAFullyPinnedReviewedSource(t *testing.T) {
@@ -46,21 +54,23 @@ func TestCommittedSourceLockIsAFullyPinnedReviewedSource(t *testing.T) {
 	if err := lock.Validate(); err != nil {
 		t.Fatalf("the committed source lock is not a complete pin: %v", err)
 	}
-	// The committed pair is the v2fly fallback publication: one reviewed source
-	// as the primary and no supplement. Task 6 re-pins it to the dnsmasq
-	// primary, which is a different primary rather than a different shape.
-	if lock.SchemaVersion != 2 {
-		t.Errorf("committed schema_version = %d, want 2", lock.SchemaVersion)
-	}
-	if lock.Supplement != nil {
-		t.Errorf("the committed lock names a supplement: %+v", lock.Supplement)
-	}
-	if lock.Primary.Repository != RepositoryV2Fly {
-		t.Errorf("committed repository = %q, want %q", lock.Primary.Repository, RepositoryV2Fly)
-	}
-	if lock.Primary.Entry != V2FlyEntry {
-		t.Errorf("committed entry = %q, want %q", lock.Primary.Entry, V2FlyEntry)
-	}
+	// Nothing else about WHICH source is asserted here, and that is the migration
+	// done properly. Under schema 1 "the lock names exactly one reviewed
+	// repository" was a shape, because there was one repository; under schema 2
+	// Validate is what enforces it -- the primary is one of the two reviewed
+	// names, and a supplement may only be the v2fly one -- so restating the
+	// current values here would be a test that fails the moment this repository
+	// re-pins, which is an ordinary operation and not a fault.
+	//
+	// SchemaVersion is not asserted either, and the parse above is why that costs
+	// nothing: ParseSourceLock refuses any version but the current one, so a
+	// committed lock of another version fails before this point with a message
+	// naming the version. An assertion the parse has already made unreachable is
+	// coverage that reads as coverage and cannot fail.
+	//
+	// What the committed pair is pinned to is asserted by shape, next door, in
+	// TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom and
+	// TestTheCommittedSupplementIsTheKindsTheDnsmasqSyntaxCannotExpress.
 	if lock.Primary.Commit == strings.Repeat("0", 40) {
 		t.Error("the committed commit is all zeroes, which is not a reviewed commit")
 	}
@@ -92,16 +102,64 @@ func TestCommittedListIsSortedDeduplicatedAndReadableByMOSDNS(t *testing.T) {
 	text := strings.TrimSuffix(string(list), "\n")
 	lines := strings.Split(text, "\n")
 	forms := make(map[string]int)
+	ruleLines := make([]string, 0, len(lines))
+	comments, blanks := 0, 0
+	inRules := false
 	for number, line := range lines {
-		if err := validateRenderedRule(line); err != nil {
-			t.Fatalf("committed list line %d is not a MOSDNS expression: %v", number+1, err)
+		trimmed := strings.TrimSpace(line)
+		// Three shapes share the file, and each is held to what it actually is.
+		//
+		// A comment line is not an expression MOSDNS will read: its loader
+		// truncates every line at the first `#`, so a comment contributes no rule
+		// and never was what the rule gate is about. It is therefore held to a
+		// different requirement -- that it says where it came from and names no
+		// resolver -- rather than fed to a gate about rule syntax.
+		//
+		// The blank line is renderList's separator between the comment block and
+		// the rules, and it is held to that: exactly one, and only once the
+		// comment block it divides has been written.
+		switch {
+		case trimmed == "":
+			blanks++
+			if blanks > 1 {
+				t.Fatalf("committed list line %d is a second blank line, and renderList writes exactly one", number+1)
+			}
+			if comments == 0 {
+				t.Fatalf("committed list line %d is blank and the list carries no disabled-upstream block to divide", number+1)
+			}
+			inRules = true
+			continue
+		case strings.HasPrefix(trimmed, "#"):
+			comments++
+			if inRules {
+				t.Fatalf("committed list line %d is a comment below the rules, and every comment this package writes is a block above them", number+1)
+			}
+			if !strings.HasPrefix(trimmed, disabledUpstreamCommentPrefix) {
+				t.Fatalf("committed list line %d is a comment this package does not write: %q", number+1, line)
+			}
+			if addressShaped.MatchString(line) {
+				t.Fatalf("committed list line %d carries an address in a comment: %q", number+1, line)
+			}
+		default:
+			inRules = true
+			if err := validateRenderedRule(line); err != nil {
+				t.Fatalf("committed list line %d is not a MOSDNS expression: %v", number+1, err)
+			}
+			forms[strings.SplitN(line, ":", 2)[0]]++
+			ruleLines = append(ruleLines, line)
 		}
-		forms[strings.SplitN(line, ":", 2)[0]]++
 	}
-	if !sort.StringsAreSorted(lines) {
-		t.Errorf("the committed list is not sorted:\nfirst out of order: %s", firstUnsorted(lines))
+	if comments == 0 {
+		t.Fatal("the committed list carries no disabled-upstream comment, so the provenance this plan exists to keep was dropped")
 	}
-	if duplicate := firstDuplicate(lines); duplicate != "" {
+	// The comment block sits at the top of the file, so the document is sorted
+	// whole only because renderList puts the two shapes in that order. What this
+	// gate is about -- a rule out of order -- is a property of the rules alone,
+	// and the rules are what is checked here.
+	if !sort.StringsAreSorted(ruleLines) {
+		t.Errorf("the committed list's rules are not sorted:\nfirst out of order: %s", firstUnsorted(ruleLines))
+	}
+	if duplicate := firstDuplicate(ruleLines); duplicate != "" {
 		t.Errorf("the committed list repeats %q", duplicate)
 	}
 	for _, form := range []string{"domain", "full", "regexp"} {
@@ -132,6 +190,61 @@ func mustReadCommitted(t *testing.T, path string) []byte {
 		t.Fatalf("cannot read the committed %s: %v", path, err)
 	}
 	return contents
+}
+
+func TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom(t *testing.T) {
+	lock, err := ParseSourceLock(mustReadCommitted(t, committedLockPath))
+	if err != nil {
+		t.Fatalf("the committed lock is not one this build can read: %v", err)
+	}
+	if lock.Primary.Repository != RepositoryChina {
+		t.Fatalf("the committed list is pinned to %q, and the primary source is %q",
+			lock.Primary.Repository, RepositoryChina)
+	}
+	if len(lock.Primary.Entries) != 3 {
+		t.Fatalf("the primary names %d entries, want the three the pin covers", len(lock.Primary.Entries))
+	}
+}
+
+func TestTheCommittedSupplementIsTheKindsTheDnsmasqSyntaxCannotExpress(t *testing.T) {
+	lock, err := ParseSourceLock(mustReadCommitted(t, committedLockPath))
+	if err != nil {
+		t.Fatalf("the committed lock is not readable: %v", err)
+	}
+	if lock.Supplement == nil {
+		t.Fatal("no supplement is recorded, and the full:/regexp: rules would be missing from the list")
+	}
+	if lock.Supplement.Repository != RepositoryV2Fly {
+		t.Fatalf("the supplement is %q", lock.Supplement.Repository)
+	}
+	want := map[string]bool{"full": true, "regexp": true}
+	for _, kind := range lock.Supplement.Kinds {
+		if !want[kind] {
+			t.Fatalf("the supplement contributes %q, which the dnsmasq source already provides", kind)
+		}
+	}
+}
+
+func TestTheCommittedListCarriesNoResolverAddress(t *testing.T) {
+	// The upstream names 114DNS on every rule and this project refuses that
+	// choice. A committed list that carried an address would mean the
+	// conversion had started honouring the upstream's resolver.
+	body := string(mustReadCommitted(t, committedListPath))
+	for _, address := range []string{"114.114.114.114", "223.5.5.5", "119.29.29.29"} {
+		if strings.Contains(body, address) {
+			t.Fatalf("the committed China list names %s", address)
+		}
+	}
+}
+
+func TestTheCommittedListKeepsTheRegexpRulesTheDnsmasqSourceCannotExpress(t *testing.T) {
+	// If a regeneration ever dropped the supplement, the list would still
+	// convert and still pass every routing case -- it would just stop matching
+	// AWS China CDN edge names. This is the only gate that sees that.
+	body := string(mustReadCommitted(t, committedListPath))
+	if !strings.Contains(body, "regexp:.+\\.awsdns-cn-") {
+		t.Fatal("the committed list carries no regexp: rule, so the supplement was dropped")
+	}
 }
 
 func firstUnsorted(lines []string) string {
