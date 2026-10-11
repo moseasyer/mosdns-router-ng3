@@ -386,15 +386,8 @@ place packaging/tmpfiles.d/mosdns-router.conf /usr/lib/tmpfiles.d/mosdns-router.
 place packaging/copyright "/usr/share/doc/$PACKAGE/copyright" 644
 place configs/cn-domains.txt /usr/share/mosdns-router/cn-domains.txt 644
 place configs/source-lock.json /usr/share/mosdns-router/source-lock.json 644
-# The fallback pair: a second China list, pinned from the other reviewed source, and
-# the lock that accounts for it. It is what a machine with no route to EITHER
-# repository has to publish, so it is placed and verified here rather than fetched on
-# demand, and it is a pair for the same reason the pair above is a pair. Never
-# re-pinned, exactly as the pair above is not.
-place configs/cn-domains-fallback.txt /usr/share/mosdns-router/cn-domains-fallback.txt 644
-place configs/source-lock-fallback.json /usr/share/mosdns-router/source-lock-fallback.json 644
 # The pinned Cloudflare range document, and the lock that accounts for it. The
-# third of the three pairs this package carries and the reason an installation can
+# second of the two pairs this package carries and the reason an installation can
 # complete on a machine with no route to the internet: the prefix list the
 # response rewriter refuses to construct without comes from one endpoint, so a
 # package that ships no snapshot of it cannot be installed offline at all. It is
@@ -523,12 +516,6 @@ fi
 	echo "cn-domains.txt sha256: $(sha256sum "$STAGE/usr/share/mosdns-router/cn-domains.txt" | cut -d' ' -f1)"
 	echo "The install verifies that digest against list_sha256 in source-lock.json and"
 	echo "never re-pins it; see /etc/mosdns/policy.yaml and mosdns-cdnctl(1)."
-	echo
-	echo "cn-domains-fallback.txt sha256: $(sha256sum "$STAGE/usr/share/mosdns-router/cn-domains-fallback.txt" | cut -d' ' -f1)"
-	echo "The fallback list, pinned from v2fly/domain-list-community, and the list the"
-	echo "install verifies against list_sha256 in source-lock-fallback.json. It is what a"
-	echo "machine with no route to either repository publishes, and it is a different list"
-	echo "from the one above: the two are two pins, not one pin written twice."
 	echo
 	echo "cloudflare-ranges.json sha256: $(sha256sum "$STAGE/usr/share/mosdns-router/cloudflare-ranges.json" | cut -d' ' -f1)"
 	echo "ranges-pinned-at: $(sed -n 's/.*"fetched_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAGE/usr/share/mosdns-router/cloudflare-ranges.lock.json")"

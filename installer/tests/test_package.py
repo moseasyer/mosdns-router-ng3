@@ -136,21 +136,6 @@ SOURCE_LOCK = DATA_DIRECTORY + "/source-lock.json"
 PUBLISHED_LIST = "/var/lib/mosdns/lists/cn-domains.txt"
 PUBLISHED_LOCK = "/var/lib/mosdns/lists/source-lock.json"
 
-# The FALLBACK pair: a second China list and a lock of its own, shipped beside the
-# first and published beside it, so a machine with no route to either repository has
-# two documents it can still run rather than none.
-#
-# It is a different list on purpose, and the pair is shipped as a PAIR because a lock
-# beside a list it does not describe is a record of nothing: the fallback lock carries
-# the fallback's own pin and no supplement, so a reader can tell at a glance which of
-# the two lists on disk is which. Shipping the primary twice would instead put 111,000
-# rules of a repository this machine never fetched on the disk under a name that says
-# it is the fallback.
-FALLBACK_LIST = DATA_DIRECTORY + "/cn-domains-fallback.txt"
-FALLBACK_LOCK = DATA_DIRECTORY + "/source-lock-fallback.json"
-PUBLISHED_FALLBACK_LIST = "/var/lib/mosdns/lists/cn-domains-fallback.txt"
-PUBLISHED_FALLBACK_LOCK = "/var/lib/mosdns/lists/source-lock-fallback.json"
-
 # The pinned Cloudflare range document, and the lock that accounts for it. The
 # second of the two pairs this package carries, and the one that makes an
 # installation with no route to the internet possible: the prefix list the
@@ -202,8 +187,6 @@ MODES = {
     DOC_DIRECTORY + "/copyright": 0o644,
     CHINA_LIST: 0o644,
     SOURCE_LOCK: 0o644,
-    FALLBACK_LIST: 0o644,
-    FALLBACK_LOCK: 0o644,
     RANGES_SNAPSHOT: 0o644,
     RANGES_SNAPSHOT_LOCK: 0o644,
     **{document: 0o644 for document in EDITABLE_DOCUMENTS},
@@ -446,20 +429,18 @@ def address_findings(root, documents=CONFIG_VALUE_DOCUMENTS, inventory=None):
     return findings
 
 
-# The two files the provider scan skips, and why they are not a hole: their bytes
-# are pinned by digest against a lock the package also ships -- one lock each -- and
-# every line of both is checked to be one of the four rule forms the gateway can
-# read, which is what keeps them lists of names rather than anything else.
+# The one file the provider scan skips, and why it is not a hole: its bytes are
+# pinned by digest against a lock the package also ships, and every line of it is
+# checked to be one of the four rule forms the gateway can read, which is what
+# keeps it a list of names rather than anything else.
 #
-# The second one is the fallback list, and it is exempt for the SAME reason rather
-# than because it happens to be a copy: it carries the same domain names, so the
-# same provider host names appear in it as domain NAMES -- `doh.pub` and `alidns`
-# are two of the domains this list is about, not two upstreams this package dials.
-# A scan that reported them would be reporting the list doing its job. What the
-# exemption is not is a general exemption for pinned data: it names two files, the
-# control below reads this table rather than trusting it, and a third file added to
-# it fails there.
-ROUTE_SCAN_EXEMPT = (CHINA_LIST, FALLBACK_LIST)
+# And the bytes the exemption is justified by are CHECKED rather than described,
+# because an exemption naming a file this package no longer ships -- or one whose
+# bytes the lock beside it does not record -- is an exemption with nothing behind
+# it, and nothing in this table would notice. The control below reads this table
+# and both facts out of the repository, so a stale entry fails there rather than
+# quietly exempting nothing.
+ROUTE_SCAN_EXEMPT = (CHINA_LIST,)
 
 # The CLOSED set of provider host names a shipped policy may put in a
 # `foreign.upstreams[].addr`, and the reason it is an allowlist rather than one
@@ -1981,21 +1962,25 @@ def unpinned_pair(list_body, commit="0000000000000000000000000000000000000000"):
     of the published list. So nothing but the overwrite itself can reveal that
     postinst replaced an operator's pin -- which is the whole of the property.
 
-    Schema 2, and in the shape `rules.SourceLock.Encode` writes: a `primary` beside
-    the digest and no `supplement`, because a single-archive publication has no
-    second source to name. This fixture was schema 1 -- a flat document with
-    `repository` and `entry` beside `list_sha256` -- and its docstring claimed it
-    was exactly what `mosdns-cdnctl update-lists --pin-remote` writes. That stopped
-    being true when the lock grew a second source, and nothing noticed, because
-    postinst only ever `sed`s `list_sha256` out of it and the Go side never reads
-    it: a fixture modelling a document this build can neither write nor read, held
-    in place by a gate that reads one field of it and calls it coverage.
+    The shape is the one `internal/rules` writes and reads: `rules.SourceLock`,
+    schema 2, whose `Encode` puts `schema_version`, `primary` and `list_sha256` in
+    the struct's order and OMITS `supplement` entirely when there is none --
+    `Supplement` is a `*SourceRef` carrying `json:"supplement,omitempty"`, so a
+    list converted from one archive has no such key rather than a null one. This
+    fixture used to write schema 1 instead: a flat document with `repository` and
+    `entry` beside `list_sha256`. Nothing noticed for as long as the lock had one
+    source, because `postinst` only ever `sed`s `list_sha256` out of it and the Go
+    side never reads it -- a fixture modelling a document this build can neither
+    write nor read, held in place by a gate that reads one field of it and calls
+    it coverage. `SourceLock` is what is named here rather than a command: this
+    file has read that type and not that command.
 
-    `primary.sha256` is the digest of the ARCHIVE the commit names and a fixture has
-    no archive, so the digest of the commit itself stands in for it -- as it did in
-    the v1 shape, where the field meant the same thing. Nothing in postinst reads
-    it; the Go reader would, and would refuse this document for having no archive
-    behind it, which is the correct answer to a fixture that never fetched one.
+    `primary.sha256` is the digest of the ARCHIVE the commit names, and a fixture
+    has no archive, so the digest of the commit itself stands in for it -- as it
+    did in the v1 shape, where the field meant the same thing. Nothing in postinst
+    reads it. The Go reader would, and would refuse this document for having no
+    archive behind it, which is the right answer to a fixture that never fetched
+    one: the fixture exists to be PLANTED, not to be parsed.
     """
     lock = json.dumps(
         {
@@ -2018,19 +2003,6 @@ def unconditional_publish(text):
     line = 'if [ ! -r "$PUBLISHED_LIST" ] || [ ! -r "$PUBLISHED_LOCK" ]; then'
     if line not in text:
         raise AssertionError(f"postinst does not guard the published pair with {line!r}")
-    return text.replace(line, "if true; then")
-
-
-def unconditional_fallback_publish(text):
-    """`postinst` with the FALLBACK pair published on every run.
-
-    The same mutation as `unconditional_publish` and the same reason for a second
-    copy of it: the two guards name different variables, so a script could carry the
-    first and not the second and every gate written for the first would pass it.
-    """
-    line = 'if [ ! -r "$FALLBACK_PUBLISHED_LIST" ] || [ ! -r "$FALLBACK_PUBLISHED_LOCK" ]; then'
-    if line not in text:
-        raise AssertionError(f"postinst does not guard the published fallback with {line!r}")
     return text.replace(line, "if true; then")
 
 
@@ -3735,17 +3707,6 @@ class PayloadTests(_Staged):
                     f"{name} does not end with a newline, so the last directive is not one",
                 )
 
-    def test_the_package_ships_a_fallback_list_and_its_own_lock(self):
-        """A cold start with no route has to find something to publish.
-
-        Two files rather than one, because a list with no lock beside it is a routing
-        document this project cannot account for, and a lock with no list beside it is
-        a record of nothing. So the pair is the unit here exactly as it is in postinst,
-        and this is where the .deb's own file list says so.
-        """
-        self.assertInstalledFile(FALLBACK_LIST, 0o644)
-        self.assertInstalledFile(FALLBACK_LOCK, 0o644)
-
 
 # --- the shipped documents ---------------------------------------------------
 
@@ -4064,66 +4025,6 @@ class ShippedDocumentTests(_Staged):
             + "\n".join(f"  {finding}" for finding in findings[:5]),
         )
 
-    def test_the_fallback_pair_is_a_complete_v2_lock_of_its_own(self):
-        """A fallback lock is a document in its own right, not a copy of the primary's.
-
-        Read with the shape `internal/rules` writes and reads -- schema 2, one
-        `primary`, no supplement -- because the two documents sitting on one machine
-        describe two different pins and a reader has to be able to tell them apart.
-        """
-        self.assertInstalledFile(FALLBACK_LOCK, 0o644)
-        lock = json.loads(self.read(FALLBACK_LOCK))
-        self.assertEqual(lock["schema_version"], 2)
-        self.assertEqual(lock["primary"]["repository"], "v2fly/domain-list-community")
-        self.assertEqual(lock["primary"]["entry"], "data/cn")
-        # A fallback lock that carried a supplement, or a reader told to expect one
-        # beside the fallback, would let a reader believe the fallback and the live
-        # list are the same pin: the field is ABSENT rather than null because
-        # `SourceLock.Supplement` carries `omitempty`, so a single-archive lock
-        # omits the key entirely. An assertion reading `lock["primary"]["supplement"]`
-        # would pass for every document there is, including one carrying a supplement.
-        self.assertNotIn("supplement", lock)
-        self.assertEqual(
-            lock["list_sha256"],
-            hashlib.sha256(self.read_bytes(FALLBACK_LIST)).hexdigest(),
-            "the shipped fallback lock does not record the digest of the fallback list "
-            "beside it, so this package cannot account for the rules in it",
-        )
-
-    def test_neither_list_names_a_resolver_address(self):
-        """Both lists, and both read as rules -- a list of names, never of addresses.
-
-        The fallback is a second copy of the same job, so it carries the same risk as
-        the first and gets the same gate; a package that ships two routing documents
-        and checks one of them has checked half of what it ships.
-        """
-        for path in (CHINA_LIST, FALLBACK_LIST):
-            with self.subTest(list=path):
-                self.assertInstalledFile(path, 0o644)
-                findings = china_list_findings(self.read(path))
-                self.assertEqual(
-                    findings[:5], [],
-                    f"{len(findings)} line(s) of {path} are not a rule the gateway can read:\n"
-                    + "\n".join(f"  {finding}" for finding in findings[:5]),
-                )
-
-    def test_the_fallback_is_the_v2fly_list_and_the_primary_is_not(self):
-        """They are two different lists on purpose, and the fallback is its own source.
-
-        Shipping the primary twice would mean a machine that publishes the fallback
-        publishes 111k rules of something it never fetched. The right-hand side is the
-        committed SOURCE of the fallback rather than the primary, because the two
-        documents are identical for as long as the primary is still v2fly -- which is
-        exactly now -- and a comparison against the primary would pass for a fallback
-        that had been replaced with it.
-        """
-        self.assertInstalledFile(FALLBACK_LIST, 0o644)
-        committed = (REPO / "configs" / "cn-domains-fallback.txt").read_text(encoding="utf-8")
-        self.assertEqual(
-            self.read(FALLBACK_LIST), committed,
-            "the shipped fallback is not the committed v2fly snapshot it is pinned to",
-        )
-
 
 # --- what must not be in the package ----------------------------------------
 
@@ -4229,19 +4130,16 @@ class ForbiddenContentTests(_Staged):
         # so an operator switching transport has not switched provider.
         self.assertIn("dns.quad9.net", ROUTE_ALLOWED_PROVIDERS)
 
-    def test_the_provider_scan_exempts_exactly_the_two_files_that_may_name_them(self):
-        """An exemption is a hole in the gate, so the hole is two named files, it
-        is asserted to be exactly those two, and each is pinned by digest and
-        checked line by line rather than merely trusted."""
-        self.assertEqual(ROUTE_SCAN_EXEMPT, (CHINA_LIST, FALLBACK_LIST))
-        for exempt in ROUTE_SCAN_EXEMPT:
-            with self.subTest(exempt=exempt):
-                self.assertNotIn(
-                    exempt, COMPILED,
-                    f"{exempt} is a text file and must not be exempt twice over",
-                )
+    def test_the_provider_scan_exempts_exactly_the_one_file_that_may_name_them(self):
+        """An exemption is a hole in the gate, so the hole is one named file, it is
+        asserted to be one file, and that file is pinned by digest and checked line
+        by line rather than merely trusted."""
+        self.assertEqual(ROUTE_SCAN_EXEMPT, (CHINA_LIST,))
+        self.assertNotIn(
+            CHINA_LIST, COMPILED,
+            "the China list is a text file and must not be exempt twice over",
+        )
         self.assertTrue((REPO / "configs" / "cn-domains.txt").is_file())
-        self.assertTrue((REPO / "configs" / "cn-domains-fallback.txt").is_file())
 
     def test_every_address_a_shipped_document_names_is_one_this_package_may_configure(self):
         """An allowlist, not the denylist above, and the reason is that a denylist
@@ -5000,16 +4898,14 @@ class MaintainerScriptTests(_Staged):
     def shipped_pair(self):
         """The pinned files the package carries, as the staged tree holds them.
 
-        All six, and the name is historical: STEP 3 reads the China pair, the
-        fallback pair and the range pair, and the sandbox plants every shipped file
-        the step names, so a fixture that supplied four of the six would fail before
-        the step ran rather than quietly verifying nothing.
+        All four, and the name is historical: STEP 3 reads the China pair and the
+        range pair, and the sandbox plants every shipped file the step names, so a
+        fixture that supplied two of the four would fail before the step ran
+        rather than quietly verifying nothing.
         """
         return {
             "SOURCE_LIST": self.read(CHINA_LIST),
             "SOURCE_LOCK": self.read(SOURCE_LOCK),
-            "FALLBACK_SOURCE_LIST": self.read(FALLBACK_LIST),
-            "FALLBACK_SOURCE_LOCK": self.read(FALLBACK_LOCK),
             "SOURCE_RANGES": self.read(RANGES_SNAPSHOT),
             "SOURCE_RANGES_LOCK": self.read(RANGES_SNAPSHOT_LOCK),
         }
@@ -5093,132 +4989,6 @@ class MaintainerScriptTests(_Staged):
                 shipped[source],
                 f"the pair was not placed even though the lock was unreadable ({name})",
             )
-
-    def test_postinst_places_the_fallback_pair_only_when_it_is_absent(self):
-        """The fallback pair is the operator's too, and it is placed on the same rule.
-
-        It is not enough for the fallback pair to be shipped: a machine with no
-        route to either repository can only publish what is already on its disk, and
-        what is on its disk is what postinst placed. So this is the behaviour the
-        whole pair exists for, run the way the step runs it -- a differing and
-        internally consistent pair is left exactly as it was found, and a pair that
-        is absent or half-present is placed whole, because one half of it is not a
-        record of anything.
-
-        The three cases are here so a script that simply never publishes anything
-        cannot pass: absent, the pair is placed.
-        """
-        shipped = self.shipped_pair()
-        list_body, lock_body = unpinned_pair("domain:operator.example\n")
-        # The sandbox plants by ABSOLUTE PATH, so the variable name is resolved to the
-        # path the script uses before anything is written. Keying the plant by the
-        # variable NAME instead plants a file the step cannot see, and the case that
-        # is supposed to prove the pair is left alone then proves the opposite: the
-        # step never found the operator's pair and placed its own over it.
-        paths = {
-            "FALLBACK_PUBLISHED_LIST": PUBLISHED_FALLBACK_LIST,
-            "FALLBACK_PUBLISHED_LOCK": PUBLISHED_FALLBACK_LOCK,
-        }
-        pinned = {"FALLBACK_PUBLISHED_LIST": list_body, "FALLBACK_PUBLISHED_LOCK": lock_body}
-        cases = {
-            "differing": (pinned, pinned),
-            "absent": ({}, {}),
-            # The lock describes the list beside it, so the two are placed together
-            # or not at all.
-            "lock-only": ({"FALLBACK_PUBLISHED_LOCK": lock_body}, {}),
-        }
-        for label, (before, expected) in cases.items():
-            with self.subTest(published=label):
-                _root, variables, completed = sandboxed_postinst_step(
-                    3,
-                    {paths[name]: body for name, body in before.items()},
-                    shipped,
-                    text=SCRIPTS["postinst"].read_text(),
-                )
-                self.assertEqual(
-                    completed.returncode, 0,
-                    f"the pinned-data step failed on a {label} fallback pair: "
-                    f"{completed.stdout}{completed.stderr}",
-                )
-                for name, source in (
-                    ("FALLBACK_PUBLISHED_LIST", "FALLBACK_SOURCE_LIST"),
-                    ("FALLBACK_PUBLISHED_LOCK", "FALLBACK_SOURCE_LOCK"),
-                ):
-                    self.assertEqual(
-                        Path(variables[name]).read_text(encoding="utf-8"),
-                        expected.get(name, shipped[source]),
-                        f"the {label} case did not leave the fallback {name} as it should have",
-                    )
-        # And the install pattern, which a run in a sandbox cannot see because its
-        # `install` is shimmed: the fallback is published exactly as the primary is --
-        # root-owned, the state group, 0640 -- so the list-check identity can read a
-        # document the optimizer replaces and no unprivileged process can change it.
-        # The comparison is against the PRIMARY'S OWN line rather than against a
-        # spelling written here, so "the same install pattern" is checked against
-        # what the script really does for the pair above.
-        text = SCRIPTS["postinst"].read_text()
-        primary_install = (
-            'install -o root -g "$STATE_GROUP" -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"'
-        )
-        self.assertTrue(primary_install in text, "the primary's own publish line has changed")
-        for published, source in (
-            ("FALLBACK_PUBLISHED_LIST", "FALLBACK_SOURCE_LIST"),
-            ("FALLBACK_PUBLISHED_LOCK", "FALLBACK_SOURCE_LOCK"),
-        ):
-            with self.subTest(published=published):
-                # `assertTrue(needle in text)` rather than `assertIn`, because
-                # `assertIn` prints the whole haystack -- and the haystack here is
-                # every line of postinst, which buries the sentence that says what
-                # is wrong.
-                self.assertTrue(
-                    primary_install.replace("SOURCE_LIST", source)
-                    .replace("PUBLISHED_LIST", published) in text,
-                    f"postinst does not publish {source} at ${published} the way it "
-                    f"publishes the primary",
-                )
-
-    def test_postinst_refuses_a_fallback_list_its_own_lock_does_not_account_for(self):
-        """A second list is a second routing document, and it gets the same accounting.
-
-        The primary pair's digest check reads the PUBLISHED pair, because that is the
-        list the router is about to read. Nothing on a cold start has read the
-        fallback yet, so the claim postinst can make about it is the narrower one it
-        makes about the range snapshot: the bytes this package carries are the bytes
-        the lock beside them records. A mismatch means a damaged archive rather than
-        an operator's state, so the way out is reinstalling and not re-pinning -- and
-        it is refused BEFORE the pair is placed, so nothing unverifiable is published.
-        """
-        shipped = self.shipped_pair()
-        corrupted = shipped["FALLBACK_SOURCE_LIST"] + "domain:not-in-the-lock.example\n"
-        _root, variables, completed = sandboxed_postinst_step(
-            3, {}, {**shipped, "FALLBACK_SOURCE_LIST": corrupted},
-            text=SCRIPTS["postinst"].read_text(),
-        )
-        self.assertEqual(
-            completed.returncode, 1,
-            "a fallback list the lock beside it does not account for was accepted: "
-            f"{completed.stdout}{completed.stderr}",
-        )
-        self.assertIn(
-            FALLBACK_LIST, completed.stderr,
-            "the refusal does not name the file this project cannot account for",
-        )
-        self.assertIn(
-            hashlib.sha256(corrupted.encode("utf-8")).hexdigest(), completed.stderr,
-            "the refusal does not print the digest it computed, so nobody can see which "
-            "of the two it is talking about",
-        )
-        self.assertIn(
-            "dpkg", completed.stderr,
-            "the refusal does not name the way out, and both files belong to dpkg rather "
-            "than to an operator's pin",
-        )
-        # And it refuses BEFORE it places, rather than publishing and then complaining:
-        # a package that cannot account for a list is not allowed to put one on disk.
-        self.assertFalse(
-            Path(variables["FALLBACK_PUBLISHED_LIST"]).exists(),
-            "the unverifiable fallback list was published before the refusal",
-        )
 
     def test_postinst_verifies_the_pinned_range_snapshot_and_refuses_a_mismatch(self):
         """The digest check the China list has, applied to the ranges.
@@ -6219,22 +5989,6 @@ class BuildTests(_Staged):
                     f"the manifest does not record the {committed} digest that was built against",
                 )
 
-    def test_the_manifest_records_the_fallback_list_beside_the_list_it_ships(self):
-        """The manifest is where an operator looks to find out what a .deb was built
-        from, and a pin it does not mention is a pin nobody can check against the
-        archive they were given. The fallback is a second such pin and it is named
-        under its own field, so the two lists on a machine are not one line of
-        provenance between them.
-        """
-        text = self.read(BUILD_MANIFEST)
-        self.assertInstalledFile(FALLBACK_LIST, 0o644)
-        self.assertIn(
-            "cn-domains-fallback.txt sha256: "
-            + hashlib.sha256(self.read_bytes(FALLBACK_LIST)).hexdigest(),
-            text,
-            "the manifest records no digest for the fallback list this package ships",
-        )
-
     def test_the_programs_the_build_verifies_with_are_the_programs_it_ships(self):
         """Same source, same flags, same architecture, differing only in `-o`.
 
@@ -6600,15 +6354,14 @@ class ControlTests(unittest.TestCase):
     pattern, a reversed tmpfiles entry, a tmpfiles entry with no default ACL, a
     space-separated ACL, a reap pattern that matches too much, a routing document
     that is not the render, a manifest entry that is not shipped, and a provider-scan
-    exemption that has grown. On the MAINTAINER SCRIPTS, eleven: a dpkg Policy 6.5 verb
-    that is missing, a published pair an operator re-pinned, a published FALLBACK pair an
-    operator re-pinned, a capture closed before
+    exemption that has grown. On the MAINTAINER SCRIPTS, ten: a dpkg Policy 6.5 verb
+    that is missing, a published pair an operator re-pinned, a capture closed before
     its arms, an `if`/`elif` chain in place of the `case`, a hard-coded capture, the
     timers enabled before the transaction, a reversed provisioning order, a directory
     created without its group, the mode this plan itself first named, and prerm's two
     refusals flattened into one sentence.
 
-    FOUR OF THOSE THIRTY-ONE are about a third thing -- a VERIFIER rather than a tree or a
+    FIVE OF THOSE THIRTY-ONE are about a third thing -- a VERIFIER rather than a tree or a
     script, because a reader that cannot read a shape is also a gate that cannot fail
     -- and they are named here because the group is a SUBSET of the two above and
     not a third set of cases: the missing-policy-verb case
@@ -6880,6 +6633,47 @@ class ControlTests(unittest.TestCase):
             self.assertIn("failed-upgrade", SCRIPTS["postrm"].read_text() or "")
             self.assertTrue(policy_verb_findings("postrm", SCRIPTS["postrm"].read_text()))
 
+    def test_the_planted_pair_fixture_writes_a_document_this_build_can_read(self):
+        """The control for the fixture the pair tests plant, because nothing else holds it.
+
+        `unpinned_pair` wrote a schema-1 lock for as long as this project's locks had
+        one source -- a flat document with `repository` and `entry` beside
+        `list_sha256`, which `rules.ParseSourceLock` refuses and `rules.SourceLock`
+        cannot produce. Every test that plants it passed anyway, because postinst only
+        ever `sed`s `list_sha256` out of the document it is given and never hands it
+        to the Go reader. A fixture that models a document the build can neither write
+        nor read is invisible to every gate that plants it, which is why this case
+        exists rather than another assertion inside one of those two tests.
+
+        The shape is what is asserted, and the limit is stated rather than hidden: the
+        parser is Go and this suite is Python, so the test holds the fixture to the
+        document `SourceLock.Encode` emits -- `schema_version`, `primary`, no
+        `supplement` key at all, `list_sha256` -- which is the shape the two tests
+        that plant this fixture are really about. `internal/rules`' own cases hold
+        the parser's half.
+        """
+        _list_body, lock_body = unpinned_pair("domain:operator.example\n")
+        document = json.loads(lock_body)
+        self.assertEqual(document["schema_version"], 2)
+        self.assertEqual(
+            sorted(document), ["list_sha256", "primary", "schema_version"],
+            "the fixture's lock is not the document `SourceLock.Encode` writes",
+        )
+        self.assertEqual(
+            sorted(document["primary"]), ["commit", "entry", "repository", "sha256"],
+            "the fixture's primary is not a `rules.SourceRef`",
+        )
+        # `omitempty`, so the key is ABSENT rather than null: a fixture carrying a
+        # null there would be a document the Go encoder never writes and would teach
+        # the next reader that a single-archive lock spells it that way.
+        self.assertNotIn("supplement", document)
+        self.assertEqual(
+            document["list_sha256"],
+            hashlib.sha256(b"domain:operator.example\n").hexdigest(),
+            "the fixture's pair is not self-consistent, which is the one property every "
+            "test that plants it is actually about",
+        )
+
     def test_a_pair_an_operator_re_pinned_is_reported_by_the_method(self):
         """The control for the published-pair gate, and the reason it is behavioural.
 
@@ -6925,41 +6719,6 @@ class ControlTests(unittest.TestCase):
             broken,
             f"the publish of the pair is gone entirely, so this is not the old script "
             f"but a different defect; the group it names is {names['group']}",
-        )
-
-    def test_a_fallback_pair_an_operator_replaced_is_reported_by_the_method(self):
-        """The control for the fallback pair's guard, and the reason it is a separate test.
-
-        Two guards that name two different variables are two gates, and the second one
-        arrived after the first was written, reviewed and controlled. A postinst that
-        placed the fallback pair on every `configure` would still satisfy every gate
-        written for the primary pair: the re-pinning tokens are absent from it, the
-        install lines have the right shape, and the primary's behaviour is untouched.
-        So the fallback's guard is removed and the METHOD is asked to fail.
-        """
-        broken = unconditional_fallback_publish(SCRIPTS["postinst"].read_text())
-        self.assertMethodFails(
-            MaintainerScriptTests,
-            "test_postinst_places_the_fallback_pair_only_when_it_is_absent",
-            postinst=broken,
-            staged={},
-        )
-        # The mutation really removed the guard, and really left the publish in place.
-        # A control that removed something else would pass against a script that was
-        # never defective, which is the defect this class exists to make impossible.
-        self.assertIn("if true; then", broken)
-        self.assertNotIn(
-            'if [ ! -r "$FALLBACK_PUBLISHED_LIST" ] || [ ! -r "$FALLBACK_PUBLISHED_LOCK" ]; then',
-            broken,
-            "the mutation did not remove the fallback guard, so this control would pass "
-            "against a script that was never defective",
-        )
-        self.assertIn(
-            'install -o root -g "$STATE_GROUP" -m 0640 "$FALLBACK_SOURCE_LIST" '
-            '"$FALLBACK_PUBLISHED_LIST"',
-            broken,
-            "the publish of the fallback pair is gone entirely, so this is not the old "
-            "script but a different defect",
         )
 
     def test_a_capture_closed_before_the_arms_is_reported_by_the_method(self):
@@ -7402,35 +7161,31 @@ class ControlTests(unittest.TestCase):
             )
 
     def test_the_provider_scan_exemption_cannot_silently_grow(self):
-        """The exemption is a hole in the gate, so it is a named table and this
+        """The exemption is a hole in the gate, so it is one named file and this
         test reads the table rather than trusting it."""
         self.assertEqual(
-            ROUTE_SCAN_EXEMPT, (CHINA_LIST, FALLBACK_LIST),
-            "a file is exempt from the provider scan that nobody decided on, or one of "
-            "these two is not exempt any more",
+            ROUTE_SCAN_EXEMPT, (CHINA_LIST,),
+            "a second file is exempt from the provider scan, and nobody decided on it",
         )
-        for exempt, source in (
-            (CHINA_LIST, "cn-domains.txt"),
-            (FALLBACK_LIST, "cn-domains-fallback.txt"),
-        ):
-            with self.subTest(exempt=exempt):
-                # The exemption is justified by a REVIEWED SOURCE and a LOCK, so a
-                # package exempting a file nobody re-pins is a hole with nothing
-                # behind it. Both are named here rather than inferred.
-                self.assertEqual(
-                    (REPO / "configs" / source).is_file(), True,
-                    f"the exempt {exempt}'s reviewed source has to exist",
-                )
-                lock = (
-                    REPO / "configs"
-                    / ("source-lock.json" if exempt == CHINA_LIST else "source-lock-fallback.json")
-                )
-                self.assertEqual(
-                    hashlib.sha256((REPO / "configs" / source).read_bytes()).hexdigest(),
-                    json.loads(lock.read_text(encoding="utf-8"))["list_sha256"],
-                    f"{exempt} is exempt from the provider scan but {lock.name} does not "
-                    f"record its digest, which is the reason the exemption is not a hole",
-                )
+        # And the ONE entry is not a stale one. An exemption is justified by three
+        # facts, and only the first of them was checked: the file the table names is
+        # the file this package still ships, its reviewed source exists, and its
+        # bytes are the bytes the lock beside it records. A table entry naming a file
+        # this package stopped shipping exempts nothing and looks like coverage; one
+        # naming a file whose digest the lock does not record exempts an unaccounted
+        # document. Neither is visible in a gate that skips the path silently, so
+        # both are read here.
+        self.assertEqual(
+            (REPO / "configs" / "cn-domains.txt").is_file(), True,
+            "the one exempt file's reviewed source has to exist",
+        )
+        lock = json.loads((REPO / "configs" / "source-lock.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            hashlib.sha256((REPO / "configs" / "cn-domains.txt").read_bytes()).hexdigest(),
+            lock["list_sha256"],
+            "the exempt file's source is not the bytes its lock records, so the exemption "
+            "is not justified by a pinned document",
+        )
 
     def test_a_manifest_entry_that_is_not_shipped_is_reported(self):
         listed = {destination for _s, destination in manifest_entries(MANIFEST.read_text())}

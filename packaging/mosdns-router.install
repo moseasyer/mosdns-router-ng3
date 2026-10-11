@@ -92,17 +92,9 @@ packaging/man/mosdns-cdnctl.1              /usr/share/man/man1/mosdns-cdnctl.1.g
 packaging/man/dnscrypt-proxy.8             /usr/share/man/man8/dnscrypt-proxy.8.gz
 configs/cn-domains.txt                    /usr/share/mosdns-router/cn-domains.txt
 configs/source-lock.json                  /usr/share/mosdns-router/source-lock.json
-# The fallback pair: a second China list, pinned from the other reviewed source, and
-# the lock that accounts for it. Shipped as a pair for the reason the pair above is:
-# a list with no lock beside it is a document nothing can account for. Its reason for
-# existing is a machine with no route to either repository, which otherwise has
-# nothing at all to publish; the install places it only when it is absent, exactly as
-# it does the pair above, and verifies it rather than re-pinning it.
-configs/cn-domains-fallback.txt           /usr/share/mosdns-router/cn-domains-fallback.txt
-configs/source-lock-fallback.json         /usr/share/mosdns-router/source-lock-fallback.json
 # The pinned Cloudflare range document and the lock that accounts for it, which is
 # what lets this package install on a machine with no route to the internet. It is
-# verified at install and never re-pinned, exactly as the four files above are.
+# verified at install and never re-pinned, exactly as the two files above are.
 configs/cloudflare-ranges.json            /usr/share/mosdns-router/cloudflare-ranges.json
 configs/cloudflare-ranges.lock.json       /usr/share/mosdns-router/cloudflare-ranges.lock.json
 
