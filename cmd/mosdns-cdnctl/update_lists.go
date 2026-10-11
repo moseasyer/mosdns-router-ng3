@@ -242,8 +242,18 @@ type updateListOptions struct {
 	// policy, which is the file the rest of this package renders from, so a scheduled
 	// run and a hand-run render cannot disagree about what the machine is configured
 	// to do.
-	policy        string
-	pinRemote     string
+	policy    string
+	pinRemote string
+	// pinRepository is the source a pin resolves against. It is empty for a pin
+	// an operator asked for by name, which is resolved against whatever the
+	// published lock names; refreshChinaList sets it to the source it measured,
+	// so the commit it hands on is fetched from the repository that commit is in.
+	//
+	// The field exists because the two callers of runPinRemote had no other way
+	// to agree on a repository, and the one that passes a commit resolved from
+	// the lock had to hand over a repository too. Task 4 replaces this string
+	// with the primary/supplement refs the lock actually carries.
+	pinRepository string
 	refreshRanges bool
 	sourceLock    string
 	listFile      string
@@ -734,6 +744,10 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// mechanism built to prevent exactly that.
 	pinned_ := options
 	pinned_.pinRemote = resolved.Primary.Commit
+	// The repository travels with the commit. Handing over the commit alone would
+	// have runPinRemote resolve it against the v2fly default, and a commit id is
+	// not a repository: the same 40 characters name one file in one of them.
+	pinned_.pinRepository = resolved.Primary.Repository
 	return runPinRemote(ctx, pinned_, stdout, stderr, services)
 }
 
@@ -744,16 +758,32 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// mistake is undone: the rollback has to be able to name where it is going back
 	// to, and "whatever upstream says now" is not an answer to that question.
 	//
-	// The repository is the v2fly one because a pin names the source to re-pin and
-	// this command has no published lock in hand to read a source out of. It is
-	// named rather than left implicit so that the choice is visible, because it is
-	// now a choice: refreshChinaList above resolves the source the PUBLISHED lock
-	// names and then hands this function a commit. While the published primary is
-	// v2fly the two are the same repository and the handoff is sound. The day the
-	// published primary is the dnsmasq source, this function would be asked to
-	// fetch that commit from v2fly, so it has to resolve the source rather than
-	// assume one before a pin can be written at all.
-	resolved, err := rules.ResolvePinned(ctx, client, rules.RepositoryV2Fly, options.pinRemote)
+	// A repository the caller named wins, because a commit and the repository it
+	// was resolved in travel together: refreshChinaList measures one source and
+	// hands this function its commit, and resolving that commit against any other
+	// repository would verify a digest against an archive the commit is not in.
+	repository := options.pinRepository
+	if repository == "" {
+		// Nothing named one, so the published lock does.
+		published, _, found, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile)
+		if readErr != nil {
+			// A pair that cannot be read refuses the run either way -- the
+			// publish path below reads it again and reports the same error -- so
+			// this is reported here rather than swallowed into a default that
+			// would fetch an archive the operator's machine cannot then use.
+			writeCLIError(stderr, "update-lists: %v", readErr)
+			return exitStateUnavailable
+		}
+		if found {
+			repository = published.Primary.Repository
+		} else {
+			// Nothing published yet is a first install, and nothing on this
+			// machine says which source to install, so the reviewed default is
+			// the whole answer rather than a guess.
+			repository = rules.RepositoryV2Fly
+		}
+	}
+	resolved, err := rules.ResolvePinned(ctx, client, repository, options.pinRemote)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable

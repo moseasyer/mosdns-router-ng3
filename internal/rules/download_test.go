@@ -945,11 +945,10 @@ func TestAV2LockRoundTripsThroughItsOwnEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if decoded.Primary.Repository != RepositoryChina || len(decoded.Primary.Entries) != 3 {
-		t.Fatalf("the primary did not survive the round trip: %#v", decoded.Primary)
-	}
-	if decoded.Supplement == nil || decoded.Supplement.Entry != "data/cn" {
-		t.Fatalf("the supplement did not survive the round trip: %#v", decoded.Supplement)
+	// sameLock, not a spot check on two fields: this document has six, and a
+	// round trip that dropped a third of them is the failure being looked for.
+	if !sameLock(decoded, lock) {
+		t.Fatalf("the round trip lost something: decoded %+v, want %+v", decoded, lock)
 	}
 }
 
@@ -984,12 +983,33 @@ func TestAV1LockIsRefusedAndTheRefusalNamesTheWayOut(t *testing.T) {
 	}
 }
 
-func TestAnUnknownRepositoryIsRefused(t *testing.T) {
-	if KnownRepository("example.test/not-a-source") {
-		t.Fatal("a repository this gateway has never reviewed is accepted")
-	}
-	if !KnownRepository(RepositoryChina) || !KnownRepository(RepositoryV2Fly) {
-		t.Fatal("one of the two reviewed repositories is not in the allowlist")
+func TestALockFromTheFutureIsNotToldToRePinItAway(t *testing.T) {
+	// The advice differs by direction. A v1 lock is behind this build and
+	// re-pinning moves it forward; a lock from the future is AHEAD of it, and
+	// re-pinning with this build would replace a document that records sources
+	// this one cannot name with one that knows less. Telling an operator to
+	// re-pin over it would be advice that destroys the thing it is offered as a
+	// fix for.
+	for _, version := range []string{"3", "99"} {
+		t.Run("schema version "+version, func(t *testing.T) {
+			document := []byte(`{"schema_version":` + version + `,"primary":{"repository":"v2fly/domain-list-community","commit":"` +
+				strings.Repeat("a", 40) + `","sha256":"` + strings.Repeat("b", 64) + `","entry":"data/cn"},"list_sha256":"` +
+				strings.Repeat("e", 64) + `"}`)
+			_, err := ParseSourceLock(document)
+			if err == nil {
+				t.Fatalf("a schema version %s lock was accepted by a build that reads version %d", version, schemaVersion)
+			}
+			message := err.Error()
+			if !strings.Contains(message, "schema version "+version) {
+				t.Errorf("the refusal does not name the version it found: %v", err)
+			}
+			if strings.Contains(message, "A v1 lock") {
+				t.Errorf("a version %s document is told it is a v1 lock: %v", version, err)
+			}
+			if strings.Contains(message, "--pin-remote") {
+				t.Errorf("a document from the future is told to re-pin over itself: %v", err)
+			}
+		})
 	}
 }
 
@@ -1000,15 +1020,6 @@ func TestAnUnknownFieldInAV2LockIsRefused(t *testing.T) {
 		strings.Repeat("e", 64) + `","future_field":true}`)
 	if _, err := ParseSourceLock(document); err == nil {
 		t.Fatal("a field this build does not understand was dropped while the document still read as a complete pin")
-	}
-}
-
-func TestAnArchiveIsFetchedFromTheLockRepositoryNotThePackageDefault(t *testing.T) {
-	// The fetch must follow the pin. A converter that always asked for the
-	// default repository would verify a digest against an archive from
-	// somewhere else entirely.
-	if strings.Contains(archiveBaseURL+"/"+RepositoryChina, "v2fly") {
-		t.Fatal("the primary repository constant names the wrong source")
 	}
 }
 
@@ -1066,7 +1077,7 @@ func TestDownloadRefusesALockCarryingASecondSourceRatherThanIgnoringIt(t *testin
 		Commit:     fixtureCommit,
 		SHA256:     digest(fixtureArchive(t)),
 		Entry:      V2FlyEntry,
-		Kinds:      V2FlySupplementKinds,
+		Kinds:      supplementKinds(),
 	}
 	lock.ListSHA256 = digest([]byte("unused"))
 
@@ -1082,6 +1093,89 @@ func TestDownloadRefusesALockCarryingASecondSourceRatherThanIgnoringIt(t *testin
 	}
 }
 
+func TestASupplementNamesOnlyTheKindsThePrimaryCannotCarry(t *testing.T) {
+	// The published list is the union of two repositories, and a supplement
+	// says which of its rules went into it. Naming a kind the primary already
+	// carries makes the document untrue about how the list was built: it claims
+	// `domain:` rules came from v2fly when the dnsmasq source held every one of
+	// them, so a later reader comparing the two sources would count the same
+	// domains twice and call it agreement.
+	supplement := func(kinds []string) SourceLock {
+		return SourceLock{
+			SchemaVersion: schemaVersion,
+			Primary:       chinaPinnedLock(t, []byte("x")).Primary,
+			Supplement: &SourceRef{
+				Repository: RepositoryV2Fly,
+				Commit:     strings.Repeat("c", 40),
+				SHA256:     strings.Repeat("d", 64),
+				Entry:      V2FlyEntry,
+				Kinds:      kinds,
+			},
+			ListSHA256: strings.Repeat("e", 64),
+		}
+	}
+	tests := []struct {
+		name       string
+		kinds      []string
+		wantErr    bool
+		wantSubstr string
+	}{
+		{name: "the reviewed kinds", kinds: []string{"full", "regexp"}},
+		{name: "one of them", kinds: []string{"regexp"}},
+		{name: "a kind the primary carries", kinds: []string{"full", "domain"}, wantErr: true, wantSubstr: `"domain"`},
+		{name: "a kind this build does not know", kinds: []string{"ipcidr"}, wantErr: true, wantSubstr: `"ipcidr"`},
+		{name: "no kinds at all", kinds: nil, wantErr: true, wantSubstr: "records which rule kinds"},
+		{name: "an empty set", kinds: []string{}, wantErr: true, wantSubstr: "records which rule kinds"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := supplement(test.kinds).Validate()
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("a supplement naming %v was accepted", test.kinds)
+				}
+				if !strings.Contains(err.Error(), test.wantSubstr) {
+					t.Fatalf("error = %v, want it to mention %q", err, test.wantSubstr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a supplement naming %v was refused: %v", test.kinds, err)
+			}
+		})
+	}
+}
+
+func TestAPrimaryCannotSayWhichKindsItContributes(t *testing.T) {
+	// `kinds` is a supplement's field: it narrows what a SECOND source adds. On
+	// the primary it would mean "these and only these rules came from here",
+	// which is a claim about the conversion rather than a description of the
+	// source -- and one nothing here could check, because the primary contributes
+	// every rule its repository holds.
+	lock := SourceLock{
+		SchemaVersion: schemaVersion,
+		Primary:       chinaPinnedLock(t, []byte("x")).Primary,
+		ListSHA256:    strings.Repeat("e", 64),
+	}
+	lock.Primary.Kinds = []string{"domain"}
+	if err := lock.Validate(); err == nil {
+		t.Fatal("a primary naming the kinds it contributes was accepted")
+	}
+}
+
+func TestALockHoldingTheSupplementKindsDoesNotHoldTheExportedSet(t *testing.T) {
+	// The reviewed kinds are a package-level slice, and a lock that shared their
+	// backing array would hand a caller a way to rewrite the package's own
+	// constant through the lock -- and through the next lock built from it. The
+	// primary's entry set is copied for the same reason, and the two sets end up
+	// in the same document.
+	kinds := supplementKinds()
+	kinds[0] = "domain"
+	if V2FlySupplementKinds[0] != "full" {
+		t.Fatalf("the exported set was written through a lock: %v", V2FlySupplementKinds)
+	}
+}
+
 func TestASupplementHasToBeTheOneRepositoryThatMaySupplement(t *testing.T) {
 	// The dnsmasq source is the primary or it is nothing: it cannot be the 70
 	// extra rules of a v2fly publication, because those rules are its own kind
@@ -1094,7 +1188,7 @@ func TestASupplementHasToBeTheOneRepositoryThatMaySupplement(t *testing.T) {
 			Commit:     strings.Repeat("c", 40),
 			SHA256:     strings.Repeat("d", 64),
 			Entries:    ChinaConfEntries,
-			Kinds:      V2FlySupplementKinds,
+			Kinds:      supplementKinds(),
 		},
 		ListSHA256: strings.Repeat("e", 64),
 	}

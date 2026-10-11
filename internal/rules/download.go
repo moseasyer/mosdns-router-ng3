@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 	"time"
 )
@@ -71,7 +72,21 @@ const (
 // `domain:` rule already means, so the syntax has no room for an exact match or
 // for a regular expression. A kind the primary does carry would contribute a
 // second spelling of a rule the published list already holds.
+//
+// It is a slice, so nothing may put it into a SourceRef directly: see
+// supplementKinds, which is the only way this package hands the set out.
 var V2FlySupplementKinds = []string{"full", "regexp"}
+
+// supplementKinds returns a copy of the kinds a v2fly supplement may contribute.
+//
+// The copy is the same defence entriesFor makes, for the same reason. A lock
+// that shared the backing array of a package-level slice would hand its holder a
+// way to rewrite that slice in place, and the next lock built from it would
+// carry whatever the previous holder wrote there. The lock is the document a
+// later reader trusts, so it must not alias a mutable value.
+func supplementKinds() []string {
+	return append([]string(nil), V2FlySupplementKinds...)
+}
 
 // KnownRepository reports whether this gateway has reviewed name as a source.
 //
@@ -93,8 +108,8 @@ func KnownRepository(name string) bool {
 // checked rather than inferred, because a lock that named both, or named the
 // wrong one, would be a pin of something nobody read.
 //
-// Kinds is only meaningful on a supplement, and is what it contributes rather
-// than what the repository holds.
+// Kinds narrows what a SUPPLEMENT contributes, and a primary names none: both
+// are checked, and a doc comment saying so is not what enforces it.
 type SourceRef struct {
 	Repository string   `json:"repository"`
 	Commit     string   `json:"commit"`
@@ -160,12 +175,8 @@ func ParseSourceLock(data []byte) (SourceLock, error) {
 		return SourceLock{}, fmt.Errorf("decode source lock: %w", err)
 	}
 	if version.SchemaVersion != schemaVersion {
-		return SourceLock{}, fmt.Errorf(
-			"source lock is schema version %d and this build reads version %d. A v1 lock names one "+
-				"repository and one entry; this list is published from two, so reading the old "+
-				"document as the new one would make a lock that reads complete mean something it does "+
-				"not say. Re-pin it with `mosdns-cdnctl update-lists --pin-remote HEAD`",
-			version.SchemaVersion, schemaVersion)
+		return SourceLock{}, fmt.Errorf("source lock is schema version %d and this build reads version %d. %s",
+			version.SchemaVersion, schemaVersion, whyVersionIsRefused(version.SchemaVersion))
 	}
 
 	lock := SourceLock{}
@@ -179,6 +190,27 @@ func ParseSourceLock(data []byte) (SourceLock, error) {
 		return SourceLock{}, errors.New("decode source lock: trailing data after the document")
 	}
 	return lock, nil
+}
+
+// whyVersionIsRefused explains a version this build does not read, and says
+// what to do about it.
+//
+// The advice differs by DIRECTION, which is why this is not one sentence: an
+// older lock is behind this build and re-pinning moves it forward, while a newer
+// one is ahead of it, and re-pinning with this build would replace a document
+// that records things this one cannot with one that knows less. So a v1 lock is
+// named as v1 and told the command that fixes it; anything else is told the
+// version it actually is and told not to re-pin it away.
+func whyVersionIsRefused(version int) string {
+	if version == 1 {
+		return "A v1 lock names one repository and one entry; this list is published from two, " +
+			"so reading the old document as the new one would make a lock that reads complete " +
+			"mean something it does not say. Re-pin it with " +
+			"`mosdns-cdnctl update-lists --pin-remote HEAD`"
+	}
+	return "This build cannot account for a lock of another shape, and re-pinning with it would " +
+		"replace a document that knows things this one does not. Upgrade the gateway instead of " +
+		"re-pinning over it"
 }
 
 // Validate reports whether a published lock is complete. It is used when a lock
@@ -203,6 +235,13 @@ func (l SourceLock) validatePinnedSource() error {
 	if err := l.validateRef(&l.Primary); err != nil {
 		return fmt.Errorf("primary: %w", err)
 	}
+	if len(l.Primary.Kinds) != 0 {
+		// `kinds` is a supplement's field, so on the primary it is a claim about
+		// the conversion rather than a description of the source -- and one that
+		// nothing here could check, because the primary contributes every rule
+		// its repository holds.
+		return errors.New("primary: kinds names what a SUPPLEMENT contributes; the primary contributes everything its repository holds")
+	}
 	if l.Supplement != nil {
 		if l.Supplement.Repository != RepositoryV2Fly {
 			return fmt.Errorf("supplement: repository %q is not the only source allowed as a supplement", l.Supplement.Repository)
@@ -210,17 +249,45 @@ func (l SourceLock) validatePinnedSource() error {
 		if err := l.validateRef(l.Supplement); err != nil {
 			return fmt.Errorf("supplement: %w", err)
 		}
-		if l.Supplement.Kinds == nil {
-			return errors.New("supplement: a supplement records which rule kinds it contributed")
+		if err := validateSupplementKinds(l.Supplement.Kinds); err != nil {
+			return fmt.Errorf("supplement: %w", err)
 		}
 	}
 	return nil
 }
 
-// validateRef checks one source ref. The schema version is checked here rather
-// than once per document because a v2 document with a v1 version is a document
-// this build cannot account for whatever else it says, and a lock with no
-// sources at all still has to fail for that reason first.
+// validateSupplementKinds reports whether kinds are the ones a supplement may
+// contribute.
+//
+// It is an allowlist rather than "some kinds are fine" because the field says
+// what went into the published list from a second source. A kind the primary
+// already carries makes the document untrue about how the list was built: it
+// attributes `domain:` rules to v2fly when the dnsmasq source held every one of
+// them, so a later reader comparing the two sources would count the same domains
+// twice and read the agreement as coverage. A kind this build does not know is
+// worse still: it is a rule form no converter here will ever emit, so the lock
+// promises a contribution nothing can produce.
+func validateSupplementKinds(kinds []string) error {
+	if len(kinds) == 0 {
+		return errors.New("a supplement records which rule kinds it contributed")
+	}
+	for _, kind := range kinds {
+		if !slices.Contains(V2FlySupplementKinds, kind) {
+			return fmt.Errorf("kind %q is not one of the kinds a supplement contributes %v", kind, V2FlySupplementKinds)
+		}
+	}
+	return nil
+}
+
+// validateRef checks everything a source ref must satisfy apart from what it
+// contributes, which only means something on one of the two roles: the primary
+// contributes everything its repository holds and names no kinds, while a
+// supplement contributes the kinds it names and is checked by its caller.
+//
+// The schema version is checked here rather than once per document because a v2
+// document with a v1 version is a document this build cannot account for
+// whatever else it says, and a lock with no sources at all still has to fail for
+// that reason first.
 func (l SourceLock) validateRef(ref *SourceRef) error {
 	if l.SchemaVersion != schemaVersion {
 		return fmt.Errorf("schema_version %d is not the supported version %d", l.SchemaVersion, schemaVersion)
@@ -451,6 +518,14 @@ func normalizeCommitRef(ref string) (string, bool) {
 // repository would verify the pinned digest against an archive from somewhere
 // else entirely, and the two would agree only while the default happened to be
 // the source the lock named.
+//
+// It publishes ONE source. A lock that names a supplement is refused, even
+// though Validate accepts it: this build reads one archive and the document
+// shape for two is ahead of what it can satisfy. Carrying on would publish the
+// primary alone beside a lock that says the supplement's rules are in it, and
+// every domain the supplement contributes would silently take the foreign
+// branch. The union that makes such a lock satisfiable is the change that
+// removes the refusal -- and until it lands, refusing is the honest answer.
 func Download(ctx context.Context, client *http.Client, lock SourceLock) (SourceLock, []byte, error) {
 	if err := lock.validatePinnedSource(); err != nil {
 		return SourceLock{}, nil, fmt.Errorf("source lock: %w", err)
@@ -522,9 +597,16 @@ func convertSource(fsys fs.FS, ref SourceRef) ([]string, error) {
 }
 
 // renderList renders converted expressions as the exact bytes a list file
-// holds: one expression per line, each line terminated. A line beginning with
-// '#' is a comment upstream gave and this package kept, and is written by the
-// same rule as a rule is, because the loader reads both the same way.
+// holds: one expression per line, each line terminated.
+//
+// A line beginning with '#' is an upstream's own disabled entry and the reason
+// it gave, kept so the published list carries upstream's record rather than only
+// its rules. It is written by the same line rule, and it is NOT a rule: the
+// loader truncates at '#' and skips what is left empty, so a comment line
+// contributes no domain to the matcher. `validateRenderedRule` -- the gate the
+// committed list is held to -- does not accept a '#' at all, so a list carrying
+// comments is refused by that gate until it is taught the shape. That is a known
+// conflict, not a contradiction here.
 func renderList(expressions []string) []byte {
 	var rendered bytes.Buffer
 	for _, expression := range expressions {

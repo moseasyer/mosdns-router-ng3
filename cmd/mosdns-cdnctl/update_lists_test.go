@@ -41,14 +41,26 @@ const (
 	sharedList = "regexp:^static[0-9]+\\.example\\.cn$\n"
 )
 
+// fakeSource is one repository the origin will answer for.
+type fakeSource struct {
+	// head is what /commits/HEAD answers for this repository.
+	head string
+	// archives is what the origin holds for this repository, keyed by commit.
+	archives map[string][]byte
+}
+
 // fakeOrigin is a GitHub-shaped test origin: it publishes one commit for HEAD,
 // and serves a source archive only for the commits it holds one for.
+//
+// It answers for SEVERAL repositories rather than one. An origin that knows a
+// single repository's tar.gz prefix cannot observe a request for another one at
+// all -- the request 404s and the test passes either way -- which is how a
+// fixture ends up modelling a machine that has only ever had one source.
 type fakeOrigin struct {
 	server *httptest.Server
 	client *http.Client
-	head   string
-	// archives is what the origin can serve, keyed by commit.
-	archives map[string][]byte
+	// sources is what the origin can serve, keyed by repository.
+	sources  map[string]fakeSource
 	status   int
 	requests []string
 	// onServe runs before each answer, so a case can make the origin answer
@@ -63,11 +75,38 @@ type fakeOrigin struct {
 
 func newFakeOrigin(t *testing.T, head string, archives map[string][]byte) *fakeOrigin {
 	t.Helper()
-	origin := &fakeOrigin{head: head, archives: archives, status: http.StatusOK}
+	return newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryV2Fly: {head: head, archives: archives},
+	})
+}
+
+func newFakeOriginSources(t *testing.T, sources map[string]fakeSource) *fakeOrigin {
+	t.Helper()
+	origin := &fakeOrigin{sources: make(map[string]fakeSource, len(sources)), status: http.StatusOK}
+	for repository, source := range sources {
+		origin.sources[repository] = source
+	}
 	origin.server = httptest.NewServer(http.HandlerFunc(origin.serve))
 	t.Cleanup(origin.server.Close)
 	origin.client = rewritingClient(t, origin.server.URL)
 	return origin
+}
+
+// setArchives replaces what the origin can serve for one repository, so a case
+// that arranges a different archive does not have to reach into a map it does
+// not own.
+func (o *fakeOrigin) setArchives(repository string, archives map[string][]byte) {
+	source := o.sources[repository]
+	source.archives = archives
+	o.sources[repository] = source
+}
+
+// setHead replaces the commit the origin publishes for one repository's default
+// branch.
+func (o *fakeOrigin) setHead(repository, head string) {
+	source := o.sources[repository]
+	source.head = head
+	o.sources[repository] = source
 }
 
 func (o *fakeOrigin) serve(writer http.ResponseWriter, request *http.Request) {
@@ -79,8 +118,13 @@ func (o *fakeOrigin) serve(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(o.status)
 		return
 	}
-	if commit, ok := strings.CutPrefix(request.URL.Path, "/v2fly/domain-list-community/tar.gz/"); ok {
-		archive, known := o.archives[commit]
+	repository := repositoryOfPath(request.URL.Path)
+	if repository == "" {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if commit, isArchive := strings.CutPrefix(request.URL.Path, archivePrefix(repository)); isArchive {
+		archive, known := o.sources[repository].archives[commit]
 		if !known {
 			writer.WriteHeader(http.StatusNotFound)
 			return
@@ -90,12 +134,37 @@ func (o *fakeOrigin) serve(writer http.ResponseWriter, request *http.Request) {
 		_, _ = writer.Write(archive)
 		return
 	}
-	if !strings.HasSuffix(request.URL.Path, "/commits/HEAD") {
+	if request.URL.Path != o.commitPath(repository) {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
-	_, _ = io.WriteString(writer, fmt.Sprintf(`{"sha":%q,"node_id":"C_1","parents":[]}`, o.head))
+	_, _ = io.WriteString(writer, fmt.Sprintf(`{"sha":%q,"node_id":"C_1","parents":[]}`, o.sources[repository].head))
+}
+
+// archivePrefix is the codeload path a repository's source archives live under.
+func archivePrefix(repository string) string {
+	return "/" + repository + "/tar.gz/"
+}
+
+// repositoryOfPath returns the `owner/name` a codeload or API path names, or "".
+//
+// A repository name has two segments, and the API prefixes the pair with
+// `/repos`, so the pair is taken from the front after that prefix is dropped.
+// Reading one segment would yield `felixonmars` for every request and answer
+// with one repository's commit whatever was asked for.
+func repositoryOfPath(path string) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	trimmed = strings.TrimPrefix(trimmed, "repos/")
+	owner, rest, found := strings.Cut(trimmed, "/")
+	if !found {
+		return ""
+	}
+	name, _, _ := strings.Cut(rest, "/")
+	if name == "" {
+		return ""
+	}
+	return owner + "/" + name
 }
 
 func (o *fakeOrigin) fetched(path string) bool {
@@ -107,12 +176,12 @@ func (o *fakeOrigin) fetched(path string) bool {
 	return false
 }
 
-func (o *fakeOrigin) archivePath(commit string) string {
-	return "/v2fly/domain-list-community/tar.gz/" + commit
+func (o *fakeOrigin) archivePath(repository, commit string) string {
+	return archivePrefix(repository) + commit
 }
 
-func (o *fakeOrigin) commitPath() string {
-	return "/repos/" + rules.RepositoryV2Fly + "/commits/HEAD"
+func (o *fakeOrigin) commitPath(repository string) string {
+	return "/repos/" + repository + "/commits/HEAD"
 }
 
 // rewritingClient sends every request to the test origin, so the command under
@@ -138,21 +207,83 @@ func (r rewriteTo) RoundTrip(request *http.Request) (*http.Response, error) {
 	return r.inner.RoundTrip(next)
 }
 
+// publishChinaPair writes a valid lock whose PRIMARY is the dnsmasq source, so
+// a test starts from a machine pinned to the other reviewed source.
+//
+// It exists because publishPair is v2fly at all 25 of its call sites: a fixture
+// that only ever holds one repository cannot observe whether the command asked
+// that repository or the other one, so every check and refresh test would pass
+// identically whichever the code named.
+func publishChinaPair(t *testing.T, paths listPaths, commit string, list []byte) {
+	t.Helper()
+	lock := rules.SourceLock{
+		SchemaVersion: 2,
+		Primary: rules.SourceRef{
+			Repository: rules.RepositoryChina,
+			Commit:     commit,
+			SHA256:     sha256Hex([]byte("the archive " + commit)),
+			Entries:    append([]string(nil), rules.ChinaConfEntries...),
+		},
+		ListSHA256: sha256Hex(list),
+	}
+	encoded, err := lock.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.sourceLock, encoded, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.listFile, list, 0o640); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // sourceArchive builds a source archive for a commit, carrying the lists it is
 // given under the single top-level directory GitHub names them with.
 func sourceArchive(t *testing.T, commit, cnList string) []byte {
 	t.Helper()
-	var compressed bytes.Buffer
-	gzipWriter := gzip.NewWriter(&compressed)
-	tarWriter := tar.NewWriter(gzipWriter)
-	files := map[string]string{
+	return sourceArchiveUnder(t, "domain-list-community-"+commit, map[string]string{
 		"data/cn":     cnList,
 		"data/shared": sharedList,
 		"README.md":   "# fixture\n",
+	})
+}
+
+// chinaSourceArchive builds a dnsmasq source archive for a commit: the three
+// files the pin names, under the top-level directory THAT repository's source
+// archive is named after. The address is not the one upstream really uses, so a
+// converter that published it could not pass by publishing the right value.
+func chinaSourceArchive(t *testing.T, commit, domains string) []byte {
+	t.Helper()
+	// The fixture argument is a MOSDNS list; it is turned back into the dnsmasq
+	// lines upstream writes, so a case can state the domains it expects to end
+	// up published without restating them in the other syntax.
+	var primary strings.Builder
+	for _, domain := range strings.Split(strings.TrimSuffix(domains, "\n"), "\n") {
+		if domain == "" {
+			continue
+		}
+		primary.WriteString("server=/" + strings.TrimPrefix(domain, "domain:") + "/203.0.113.7\n")
 	}
+	files := map[string]string{
+		rules.ChinaConfEntries[0]: primary.String(),
+		rules.ChinaConfEntries[1]: "server=/apple.cn/203.0.113.7\n",
+		rules.ChinaConfEntries[2]: "server=/google.cn/203.0.113.7\n",
+	}
+	return sourceArchiveUnder(t, "dnsmasq-china-list-"+commit, files)
+}
+
+// sourceArchiveUnder builds a source archive whose single top-level directory is
+// root, which is what proves an extractor that looks for the wrong repository's
+// directory refuses it rather than converting a subset of it.
+func sourceArchiveUnder(t *testing.T, root string, files map[string]string) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressed)
+	tarWriter := tar.NewWriter(gzipWriter)
 	for name, body := range files {
 		header := &tar.Header{
-			Name:     "domain-list-community-" + commit + "/" + name,
+			Name:     root + "/" + name,
 			Mode:     0o644,
 			Size:     int64(len(body)),
 			Typeflag: tar.TypeReg,
@@ -341,7 +472,7 @@ func TestUpdateListsCheckReportsAnUnchangedSourceWithoutFetchingTheArchive(t *te
 			t.Errorf("check output does not report %q:\n%s", want, stdout)
 		}
 	}
-	if origin.fetched(origin.archivePath(lockedCommit)) {
+	if origin.fetched(origin.archivePath(rules.RepositoryV2Fly, lockedCommit)) {
 		t.Error("check downloaded the archive although the locked commit is unchanged")
 	}
 	if stderr != "" {
@@ -377,7 +508,7 @@ func TestUpdateListsCheckReportsDriftWithTheRemoteArchiveDigest(t *testing.T) {
 			t.Errorf("drift report does not include %q:\n%s", want, stdout)
 		}
 	}
-	if !origin.fetched(origin.archivePath(remoteCommit)) {
+	if !origin.fetched(origin.archivePath(rules.RepositoryV2Fly, remoteCommit)) {
 		t.Errorf("drift report did not read the remote archive: %v", origin.requests)
 	}
 	assertUnchanged(t, before, paths.dir, "")
@@ -568,19 +699,19 @@ func TestUpdateListsPinRemoteKeepsTheInstalledPairOnEveryFailure(t *testing.T) {
 			name: "the remote has no such archive",
 			arrange: func(t *testing.T, paths listPaths, origin *fakeOrigin) {
 				// The origin publishes a commit it cannot serve an archive for.
-				origin.archives = map[string][]byte{lockedCommit: sourceArchive(t, lockedCommit, firstInstallArchive)}
+				origin.setArchives(rules.RepositoryV2Fly, map[string][]byte{lockedCommit: sourceArchive(t, lockedCommit, firstInstallArchive)})
 			},
 		},
 		{
 			name: "the archive is not the list the gateway understands",
 			arrange: func(t *testing.T, paths listPaths, origin *fakeOrigin) {
-				origin.archives = map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, "ip4:1.2.3.4\n")}
+				origin.setArchives(rules.RepositoryV2Fly, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, "ip4:1.2.3.4\n")})
 			},
 		},
 		{
 			name: "the archive does not carry the pinned entry",
 			arrange: func(t *testing.T, paths listPaths, origin *fakeOrigin) {
-				origin.archives = map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, "# nothing here\n")}
+				origin.setArchives(rules.RepositoryV2Fly, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, "# nothing here\n")})
 			},
 		},
 		{
@@ -718,7 +849,7 @@ func TestPinRemotePublishesTheNamedCommitRatherThanTheRemoteHead(t *testing.T) {
 	// round trip, and one that needed it would fail on a machine that can reach the
 	// archive host but not the API -- which is the situation an operator doing this
 	// is most likely to be in.
-	if origin.fetched(origin.commitPath()) {
+	if origin.fetched(origin.commitPath(rules.RepositoryV2Fly)) {
 		t.Errorf("pinning a named commit asked the API for HEAD: %v", origin.requests)
 	}
 }
@@ -991,6 +1122,154 @@ func TestUpdateListsCheckWritesNoPartialReportWhenTheDriftedArchiveCannotBeRead(
 		t.Errorf("refusal does not name the commit it could not read an archive for: %q", stderr)
 	}
 	assertUnchanged(t, before, paths.dir, "")
+}
+
+func TestTheCheckAsksTheRepositoryThePublishedLockNames(t *testing.T) {
+	// "Has upstream moved on from what this machine pinned" is a question about
+	// one repository. A check that asked the v2fly one about a list built from
+	// the dnsmasq source would answer a question nobody asked: it would report a
+	// commit, and an up-to-date verdict, about a source this machine is not
+	// running. Both facts are visible here because the origin records every path
+	// it was asked for, and the two repositories are distinguishable paths.
+	paths := newListPaths(t)
+	published := []byte("domain:previous.cn\n")
+	publishChinaPair(t, paths, lockedCommit, published)
+	before := snapshot(t, paths.dir)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, firstInstallArchive),
+			},
+		},
+		rules.RepositoryV2Fly: {head: lockedCommit},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	if want := origin.commitPath(rules.RepositoryChina); !origin.fetched(want) {
+		t.Fatalf("--check fetched %v, want the HEAD of the repository the lock names %q", origin.requests, want)
+	}
+	if other := origin.commitPath(rules.RepositoryV2Fly); origin.fetched(other) {
+		t.Fatalf("--check fetched %q, which is not the source this list was published from", other)
+	}
+	// The archive follows the same question: a drifted check reports the digest
+	// the new pin WOULD record, and that archive is the pinned source's.
+	if want := origin.archivePath(rules.RepositoryChina, remoteCommit); !origin.fetched(want) {
+		t.Fatalf("--check fetched %v, want the archive at %q", origin.requests, want)
+	}
+	if other := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(other) {
+		t.Fatalf("--check fetched %q, which belongs to a source this list was not published from", other)
+	}
+	for _, want := range []string{"repository: " + rules.RepositoryChina, "entries: " + strings.Join(rules.ChinaConfEntries, " "), "up-to-date: false"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("check output does not report %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "entry: ") {
+		t.Errorf("check reported a single entry for a source that has none:\n%s", stdout)
+	}
+	if stderr != "" {
+		t.Errorf("check wrote a diagnostic: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
+func TestAPinTakesTheRepositoryFromThePublishedLockWhenNothingNamesIt(t *testing.T) {
+	// A pin asked for by name has no other way to learn which source this machine
+	// runs: the published lock is the only document here that says so. Asking a
+	// different repository would fetch an archive of another source's content
+	// and publish it under a lock naming the source the operator already had.
+	paths := newListPaths(t)
+	installed := []byte("domain:previous.cn\n")
+	publishChinaPair(t, paths, lockedCommit, installed)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, "domain:repinned.cn\n"),
+			},
+		},
+		rules.RepositoryV2Fly: {head: remoteCommit},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	if want := origin.archivePath(rules.RepositoryChina, lockedCommit); !origin.fetched(want) {
+		t.Fatalf("the pin fetched %v, want the archive at %q", origin.requests, want)
+	}
+	if other := origin.archivePath(rules.RepositoryV2Fly, lockedCommit); origin.fetched(other) {
+		t.Fatalf("the pin fetched %q, which belongs to a source this machine does not run", other)
+	}
+	published, err := rules.ParseSourceLock(mustReadFile(t, paths.sourceLock))
+	if err != nil {
+		t.Fatalf("parse the published lock: %v", err)
+	}
+	if published.Primary.Repository != rules.RepositoryChina {
+		t.Errorf("the published lock names %q, want %q", published.Primary.Repository, rules.RepositoryChina)
+	}
+}
+
+func TestTheUnattendedRefreshResolvesAndPublishesFromThePinnedRepository(t *testing.T) {
+	// The refresh measures one source and then hands its commit to the pin
+	// path. Both halves have to be about the same repository: a commit id names
+	// a file inside one of them, so resolving the measured commit against the
+	// other would verify a digest against an archive the commit is not in. This
+	// is the case that fails loudly, at the publish, after the whole unattended
+	// run has been built on the wrong repository.
+	paths := newListPaths(t)
+	installed := []byte("domain:previous.cn\n")
+	publishChinaPair(t, paths, lockedCommit, installed)
+	policy := automaticPolicy(t, true, false)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:refreshed.cn\n"),
+			},
+		},
+		rules.RepositoryV2Fly: {head: lockedCommit},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--automatic", "--policy", policy,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	for _, path := range []string{
+		origin.commitPath(rules.RepositoryChina),
+		origin.archivePath(rules.RepositoryChina, remoteCommit),
+	} {
+		if !origin.fetched(path) {
+			t.Errorf("--automatic fetched %v, want %q", origin.requests, path)
+		}
+	}
+	for _, path := range []string{
+		origin.commitPath(rules.RepositoryV2Fly),
+		origin.archivePath(rules.RepositoryV2Fly, remoteCommit),
+	} {
+		if origin.fetched(path) {
+			t.Errorf("--automatic fetched %q, which belongs to a source this list was not published from", path)
+		}
+	}
+	if !strings.Contains(stdout, "pinned-commit: "+remoteCommit) {
+		t.Errorf("the refresh did not publish the measured commit:\n%s", stdout)
+	}
+	published, err := rules.ParseSourceLock(mustReadFile(t, paths.sourceLock))
+	if err != nil {
+		t.Fatalf("parse the published lock: %v", err)
+	}
+	if published.Primary.Repository != rules.RepositoryChina || published.Primary.Commit != remoteCommit {
+		t.Errorf("the published lock names %+v, want the dnsmasq source at %s", published.Primary, remoteCommit)
+	}
 }
 
 // --- unattended refresh -------------------------------------------------
@@ -1292,7 +1571,7 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 		}
 		resolutions++
 		if resolutions >= 4 {
-			o.head = collapsed
+			o.setHead(rules.RepositoryV2Fly, collapsed)
 		}
 	}
 	code, _, stderr := runCLI(t, origin.services(), "--automatic",
