@@ -238,6 +238,34 @@ func publishChinaPair(t *testing.T, paths listPaths, commit string, list []byte)
 	}
 }
 
+// publishV1Pair writes the pair a machine carried BEFORE this build existed: a
+// schema version 1 lock and the list it describes.
+//
+// It exists because the deadlock it models is the whole point. A v1 lock is
+// refused by ParseSourceLock, and the refusal tells the operator to run
+// `update-lists --pin-remote`. If that command also refuses a v1 lock on disk,
+// the message sends the operator into a command that cannot succeed, and the
+// only way out is editing a file by hand. No other fixture can produce this
+// state: publishPair writes v2 at all 25 of its call sites.
+func publishV1Pair(t *testing.T, paths listPaths, commit string, list []byte) {
+	t.Helper()
+	lock := `{
+  "schema_version": 1,
+  "repository": "` + rules.RepositoryV2Fly + `",
+  "commit": "` + commit + `",
+  "sha256": "` + sha256Hex([]byte("the archive "+commit)) + `",
+  "list_sha256": "` + sha256Hex(list) + `",
+  "entry": "` + rules.V2FlyEntry + `"
+}
+`
+	if err := os.WriteFile(paths.sourceLock, []byte(lock), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.listFile, list, 0o640); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // sourceArchive builds a source archive for a commit, carrying the lists it is
 // given under the single top-level directory GitHub names them with.
 func sourceArchive(t *testing.T, commit, cnList string) []byte {
@@ -1176,6 +1204,131 @@ func TestTheCheckAsksTheRepositoryThePublishedLockNames(t *testing.T) {
 		t.Errorf("check wrote a diagnostic: %q", stderr)
 	}
 	assertUnchanged(t, before, paths.dir, "")
+}
+
+func TestAMachineOnAV1LockCanFollowTheRefusalItIsGiven(t *testing.T) {
+	// This is the deadlock. ParseSourceLock refuses a v1 lock and names
+	// `update-lists --pin-remote` as the way out; if that command also refuses a
+	// v1 pair on disk, the message sends the operator into a refusal, and the
+	// only recovery is hand-editing a file. So the refusal's own advice has to
+	// work: an operator who names the source re-pins onto a v2 lock.
+	//
+	// The source is named on the command line rather than read from the pair,
+	// because the pair is exactly what cannot be read.
+	paths := newListPaths(t)
+	publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote on a v1 pair exited %d, want %d (stderr: %s)\nstdout: %s", code, exitSuccess, stderr, stdout)
+	}
+
+	// The published lock must be a v2 document this build can read back, not
+	// merely a file that changed.
+	published, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatalf("the published pair cannot be read after the re-pin: %v", err)
+	}
+	if !found {
+		t.Fatal("nothing is published after the re-pin")
+	}
+	if published.SchemaVersion != 2 {
+		t.Errorf("the published lock is schema version %d, want 2", published.SchemaVersion)
+	}
+	if published.Primary.Repository != rules.RepositoryV2Fly || published.Primary.Commit != remoteCommit {
+		t.Errorf("the published lock names %+v, want v2fly at %s", published.Primary, remoteCommit)
+	}
+	if got := sha256Hex(list); got != published.ListSHA256 {
+		t.Errorf("the published list digest is %s and the lock records %s", got, published.ListSHA256)
+	}
+	if !strings.Contains(stdout, "pinned-commit: "+remoteCommit) {
+		t.Errorf("the re-pin did not report the commit it published:\n%s", stdout)
+	}
+}
+
+// The flag's value becomes a path in a URL, so it is checked against the
+// allowlist where a caller supplies it rather than where the fetch would use it.
+func TestTheSourceFlagIsRefusedUnlessItNamesAReviewedRepository(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "v2fly", args: []string{"--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly}},
+		{name: "the dnsmasq source", args: []string{"--pin-remote", "HEAD", "--pin-source", rules.RepositoryChina}},
+		{name: "a commit with the source", args: []string{"--pin-remote", lockedCommit, "--pin-source", rules.RepositoryChina}},
+		{name: "an unreviewed repository", args: []string{"--pin-remote", "HEAD", "--pin-source", "attacker/domain-list"}, wantErr: "is not a reviewed source"},
+		{name: "the owner without the name", args: []string{"--pin-remote", "HEAD", "--pin-source", "felixonmars"}, wantErr: "is not a reviewed source"},
+		{name: "a path traversal", args: []string{"--pin-remote", "HEAD", "--pin-source", "../v2fly/domain-list-community"}, wantErr: "is not a reviewed source"},
+		{name: "the right name in another case", args: []string{"--pin-remote", "HEAD", "--pin-source", "V2Fly/domain-list-community"}, wantErr: "is not a reviewed source"},
+		{name: "without a pin", args: []string{"--pin-source", rules.RepositoryV2Fly}, wantErr: "requires --pin-remote"},
+		{name: "with a check instead", args: []string{"--check", "--pin-source", rules.RepositoryV2Fly}, wantErr: "requires --pin-remote"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseUpdateListOptions(io.Discard, test.args)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("the flag set was refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("the flag set was accepted, want a refusal naming %q", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %v, want it to mention %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+// The refusal names the command an operator can actually run, flag and all: a
+// message that omits the flag names a command that deadlocks on the same lock.
+func TestTheV1RefusalNamesACommandThatWorks(t *testing.T) {
+	v1 := []byte(`{"schema_version":1,"repository":"v2fly/domain-list-community","commit":"` +
+		strings.Repeat("a", 40) + `","sha256":"` + strings.Repeat("b", 64) +
+		`","list_sha256":"` + strings.Repeat("e", 64) + `","entry":"data/cn"}`)
+	_, err := rules.ParseSourceLock(v1)
+	if err == nil {
+		t.Fatal("a v1 lock was accepted")
+	}
+	if !strings.Contains(err.Error(), "--pin-remote HEAD --pin-source") {
+		t.Fatalf("the refusal names a command that cannot follow it, because it omits the flag that names the source: %v", err)
+	}
+}
+
+// Without the flag there is no way to answer which repository, so the refusal
+// has to say that rather than naming a repository nobody asked about.
+func TestARefusalToDefaultTheRepositoryNamesTheFlagThatWouldHaveWorked(t *testing.T) {
+	paths := newListPaths(t)
+	publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code == exitSuccess {
+		t.Fatal("--pin-remote published over a v1 pair without being told which source to use")
+	}
+	if !strings.Contains(stderr, "--pin-source") {
+		t.Fatalf("the refusal does not say which flag would have worked: %q", stderr)
+	}
+	if !strings.Contains(stderr, rules.RepositoryV2Fly) || !strings.Contains(stderr, rules.RepositoryChina) {
+		t.Fatalf("the refusal does not name the sources it would accept: %q", stderr)
+	}
 }
 
 func TestAPinTakesTheRepositoryFromThePublishedLockWhenNothingNamesIt(t *testing.T) {

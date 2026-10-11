@@ -201,12 +201,20 @@ func ParseSourceLock(data []byte) (SourceLock, error) {
 // that records things this one cannot with one that knows less. So a v1 lock is
 // named as v1 and told the command that fixes it; anything else is told the
 // version it actually is and told not to re-pin it away.
+//
+// The command names `--pin-source` because the plain form cannot be followed: a
+// machine on a v1 lock has no readable lock to say which repository to pin, so
+// `--pin-remote` alone refuses the same document this message is about. A
+// refusal that names a command which cannot succeed sends the operator to run
+// something and read a refusal, which is worse than naming no command at all.
 func whyVersionIsRefused(version int) string {
 	if version == 1 {
 		return "A v1 lock names one repository and one entry; this list is published from two, " +
 			"so reading the old document as the new one would make a lock that reads complete " +
-			"mean something it does not say. Re-pin it with " +
-			"`mosdns-cdnctl update-lists --pin-remote HEAD`"
+			"mean something it does not say. Name the source and re-pin with " +
+			"`mosdns-cdnctl update-lists --pin-remote HEAD --pin-source <repository>`, where the " +
+			"repository is one of " + RepositoryV2Fly + " or " + RepositoryChina + " -- the flag is " +
+			"required here because a v1 lock cannot say which repository this machine was running"
 	}
 	return "This build cannot account for a lock of another shape, and re-pinning with it would " +
 		"replace a document that knows things this one does not. Upgrade the gateway instead of " +

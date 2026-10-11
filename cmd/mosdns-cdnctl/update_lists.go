@@ -244,10 +244,15 @@ type updateListOptions struct {
 	// to do.
 	policy    string
 	pinRemote string
-	// pinRepository is the source a pin resolves against. It is empty for a pin
-	// an operator asked for by name, which is resolved against whatever the
-	// published lock names; refreshChinaList sets it to the source it measured,
-	// so the commit it hands on is fetched from the repository that commit is in.
+	// pinSource is the repository the operator named with --pin-source. It is the
+	// one way to pin without reading the published lock, and therefore the way out
+	// of a published lock this build refuses: a schema version 1 document, whose
+	// own refusal names this flag.
+	pinSource string
+	// pinRepository is the source a pin resolves against. An operator's --pin-source
+	// and refreshChinaList both set it, because a commit and the repository it was
+	// resolved in travel together; it is empty for a pin that names neither, which is
+	// resolved against whatever the published lock says.
 	//
 	// The field exists because the two callers of runPinRemote had no other way
 	// to agree on a repository, and the one that passes a commit resolved from
@@ -306,6 +311,7 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	policy := flags.String("policy", defaultPolicyPath, "path to the policy YAML file, read by --automatic to decide what to refresh")
 	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
+	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from, as `--pin-source "+rules.RepositoryV2Fly+"`. Without it the repository is read from the published lock, which is what a machine with a readable lock wants; with it the pin does not read that lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
 	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
 	listFile := flags.String("list-file", defaultListFilePath, "path to the converted list")
@@ -320,6 +326,29 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	}
 	if flags.NArg() != 0 {
 		return updateListOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	// --pin-source is validated before the mode is chosen, so that naming an
+	// unreviewed repository is refused as an unreviewed repository rather than as
+	// a command that happens to be missing a mode, and so that naming it with no
+	// pin says which flag it needs instead of only listing the modes.
+	selectedSource := strings.TrimSpace(*pinSource)
+	if selectedSource != "" && !rules.KnownRepository(selectedSource) {
+		// The repository is checked against the reviewed list rather than a shape,
+		// because the value is a repository name and a well-formed stranger is the
+		// case the allowlist exists to refuse. It is checked HERE, where a caller
+		// supplies it, rather than by the fetch that would build a URL from it.
+		return updateListOptions{}, fmt.Errorf("--pin-source %q is not a reviewed source: %q or %q",
+			selectedSource, rules.RepositoryV2Fly, rules.RepositoryChina)
+	}
+	if selectedSource != "" && strings.TrimSpace(*pinRemote) == "" {
+		// --pin-source names the source FOR a pin, so naming it without asking for
+		// one is a command that would do nothing. Saying so is better than
+		// accepting it and letting an operator believe a pin happened.
+		//
+		// The raw flag is what this reads, not the normalized ref: --pin-remote
+		// HEAD becomes the empty string above, so the normalized value cannot tell
+		// "no pin was asked for" from "the default branch was".
+		return updateListOptions{}, fmt.Errorf("--pin-source names the repository for a pin, so it requires --pin-remote %s or a commit", pinRef)
 	}
 	modes := 0
 	for _, selected := range []bool{*automatic, *check, *pinRemote != "", *refreshRanges} {
@@ -364,6 +393,7 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 		automatic:        *automatic,
 		policy:           *policy,
 		pinRemote:        selectedPin,
+		pinSource:        selectedSource,
 		refreshRanges:    *refreshRanges,
 		sourceLock:       *sourceLock,
 		listFile:         *listFile,
@@ -752,6 +782,13 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 }
 
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	// An operator's --pin-source is the one pin that does not consult the
+	// published lock, and it has to come first: a lock this build refuses -- a
+	// schema version 1 document -- cannot say which repository to pin, and reading
+	// it is the refusal the --pin-source operator is here to get past.
+	if options.pinSource != "" {
+		options.pinRepository = options.pinSource
+	}
 	client := services.newHTTPClient()
 	// No option means HEAD, and HEAD means the repository's current default-branch
 	// commit. A 40-character commit means that commit, which is how a pin accepted by
@@ -767,11 +804,12 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 		// Nothing named one, so the published lock does.
 		published, _, found, readErr := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 		if readErr != nil {
-			// A pair that cannot be read refuses the run either way -- the
-			// publish path below reads it again and reports the same error -- so
-			// this is reported here rather than swallowed into a default that
-			// would fetch an archive the operator's machine cannot then use.
-			writeCLIError(stderr, "update-lists: %v", readErr)
+			// There is no repository to pin without the lock, so this refusal has
+			// to say which flag supplies one. A refusal that names no way forward
+			// leaves the operator to edit a file by hand, which is the outcome the
+			// v1 lock's own refusal names this command to avoid.
+			writeCLIError(stderr, "update-lists: %v. Name the source to pin with `--pin-source %s` "+
+				"(or %q) to pin without reading the published lock", readErr, rules.RepositoryV2Fly, rules.RepositoryChina)
 			return exitStateUnavailable
 		}
 		if found {
@@ -805,9 +843,21 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	}
 	defer func() { _ = release() }()
 
-	if _, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err != nil {
-		writeCLIError(stderr, "update-lists: %v", err)
-		return exitStateUnavailable
+	// Two checks read the outgoing lock, and both refuse a lock this build cannot
+	// parse -- which is what a published schema version 1 lock is, and what the
+	// refusal ParseSourceLock prints names this command to recover from. An
+	// operator who named the source has said what replaces it, so the pair is
+	// overwritten deliberately rather than by accident, and both checks give way.
+	// The archive does not: it is the record of what was running, and it is
+	// written verbatim so a lock this build cannot read is still preserved.
+	namedSource := options.pinSource != ""
+	if !namedSource {
+		if _, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err != nil {
+			writeCLIError(stderr, "update-lists: %v. Name the source to pin with `--pin-source %s` "+
+				"(or %q) to publish over a lock this build cannot read",
+				err, rules.RepositoryV2Fly, rules.RepositoryChina)
+			return exitStateUnavailable
+		}
 	}
 	// Archived before the publish and replaced by it, and the order is the mechanism:
 	// once the new lock is renamed into place the old one no longer exists anywhere,
@@ -819,7 +869,11 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// A failure here stops the pin rather than being warned about. Publishing without
 	// an archive is the one outcome this cannot be recovered from: the rollback target
 	// is destroyed by the very operation that needed it.
-	if err := rules.Archive(options.previousLock, options.sourceLock); err != nil {
+	archive := rules.Archive
+	if namedSource {
+		archive = rules.ArchiveVerbatim
+	}
+	if err := archive(options.previousLock, options.sourceLock); err != nil {
 		writeCLIError(stderr, "update-lists: archive the outgoing pin, so publishing would leave "+
 			"no way back: %v", err)
 		return exitStateUnavailable

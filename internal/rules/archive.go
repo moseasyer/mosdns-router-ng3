@@ -55,6 +55,45 @@ func Archive(previousLockPath, currentLockPath string) error {
 	return writeLockAtomically(previousLockPath, canonical, defaultFileOps())
 }
 
+// ArchiveVerbatim copies the currently published lock to previousLockPath
+// WITHOUT reading it as a lock: the bytes on disk are what is archived, and a
+// lock this build cannot parse is still the only record of what the machine was
+// running.
+//
+// It exists for one caller, and the reason is a deadlock rather than a
+// convenience. A published schema version 1 lock is refused by ParseSourceLock,
+// and that refusal names `update-lists --pin-remote` as the way out. Archive
+// refuses a lock it cannot parse too -- correctly, because an archive that
+// parses to nothing is worse than no archive, since the refusal then names a
+// file the operator believes exists. Together they mean the command the refusal
+// points at cannot run, and the only remaining recovery is a human editing a
+// file under /var/lib.
+//
+// Archive keeps refusing; this is the alternative an operator reaches for
+// deliberately, having named the source to publish. The copy is written the way
+// Archive writes one -- staged, fsync, rename, fsync of the directory -- so a
+// power cut leaves no half-written rollback target, and a missing lock is still
+// a first install rather than an error.
+func ArchiveVerbatim(previousLockPath, currentLockPath string) error {
+	if previousLockPath == "" || currentLockPath == "" {
+		return errors.New("rules: an archive path and a current lock path are both required")
+	}
+	if previousLockPath == currentLockPath {
+		return fmt.Errorf("rules: %s is both the archive and the lock it archives, so archiving would destroy it", currentLockPath)
+	}
+	encoded, err := os.ReadFile(currentLockPath)
+	if err != nil {
+		// Absence is the first pin and archives nothing, which is the same
+		// answer Archive gives. Anything else means the outgoing pin cannot be
+		// copied at all, and publishing over it would destroy the only copy.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("rules: read the lock being archived: %w", err)
+	}
+	return writeLockAtomically(previousLockPath, encoded, defaultFileOps())
+}
+
 // ReadPrevious reads the archived pin.
 //
 // A missing archive is an error rather than an empty lock, and that is deliberate: a
