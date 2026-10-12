@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把中国域名分流的**主源**从 `v2fly/domain-list-community` 换成 `felixonmars/dnsmasq-china-list`（8,363 → 111,357 条），v2fly 保留为回退，并只取分流规则、不取上游指定的解析器。
+**Goal:** 把中国域名分流的**主源**从 `v2fly/domain-list-community` 换成 `felixonmars/dnsmasq-china-list`（8,363 → 约 110,551 条，spec 写作 111,357，差额见 Step 2），v2fly 保留为回退，并只取分流规则、不取上游指定的解析器。
 
 **Architecture:** 两个转换器并列放在 `internal/rules/`，由 `source-lock` 里的 `primary.repository` 分派；下载、pin、发布、归档、防塌缩护栏整套复用。回退在**发布期**决策，`/var/lib/mosdns/lists/cn-domains.txt` 始终只有一份，MOSDNS 路由图一行不改。`SourceLock` 升到 schema v2，因为发布列表同时来自两个仓库。
 
@@ -1691,7 +1691,7 @@ func guardSize(stderr io.Writer, name string, incoming, published int, minimum f
 // than the fallback, which is thirteen times smaller -- and a machine with
 // nothing gets 8,363 rules rather than a silent hole where every query goes
 // abroad. The fallback is published here and nowhere else, which is what keeps
-// the 0.95 guardrail honest: 111,357 down to 8,363 is a 92.49% drop, so a
+// the 0.95 guardrail honest: 110,551 down to 8,363 is a 92.4% drop, so a
 // refresh can never mistake the fallback for "the list got smaller".
 func publishFallback(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services, cause error) int {
 	client := services.newHTTPClient()
@@ -2004,7 +2004,7 @@ go run ./cmd/mosdns-cdnctl update-lists \
   --pin-remote HEAD 2>&1 | tail -20
 ```
 
-Expected: `pinned-commit`、`pinned-rules: 111357` 左右。若报护栏拒绝，说明本机已发布的列表与新列表不在同一对护栏下——**不要放宽阈值**，把两个计数读出来写进报告。
+Expected: `pinned-commit`、`pinned-rules: 110551` 左右。该数字是**规则数**（`sourceRuleCounts` 的口径），不是文件行数；带停用记录注释的列表 `wc -l` 会比它多 7。spec 的 111,357 与它的 806 差额见 Step 2 与 `docs/measured-environment.md`。若报护栏拒绝，说明本机已发布的列表与新列表不在同一对护栏下——**不要放宽阈值**，把两个计数读出来写进报告。
 
 确认之后：
 
@@ -2073,7 +2073,12 @@ dpkg-deb --fsys-tarfile build/mosdns-router_*_amd64.deb | tar -xO ./usr/share/mo
 dpkg-deb --fsys-tarfile build/mosdns-router_*_amd64.deb | tar -xO ./usr/share/mosdns-router/source-lock.json
 ```
 
-Expected: 主列表约 111,357 行；锁为 schema 2、primary 为 `felixonmars/dnsmasq-china-list`、带 supplement。
+Expected: `wc -l` 报 **110,558 行**；锁为 schema 2、primary 为 `felixonmars/dnsmasq-china-list`、带 supplement。
+
+**110,558 是行数，不是规则数。** 该文件是 110,551 条规则（110,481 `domain:` + 67 `full:` + 3 `regexp:`），
+外加 6 行停用记录注释与 renderList 写入的 1 行分隔空行。spec 第 56 行写的 111,357 是**表达式**数，
+与本仓库实发列表相差 806；该缺口的来历与复现方式见 `docs/measured-environment.md`
+「Where the spec's 111,357 / 111,287 came from — 806」，结论是 **unreconciled, not explained**。
 
 包里**只有这一对**。不要再检查 `cn-domains-fallback.txt`——本 plan 原先要求随包发布
 第二对，已按 spec 第 121 行「同一形状覆盖两种情况，不需要第二套文档」撤回（见 Task 5 的
@@ -2136,7 +2141,7 @@ git status --short
 Expected:
 
 - 全部 Go 测试与 vet 通过；
-- 发布列表约 111,357 条且**不含任何地址**；
+- 发布列表约 110,551 条规则（`wc -l` 为 110,558 行）且**不含任何地址**；spec 的 111,357 与这 806 的差额仍未对上，见 `docs/measured-environment.md`；
 - 锁是 schema 2，primary 是 dnsmasq，supplement 是 v2fly 的 70 条；
 - `build/` 只有一份 amd64 包；
 - 三版本 Podman 矩阵全绿；

@@ -774,6 +774,18 @@ per-pass medians** (each of which is itself a median over 30 samples), and the
 spread row is the six per-pass medians' min–max. The matching `matcher Len()`
 figures, 8,363 and 110,551, confirm each list was loaded whole.
 
+*Where the harness is.* `measure2/main.go` and the pooling step live in
+**`/tmp/opencode/task7-measure/`** on this host, and that directory is scratch:
+nothing in this repository pins it and it will not survive a reboot. Its
+`pooled.txt` holds the six per-pass lines this section's tables are computed
+from, including each pass's fastest hit and miss round — which is the granularity
+the lookup table's min–max needs and the only place the per-pass direction is
+visible at all. To re-derive this section, rebuild `measure2/main.go` against
+mosdns **v5.3.4** (the version named above) and re-run six passes of ten rounds
+of 200,000 operations per list; a different mosdns version invalidates the
+lookup table by the condition its own closing note states, not merely by the
+wording of that note.
+
 *How the heap was read.* In a **separate fresh process per list**, because a
 process holding both has one `HeapAlloc` for the pair and would report the same
 number twice — which it did, on the first attempt. `runtime.GC()` then
@@ -817,14 +829,18 @@ median of those six in bold:
 **The smaller list is consistently a little faster, and this entry does not
 pretend otherwise.** The 8,363-rule list has the faster round in **four of six
 passes** on hits, and the two medians-of-minima differ by **17 ns, about 9 %**,
-in the same direction every time. What that figure is *not* is a demonstrated
-cost of the larger list, and the reason is given so a reader does not have to
-guess: the difference is **smaller than either list's own pass-to-pass spread**
-(A spans 56 ns, B spans 84 ns); the fastest single hit on the *large* list
-(186 ns) beats four of the six rounds on the small one; and the structural
-account below predicts **no** rule-count term at all. So the honest claim is
-**"a difference this measurement cannot separate from its own noise, pointing
-the wrong way for the trie"** — not "identical", and not "9 % slower".
+in the smaller list's favour. The larger list is faster in the other two — pass 1
+gives it 186 ns against 199 ns and pass 2 gives it 202 ns against 235 ns — so this
+is not a direction the measurement holds without exception; what is consistent is
+the **aggregate**, the median of the six minima, which is the figure the table
+above reports. What the per-pass comparison is *not* is a demonstrated cost of the
+larger list, and the reason is given so a reader does not have to guess: the
+difference is **smaller than either list's own pass-to-pass spread** (A spans 56 ns,
+B spans 84 ns); the fastest single hit on the *large* list (186 ns) beats four of
+the six rounds on the small one; and the structural account below predicts **no**
+rule-count term at all. So the honest claim is **"a difference this measurement
+cannot separate from its own noise, pointing the wrong way for the trie"** — not
+"identical", not "9 % slower", and not "the same every pass".
 
 **Why the claim is not a coincidence — read from the code, not measured.**
 `SubDomainMatcher.Match` in v5.3.4's `pkg/matcher/domain/matcher.go` is a
@@ -959,8 +975,12 @@ should act on.
   daemon starts. Recorded as an open item above rather than as a fact.
 - **Where the spec's 111,357 / 111,287 came from — 806, and only one half of
   the question is closed.** The design spec
-  (`docs/superpowers/specs/2026-10-11-china-list-dnsmasq-source-design.md` §8)
-  quotes **111,357** expressions and **111,287** unique domains. The shipped
+  (`docs/superpowers/specs/2026-10-11-china-list-dnsmasq-source-design.md`)
+  quotes **111,357** expressions and **111,287** unique domains. §2.1 is where the
+  111,287 is measured (three files, 111,288 rule lines, one duplicate across them)
+  and §3 is where the 70-rule supplement is broken out of 111,357 — which is what
+  makes the two figures comparable with the artifact's at all. §8 is the
+  measurement table and carries 111,357 only as a column heading. The shipped
   artifact holds **110,551** rules, and they are not all one source: **110,481**
   are `domain:` rules converted from the dnsmasq source and **70** are the v2fly
   supplement (67 `full:` + 3 `regexp:` — the `kinds`
@@ -977,17 +997,24 @@ should act on.
   unique domains — exactly the `domain:` count the artifact carries. Nor can
   another file in that revision supply the missing 806: the whole tree holds
   110,482 `server=` lines and the three named entries already account for all of
-  them, because the only other `.conf`, `bogus-nxdomain.china.conf`, is 290 lines
-  of `bogus-nxdomain=<IPv4>` and contributes **zero**. The converter drops
+  them, because the only other `.conf`, `bogus-nxdomain.china.conf`, is 290 lines of
+  which **165** are `bogus-nxdomain=<IPv4>` rules — the spec's own table gives that
+  count — the rest being 65 comment lines and 60 blanks — and it contributes
+  **zero** `server=` lines. The converter drops
   nothing either — `ConvertChinaConfFS` *refuses* a malformed entry rather than
   skipping it, so a filter cannot be the explanation.
 
-  ***Drift before the pin is NOT excluded, and it is the live explanation.*** It
-  was **sampled, not refuted**, and the sample does not close it. Nineteen
+  ***Drift before the pin is neither excluded nor confirmed; nineteen samples are
+  why.*** It was **sampled, not refuted**, and the sample does not close it. Nineteen
   revisions of `master` between 2026-08-30 and the pin were fetched and counted
   (day-end for sixteen dates, day-first for three of them). Their unique-domain
-  counts run **110,481 to 111,158**. The spec's 111,287 is **129 above the
-  highest of the nineteen**, which looks like a near miss and is not one: the
+  counts run **110,481 to 111,158**. The top of that range is the day-end commit of
+  2026-09-20, **`01d1764d3782`** — named here because the endpoint of a range is the
+  one figure a reader cannot check anything against otherwise. Re-derived
+  independently: its three named entries carry **111,159** `server=/…/` lines
+  resolving to **111,158** unique domains (byte-exact, `LC_ALL=C`). The spec's
+  111,287 is **129 above the highest of the nineteen**, which looks like a near
+  miss and is not one: the
   series **oscillates rather than trends** — 2026-09-19 alone went 111,084 →
   111,152 between its first and last commit — and the upstream's stream is
   **at least 100 commits in a four-day window**, nearly all single-domain
@@ -1006,7 +1033,14 @@ should act on.
   is ~540 KB, so the search is bounded and mechanical. A `git clone` of the
   repository fails on this host's 94 %-full disk, which is why the per-archive
   route was used — and why it was stopped at nineteen revisions rather than run
-  to the end. Until someone does it: treat **806** as the measured gap,
+  to the end. Enumerating without cloning is possible where the disk is not the
+  binding constraint and is what the `01d1764d3782` figure above was re-derived
+  with: `git init`, then
+  `git fetch --depth=1 --filter=blob:none https://github.com/felixonmars/dnsmasq-china-list <full-sha>`,
+  then `git show <sha>:<entry>` for each of the three named entries. The commit
+  list itself comes from the API (`/repos/<repo>/commits?since=…&until=…`), which
+  is a few hundred kilobytes of JSON per window. Until someone does it: treat
+  **806** as the measured gap,
   **110,551** as the figure the shipped pair is accountable to — `list_sha256`
   names the file that is actually there — and the spec's two numbers as
   **unreconciled, not explained**.

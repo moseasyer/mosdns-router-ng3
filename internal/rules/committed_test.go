@@ -206,6 +206,37 @@ func TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom(t *testing.T
 	}
 }
 
+// A supplement naming no kind is self-contained here: the assertion below is proved to
+// fire on one, without borrowing anything from the committed files or from another
+// test's gate. Without that, the loop in the committed-lock case reads as coverage of
+// this shape while being unable to catch it.
+func TestASupplementNamingNoKindIsRefusedWhateverTheLockAroundIt(t *testing.T) {
+	lock := SourceLock{
+		SchemaVersion: 2,
+		Primary: SourceRef{
+			Repository: RepositoryChina,
+			Commit:     "1111111111111111111111111111111111111111",
+			SHA256:     strings.Repeat("a", 64),
+			Entries:    append([]string(nil), ChinaConfEntries...),
+		},
+		Supplement: &SourceRef{
+			Repository: RepositoryV2Fly,
+			Commit:     "2222222222222222222222222222222222222222",
+			SHA256:     strings.Repeat("b", 64),
+			Entry:      V2FlyEntry,
+			Kinds:      []string{},
+		},
+		ListSHA256: strings.Repeat("c", 64),
+	}
+	if err := lock.Validate(); err == nil {
+		t.Fatal("a supplement naming no kinds validated; the pair says a second source contributed " +
+			"something without recording what, so a later reader cannot count what it gave the list")
+	}
+	if !strings.Contains(lock.Validate().Error(), "kinds") {
+		t.Errorf("the refusal does not name the field that is wrong: %v", lock.Validate())
+	}
+}
+
 func TestTheCommittedSupplementIsTheKindsTheDnsmasqSyntaxCannotExpress(t *testing.T) {
 	lock, err := ParseSourceLock(mustReadCommitted(t, committedLockPath))
 	if err != nil {
@@ -222,6 +253,19 @@ func TestTheCommittedSupplementIsTheKindsTheDnsmasqSyntaxCannotExpress(t *testin
 		if !want[kind] {
 			t.Fatalf("the supplement contributes %q, which the dnsmasq source already provides", kind)
 		}
+	}
+	// The size is asserted as well as the membership, and that is the part the loop
+	// above cannot reach: an empty or nil Kinds passes every iteration and reads as
+	// coverage of a shape it cannot catch. A supplement naming no kind contributes
+	// nothing, so the published list would be missing every rule the dnsmasq syntax
+	// cannot express while this test reported the kinds as correct.
+	//
+	// Validate refuses an empty set -- TestCommittedSourceLockIsAFullyPinnedReviewedSource
+	// calls it -- so the gate is closed elsewhere and nothing was silently uncovered by
+	// adding this. It was closed in a DIFFERENT test, which is what made this one read as
+	// if it were checking the thing and not a subset of it.
+	if got := len(lock.Supplement.Kinds); got != len(want) {
+		t.Fatalf("the supplement names %d kinds %v, want %d %v", got, lock.Supplement.Kinds, len(want), V2FlySupplementKinds)
 	}
 }
 
