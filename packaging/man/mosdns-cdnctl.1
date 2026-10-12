@@ -226,6 +226,26 @@ An archive that cannot be written stops the publication rather than being warned
 about. Publishing without one is the only outcome here that is unrecoverable: the
 rollback target is destroyed by the very operation that needed it. A lock that is
 not there at all is not that case \em it is the first pin.
+.br
+A pin re\-pins the
+.I felixonmars/dnsmasq\-china\-list
+primary and carries the
+.I v2fly/domain\-list\-community
+supplement the published lock already names, at the commit it already names \em
+this command was asked about one source, so the second source is not re\-resolved.
+The exception is the first pin, which is the only run with nothing to carry: it
+resolves the supplement against that repository's own HEAD and says so in its
+report, because a run that quietly acquires a second source and a run that quietly
+drops one are the same run seen from outside. If that second source cannot be
+reached, the primary is published without it and standard error says what is
+missing from the list \em refusing would leave the machine with no China list at
+all, which is worse than one missing seventy rules out of a hundred and eleven
+thousand, and the next unattended refresh publishes the union once the repository
+is reachable again. A
+.BR v2fly/domain\-list\-community
+primary is the fallback publication and takes no supplement: that source already
+carries every rule kind a supplement contributes, so a lock naming one beside it
+would be untrue about how the list was built.
 .TP
 .B \-\-pin\-source\ \fIREPOSITORY\fR
 Names the reviewed repository to pin from. It is accepted only with

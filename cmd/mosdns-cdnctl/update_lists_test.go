@@ -39,6 +39,18 @@ const (
 	// It is a commit of its own repository and shares no value with the primary's,
 	// so a case that puts the wrong one in a lock cannot pass by accident.
 	lockedSupplementCommit = "4444444444444444444444444444444444444444"
+	// remoteSupplementCommit is the commit the fake origin publishes for the
+	// SUPPLEMENT repository's HEAD, for the cases that have to tell the two roles
+	// apart.
+	//
+	// It exists because serving both repositories at remoteCommit makes a request
+	// for one of their archives indistinguishable from a request for the other's:
+	// "was the v2fly archive fetched" then cannot say whether it was fetched as the
+	// primary or as the supplement. With the repositories on different commits it
+	// can -- asking the v2fly repository for the primary's commit is a role
+	// confusion and nothing else -- so the cases that need the distinction serve
+	// the supplement at this commit instead.
+	remoteSupplementCommit = "5555555555555555555555555555555555555555"
 	// firstInstallArchive is the archive served for a first pin.
 	firstInstallArchive = "domain:first.cn\nfull:exact.cn\ninclude:shared\n"
 	// shared is the list the archive's China list includes.
@@ -779,6 +791,20 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 // Defaulting it to the source the spec demotes (v2fly 不再是主源，但保留为回退) would
 // also make the two ways of doing the same thing disagree: the automatic cold start
 // installs the primary on this very machine, and a hand-run pin would not.
+//
+// The ROLE is what this case holds, and it is held against which repository was
+// asked for which commit rather than against whether an archive was fetched. Both
+// roles fetch the v2fly archive on a correct run -- a first install resolves the
+// supplement from that same repository -- so "the v2fly archive was fetched" says
+// nothing about which role it was resolved for. What says it is that each
+// repository is asked only for a commit it issued: a run that resolved v2fly AS
+// THE PRIMARY would ask the fallback for the primary's commit, and a run that
+// resolved a commit against the wrong repository asks that repository for a commit
+// that is not in it. The fixture serves the two repositories at different commits
+// so both of those are requests the origin can be observed to have received.
+//
+// The published lock is the other half of the same claim, and it is the stronger
+// one: it is the document that records which source is which.
 func TestAnUnqualifiedFirstInstallPublishesThePrimary(t *testing.T) {
 	paths := newListPaths(t)
 	origin := newFakeOriginSources(t, map[string]fakeSource{
@@ -788,12 +814,14 @@ func TestAnUnqualifiedFirstInstallPublishesThePrimary(t *testing.T) {
 				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
 			},
 		},
-		// Served so a run that reached for the fallback would be caught below
-		// rather than failing with a confusing "unexpected status".
+		// Served, at a commit of its own, because a first install resolves the
+		// supplement from this repository: the run has to reach it. See
+		// TestAFirstInstallPublishesTheUnionAndNotThePrimaryAlone for what it
+		// publishes once it does.
 		rules.RepositoryV2Fly: {
-			head: remoteCommit,
+			head: remoteSupplementCommit,
 			archives: map[string][]byte{
-				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
 			},
 		},
 	})
@@ -814,10 +842,19 @@ func TestAnUnqualifiedFirstInstallPublishesThePrimary(t *testing.T) {
 			"if that is what you want.", lock.Primary.Repository, rules.RepositoryChina, rules.RepositoryV2Fly)
 	}
 	if lock.Primary.Commit != remoteCommit {
-		t.Errorf("published %s, want the primary's HEAD %s", lock.Primary.Commit, remoteCommit)
+		t.Errorf("published %s, want the primary's own HEAD %s", lock.Primary.Commit, remoteCommit)
 	}
-	if other := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(other) {
-		t.Errorf("the unqualified install fetched %q, so it resolved the fallback as the primary", other)
+	// Each repository is asked only about its own commits. The first of these is
+	// the assertion that replaced "the v2fly archive was not fetched": it cannot be
+	// satisfied by the correct run and is satisfied by a run that resolved the
+	// fallback in the primary's place.
+	if crossed := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(crossed) {
+		t.Errorf("the run asked %s for the primary's commit %s, so it resolved the fallback "+
+			"where the primary belonged", rules.RepositoryV2Fly, remoteCommit)
+	}
+	if crossed := origin.archivePath(rules.RepositoryChina, remoteSupplementCommit); origin.fetched(crossed) {
+		t.Errorf("the run asked %s for the supplement's commit %s, so it resolved a commit "+
+			"against a repository that did not issue it", rules.RepositoryChina, remoteSupplementCommit)
 	}
 }
 
@@ -865,14 +902,185 @@ func TestTheFallbackIsStillReachableByNameOnAnEmptyMachine(t *testing.T) {
 	}
 }
 
+// A first install publishes the UNION. The published list is one document
+// describing how it was built, and a dnsmasq primary on its own is a DIFFERENT
+// document: the syntax the primary is written in cannot say a `full:` or a
+// `regexp:` rule, so the seventy-odd rules only the second source can state are
+// simply not in it. It is not a shorter version of the specified list; it is not
+// the specified list.
+//
+// Nothing downstream notices. The pair describes itself, so ReadPublishedPair
+// accepts it; the list converts, sorts and deduplicates; every routing test
+// passes. It just stops matching the AWS China CDN edge names that the
+// supplement's `regexp:` rules carry -- which is exactly the loss
+// TestTheCommittedListKeepsTheRegexpRulesTheDnsmasqSourceCannotExpress exists to
+// catch about the committed pair, and no gate in this command could see it.
+//
+// The carry-over is what made this invisible: an operator's pin re-pins the
+// PRIMARY, and a publication with no published supplement had nothing to carry, so
+// the first install -- the only run with nothing to carry -- published the primary
+// ALONE.
+func TestAFirstInstallPublishesTheUnionAndNotThePrimaryAlone(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Supplement == nil {
+		t.Fatalf("the first install published the %s primary alone: %+v. The syntax that primary "+
+			"is written in cannot express a `full:` or a `regexp:` rule, so this list is missing "+
+			"every rule only the second source can state -- and it converts, sorts and routes "+
+			"either way, so nothing about the published pair shows the loss",
+			lock.Primary.Repository, lock)
+	}
+	if lock.Supplement.Repository != rules.RepositoryV2Fly {
+		t.Errorf("the supplement is %q, want the only source rules allows beside the primary (%q)",
+			lock.Supplement.Repository, rules.RepositoryV2Fly)
+	}
+	if lock.Supplement.Commit != remoteSupplementCommit {
+		t.Errorf("the supplement is %s, want the supplement repository's own HEAD %s",
+			lock.Supplement.Commit, remoteSupplementCommit)
+	}
+	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
+		if !strings.Contains(string(list), want) {
+			t.Errorf("the published list lost %q, which the dnsmasq source cannot express:\n%s", want, list)
+		}
+	}
+}
+
+// A run that quietly ACQUIRES a second source and a run that quietly DROPS one
+// look the same from the outside: same exit code, same shape of report, same
+// published pair that describes itself. So the acquisition is said, in the report,
+// naming the repository and the commit it resolved.
+//
+// The wording is the assertion. That is deliberate: this is the operator-facing
+// sentence and the only record that the machine acquired a source nobody asked
+// about, so a change to it is a change to what the operator is told, and the case
+// that should fail first is this one.
+func TestAFirstInstallSaysItAcquiredTheSecondSource(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	want := "added the " + rules.RepositoryV2Fly + " supplement at " + remoteSupplementCommit
+	if !strings.Contains(stdout, want) {
+		t.Errorf("the run acquired a second source without saying so, which is indistinguishable "+
+			"from a run that quietly dropped one: the report has no %q:\n%s", want, stdout)
+	}
+}
+
+// The second source cannot be reached on a machine that CAN reach the primary.
+// That must not become a hard failure: this command is the documented install, it
+// has nothing on disk to keep, and refusing here leaves the machine with no China
+// list at all rather than with one that is missing seventy rules out of a hundred
+// and eleven thousand. So the primary is published, and what is missing from it is
+// said on stderr rather than left for an operator to discover by noticing that some
+// names stopped matching.
+//
+// It is the same judgement `carriedSupplement` already makes for a lock this build
+// cannot read, and the reason is the same: a note and not a refusal, because
+// refusing strands an operator whose only way out is this command. The two
+// guardrails in refreshChinaList do refuse a supplement it cannot resolve, and
+// they can: that run has a published pair to keep, so refusing costs it nothing.
+func TestAFirstInstallThatCannotReachTheSecondSourceStillPublishesAndSaysWhy(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		// The head answers and the archive does not, which is the shape a blocked
+		// host takes: the repository is named, so the resolution is attempted, and
+		// the fetch is what fails.
+		rules.RepositoryV2Fly: {head: remoteSupplementCommit},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("an install that could reach the primary refused to install it because the "+
+			"second source was unreachable (exit %d): %s", code, stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Primary.Repository != rules.RepositoryChina || lock.Supplement != nil {
+		t.Fatalf("the degraded publication is %+v, want the %s primary and no supplement",
+			lock, rules.RepositoryChina)
+	}
+	// Said, on stderr, because it is a fault rather than a report, and said with
+	// the consequence in it: a note naming a repository without saying what its
+	// absence costs is a note an operator files and forgets.
+	for _, want := range []string{
+		rules.RepositoryV2Fly,
+		"could not be resolved",
+		"missing from the list this command publishes",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the diagnostic does not say %q:\n%s", want, stderr)
+		}
+	}
+}
+
 // An explicit pin survives a later unqualified run. This is the one way the new default
 // could become a new defect: if the first-install default were consulted whenever the
 // repository is not named on the command line, a machine that deliberately pinned the
 // fallback would be dragged onto the primary by the next bare `--pin-remote HEAD`.
 //
 // The published lock outranks the default, and this case is what holds that: the origin
-// serves BOTH repositories at the same commit, so a run that asked the wrong one would
-// publish a lock naming it and fail here rather than merely looking right.
+// serves BOTH repositories, so a run that asked the wrong one would publish a lock
+// naming it and fail here rather than merely looking right.
+//
+// It also holds the other half of the rule about which repository fills which role.
+// A dnsmasq primary is published as a union with a supplement, and a v2fly primary is
+// the fallback publication and has none -- so a fix that gave the fallback a
+// supplement would make this machine's lock a document untrue about how its list was
+// built, and rules.validatePinnedSource would refuse it. The assertion below is what
+// would notice first, and the origin serving the primary is what lets it: a run that
+// resolved one beside a v2fly primary would fetch the primary's archive.
 func TestADeliberateV2FlyPinSurvivesALaterUnqualifiedPin(t *testing.T) {
 	paths := newListPaths(t)
 	// A machine that asked for the fallback and got it.
@@ -909,6 +1117,11 @@ func TestADeliberateV2FlyPinSurvivesALaterUnqualifiedPin(t *testing.T) {
 	}
 	if lock.Primary.Commit != remoteCommit {
 		t.Errorf("published %s, want the fallback's HEAD %s", lock.Primary.Commit, remoteCommit)
+	}
+	if lock.Supplement != nil {
+		t.Errorf("the re-pin gave a %s primary a supplement: %+v. The fallback already carries "+
+			"every rule kind a supplement contributes, so this lock would be untrue about how "+
+			"the list was built.", lock.Primary.Repository, lock.Supplement)
 	}
 	if other := origin.archivePath(rules.RepositoryChina, remoteCommit); origin.fetched(other) {
 		t.Errorf("the re-pin fetched %q, so it asked the primary for a machine pinned to the fallback", other)
@@ -2970,10 +3183,17 @@ func TestAMeasuredRepositoryCannotBeRedirectedByAPinSource(t *testing.T) {
 				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:measured.cn\n"),
 			},
 		},
+		// At a commit of its own. A first install resolves the supplement from this
+		// repository, so the fallback's archive IS fetched on a correct run here and
+		// "was it fetched" cannot say which role it was fetched for. What says it is
+		// the commit each repository is asked about: this run must never ask the
+		// fallback for the primary's commit, which is what resolving the measured
+		// source against --pin-source would look like.
 		rules.RepositoryV2Fly: {
-			head: remoteCommit,
+			head: remoteSupplementCommit,
 			archives: map[string][]byte{
-				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+				remoteCommit:           sourceArchive(t, remoteCommit, firstInstallArchive),
 			},
 		},
 	})
@@ -2983,9 +3203,9 @@ func TestAMeasuredRepositoryCannotBeRedirectedByAPinSource(t *testing.T) {
 	if code != exitSuccess {
 		t.Fatalf("the measured pin exited %d (stdout: %s, stderr: %s)", code, stdout.String(), stderr.String())
 	}
-	if other := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(other) {
-		t.Errorf("--pin-source %q overrode the measured repository: it fetched %q",
-			rules.RepositoryV2Fly, other)
+	if crossed := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(crossed) {
+		t.Errorf("--pin-source %q overrode the measured repository: the run asked the fallback "+
+			"for the primary's commit %s", rules.RepositoryV2Fly, remoteCommit)
 	}
 	published, err := rules.ParseSourceLock(mustReadFile(t, paths.sourceLock))
 	if err != nil {
@@ -3161,6 +3381,13 @@ func leaveDisagreement(t *testing.T, paths listPaths, replaced string) {
 // there is no supplement to recover and the publication carries none. That is
 // correct, but it is also indistinguishable from the bug above unless the run says
 // which happened.
+//
+// The assertion names the CONDITION rather than the word "supplement". A run that
+// merely mentioned the word could satisfy it, and this round added two other
+// diagnostics that mention it for different reasons -- one about a second source
+// that could not be resolved, one about one this machine never had -- so a loose
+// assertion here would now pass on the wrong note. The publication is asserted too:
+// the note is only worth writing if the thing it describes is what happened.
 func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 	paths := newListPaths(t)
 	publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
@@ -3180,9 +3407,17 @@ func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 	if code != exitSuccess {
 		t.Fatalf("the v1 re-pin exited %d (stderr: %s)", code, stderr)
 	}
-	if !strings.Contains(stderr, "supplement") {
-		t.Errorf("the run published a lock naming no supplement without saying so, which is "+
+	if !strings.Contains(stderr, "could not be read") {
+		t.Errorf("the run published a lock naming no supplement without saying WHY, which is "+
 			"what a publication that silently dropped one looks like: %q", stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Supplement != nil {
+		t.Errorf("the re-pin published %+v beside a lock it could not read, and the note above "+
+			"is only true if nothing was carried over", lock.Supplement)
 	}
 }
 

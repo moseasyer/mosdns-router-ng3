@@ -1164,26 +1164,137 @@ func publishFallback(ctx context.Context, options updateListOptions, stdout, std
 // re-pin that --pin-source exists to make possible, which is the stranding this
 // file has already been round for twice.
 //
-// A lock that is not there at all is a first install: nothing to carry, nothing to
-// say.
-func carriedSupplement(stderr io.Writer, options updateListOptions) *rules.SourceRef {
-	if published, _, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile); err == nil {
-		return published.Supplement
+// The second answer is `firstInstall`, and it is the distinction the whole function
+// turns on. Returning a nil ref is not one thing: it can mean this machine has
+// nothing published, or that what it published cannot be read. Only the first is a
+// first install, and only the first is a state where the answer to "which
+// supplement" is to resolve one rather than to carry one. A lock that exists and
+// names no supplement is not a first install, and this command does not go looking
+// for a source on a machine that has one -- that is refreshChinaList's `gaining`
+// path, which publishes one on the next unattended run.
+//
+// The note about an unreadable lock is NOT written here any more, because whether it
+// matters is not known until the caller has decided what to publish: with a
+// reachable second source the publication is about to carry a freshly resolved one,
+// and a message saying it will name no supplement would then be false.
+func carriedSupplement(options updateListOptions) (supplement *rules.SourceRef, firstInstall bool, unreadable error) {
+	published, _, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
+	switch {
+	case err == nil && found:
+		return published.Supplement, false, nil
+	case err == nil:
+		// "Nothing is published" is an ANSWER from ReadPublishedPair rather than one
+		// of its refusals -- a nil error with found=false -- so this, and not the read
+		// below, is where a first install is recognised. Reading the same file again
+		// would find it missing and say the same thing by accident, which is how the
+		// first version of this function left a first install indistinguishable from a
+		// machine whose lock it could not read.
+		return nil, true, nil
 	}
-	raw, err := os.ReadFile(options.sourceLock)
-	if err != nil || len(raw) == 0 {
-		return nil
+	raw, readErr := os.ReadFile(options.sourceLock)
+	if readErr != nil || len(raw) == 0 {
+		// No lock file at all, or an empty one. An empty file is not a document, so it
+		// describes no machine state and is read the same way as an absent one. A pair
+		// read can refuse with no lock file on disk -- a list published without one --
+		// and this function's question is the same either way: there is no document to
+		// carry a supplement from, and no document to report an unreadable one from.
+		return nil, true, nil
 	}
-	lock, err := rules.ParseSourceLock(raw)
-	if err != nil {
-		writeCLIError(stderr, "update-lists: the published source lock could not be read, so this "+
-			"publication names a primary and no supplement: %v.\n"+
+	lock, parseErr := rules.ParseSourceLock(raw)
+	if parseErr != nil {
+		return nil, false, parseErr
+	}
+	return lock.Supplement, false, nil
+}
+
+// pinSupplement is the supplement an operator's pin publishes beside the primary it
+// resolved, and whether this run ACQUIRED one rather than carrying it.
+//
+// The carrying path is the older one and its reasoning is unchanged: a re-pin was
+// asked about one source, so the second source travels at the commit this machine
+// already runs, not at a new resolution. A publication that dropped it would remove
+// every rule only it can express -- the same loss the refresh refuses to cause by
+// accident, committed deliberately instead.
+//
+// What the carrying path could not answer is the FIRST INSTALL, which is the only run
+// with nothing to carry. It used to publish the dnsmasq primary ALONE, which is not a
+// shorter version of the document the spec describes but a different one: the syntax
+// that primary is written in cannot say a `full:` or a `regexp:` rule, so every rule
+// only the second source can state is simply absent. Nothing detects that. The pair
+// still describes itself, the list still converts, sorts and routes, and every gate
+// in this command passes -- the loss is only visible as names that stop matching.
+//
+// So the first install resolves one, through resolveSupplement: the same function and
+// the same reviewed-repository resolution refreshChinaList uses for exactly this
+// state, because a first install and an unattended cold start are the same machine
+// state reached by two commands.
+//
+// A v2fly PRIMARY gets none, and that is not a special case bolted on: v2fly already
+// carries every rule kind a supplement could contribute, so naming one beside it
+// would make the lock a document untrue about how the list was built, and
+// rules.validatePinnedSource refuses the pair. The fallback publication is therefore
+// a dnsmasq-shaped document with one source, and the predicate here is the same one
+// rules uses.
+//
+// When the second source cannot be reached the primary is published anyway, and the
+// gap is said on stderr. It is a note rather than a refusal for the reason
+// carriedSupplement already gives: this command is the documented install, this
+// machine has nothing on disk to keep, and refusing leaves it with no China list at
+// all -- which is worse than one missing seventy rules out of a hundred and eleven
+// thousand. refreshChinaList's two guardrails refuse an unresolvable supplement and
+// can, because that run has a published pair to keep, so refusing costs it nothing.
+//
+// The diagnostics are written HERE rather than by the caller, because whether the
+// publication will carry a second source is not known until the fresh resolution has
+// been attempted: carriedSupplement's "could not be read" is true whatever follows,
+// but the fallback's "could not be resolved" is only true on one of two outcomes of
+// the same call. A caller that printed either before asking would be guessing.
+func pinSupplement(ctx context.Context, client *http.Client, options updateListOptions, stderr io.Writer, primary *rules.SourceRef) (supplement *rules.SourceRef, acquired bool) {
+	// A measurement wins outright: refreshChinaList resolved, downloaded, converted
+	// and sized this ref during this run and has already said everything there is to
+	// say about a supplement this machine did not have.
+	if options.supplementPin != nil {
+		return options.supplementPin, false
+	}
+	carried, firstInstall, unreadable := carriedSupplement(options)
+	if carried != nil {
+		return carried, false
+	}
+	// A v2fly primary is the fallback publication and has no supplement, so the only
+	// thing left to say is whether the lock this machine had could be read.
+	if primary.Repository != rules.RepositoryV2Fly && firstInstall {
+		resolved, err := resolveSupplement(ctx, client, nil)
+		if err == nil {
+			return resolved, true
+		}
+		// Degraded, and said. The primary is still published: see the doc comment for
+		// why this is not a refusal, and note that the next unattended run resolves
+		// the same supplement and publishes the union, so this state does not persist
+		// on a machine whose policy refreshes the China list.
+		writeCLIError(stderr, "update-lists: the %s supplement could not be resolved, so this "+
+			"publication names the %s primary and no supplement: %v\n"+
+			"The rules only a second source can express are missing from the list this command "+
+			"publishes, and nothing about that pair looks wrong from the outside: the list still "+
+			"converts and still routes, it just stops matching names such as the CDN edge names "+
+			"only that source carries. The primary is published anyway, because this machine has "+
+			"no China list at all and a whole list missing seventy rules is strictly better "+
+			"than none. Run `mosdns-cdnctl update-lists --pin-remote HEAD` once this machine can "+
+			"reach %s, and the run that succeeds publishes the union.",
+			rules.RepositoryV2Fly, primary.Repository, err, rules.RepositoryV2Fly)
+	}
+	if unreadable != nil {
+		// True whatever was decided above, which is why it is worded as what was
+		// read rather than as what is published: the outgoing lock named a machine
+		// state this build cannot account for, and no amount of what follows changes
+		// that. It is a note and not a refusal for the reason above -- refusing
+		// strands the v1 re-pin --pin-source exists to make possible.
+		writeCLIError(stderr, "update-lists: the published source lock could not be read, so no "+
+			"supplement could be carried over from it: %v\n"+
 			"A list built from two sources carries the rules only the second one can express, and "+
 			"nothing here can tell whether this machine was running one. Read the list this command "+
-			"publishes, and re-pin with `--pin-source <repository>` if it is short.", err)
-		return nil
+			"publishes, and re-pin with `--pin-source <repository>` if it is short.", unreadable)
 	}
-	return lock.Supplement
+	return nil, false
 }
 
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
@@ -1312,12 +1423,13 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	// loss the refresh refuses to make by accident, committed deliberately instead.
 	// The commit carried over is the one already published, not a new resolution:
 	// this command was asked about one source.
-	var supplement *rules.SourceRef
-	if options.supplementPin != nil {
-		supplement = options.supplementPin
-	} else {
-		supplement = carriedSupplement(stderr, options)
-	}
+	//
+	// The one exception is a first install, which is the only run with nothing to
+	// carry and used to publish the primary alone. `acquired` records that the second
+	// source was RESOLVED rather than carried, so the report can say so: a run that
+	// quietly acquires a second source and a run that quietly drops one are the same
+	// run seen from outside.
+	supplement, acquired := pinSupplement(ctx, client, options, stderr, &resolved.Primary)
 	pinned, list, err := rules.Download(ctx, client, rules.SourceLock{
 		SchemaVersion: 2,
 		Primary:       resolved.Primary,
@@ -1426,6 +1538,17 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 		return exitStateUnavailable
 	}
 
+	if acquired {
+		// Said after Publish rather than before, so the run claims an acquisition
+		// only for a publication that happened. It names the repository and the
+		// commit because a report saying "a second source was added" without either
+		// is a report an operator cannot check anything against.
+		writeReportLine(stdout, "china-list: added the %s supplement at %s; this machine had none "+
+			"to carry, and the %s primary cannot express the %s rules only the second source "+
+			"contributes, so the published list is the union of both sources\n",
+			supplement.Repository, supplement.Commit, pinned.Primary.Repository,
+			strings.Join(supplement.Kinds, " and "))
+	}
 	writeReportLine(stdout, "pinned-commit: %s\n", pinned.Primary.Commit)
 	writeReportLine(stdout, "pinned-archive-sha256: %s\n", pinned.Primary.SHA256)
 	writeReportLine(stdout, "pinned-list-sha256: %s\n", pinned.ListSHA256)
