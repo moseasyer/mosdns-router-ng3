@@ -184,19 +184,52 @@ list names a repository this build does not know is refused with that name, rath
 than being moved onto a source nobody reviewed.
 .TP
 .B \-\-check
-Reports whether the pinned source has moved, and reports the published ranges read
-from disk without requesting them. Takes no lock, writes nothing, and cannot
-publish a missing prefix list. Scheduled daily by
+Reports whether the pinned sources have moved, and reports the published ranges read
+from disk without requesting them. Takes no lock, writes nothing, and cannot publish a
+missing prefix list. Scheduled daily by
 .BR mosdns\-list\-check.timer (5).
 .br
-It also reports the range snapshot this package ships: its two digests, the
-moment it was taken, how old it is, and whether the document published on this
-machine is still the one the snapshot holds. That is the only measurement of how
-stale the shipped pin is, and a three\-month\-old pin is a perfectly good input
-for a selector while a pin nobody measures is not. The report costs no request,
-so it is printed on the failure path as well \em on standard error, with standard
-output left empty, because a machine with no route to the internet is exactly the
-machine whose China\-list request fails.
+A published China list is built from two repositories \em the
+.I felixonmars/dnsmasq\-china\-list
+primary and, beside it, the
+.I v2fly/domain\-list\-community
+supplement \em so the report names both. It carries the primary's repository, entry or
+entries, commit and archive digest, and then either the supplement's repository,
+commit, archive digest and kinds, or
+.B supplement\-present: false
+with nothing after it. That line is not decoration: a publication with no supplement is
+the degraded pair a machine is left in when
+.I v2fly/domain\-list\-community
+cannot be reached, it looks otherwise healthy from the outside, and nothing else in the
+report would say the seventy\-odd rules only the second source can express are missing.
+Beside a
+.I v2fly/domain\-list\-community
+primary the absence is not a fault and is reported without a remedy \em that source
+already carries every rule kind a supplement contributes.
+.br
+.B up\-to\-date:
+covers every source the lock names, not only the primary. Each is resolved at its own
+repository, and the verdict is
+.B false
+when any of them has moved on, so a timer acting on this line cannot conclude that a
+machine is current while its second source has run ahead. The line that moved is named:
+.B remote\-commit
+for the primary and
+.B supplement\-remote\-commit
+for the second source, and the archive digest a new pin would record is reported for
+whichever of them drifted. A source that cannot be reached at all is not a verdict:
+the half of the report that was read off the disk goes to standard error, standard
+output stays empty and the exit status is the check's own \em which is what a machine
+with no route to the internet sees. That half of the report goes out on standard error
+for the same reason it is printed at all: a machine with no route to the internet is
+exactly the machine whose China\-list requests fail, and a timer that printed nothing
+there would never measure the snapshot below.
+.br
+The report also carries the range snapshot this package ships: its two digests, the
+moment it was taken, how old it is, and whether the document published on this machine
+is still the one the snapshot holds. That is the only measurement of how stale the
+shipped pin is, and a three\-month\-old pin is a perfectly good input for a selector
+while a pin nobody measures is not.
 .TP
 .B \-\-pin\-remote\ \fIHEAD\fR
 .br
@@ -282,6 +315,24 @@ the reviewed primary, and the same one an unattended cold start installs.
 .BR v2fly/domain\-list\-community
 is the fallback, not the default, and naming it here is how you ask for it on a
 machine that has nothing installed.
+.br
+That last qualifier is the whole boundary of this flag, because naming the fallback
+on a machine that is \em not empty is refused rather than carried out. A published lock
+that already names a
+.I v2fly/domain\-list\-community
+supplement cannot travel beside a
+.I v2fly/domain\-list\-community
+primary: that source already holds every rule kind a supplement contributes, so the
+pair would be a lock untrue about how the list was built, and the pin is refused with
+nothing published. The refusal is fail\-closed and deliberate \em a list that dropped
+the second source silently would be a shorter list rather than the same one \em so
+this flag is for the empty machine and for a machine whose lock this build cannot read.
+To move a machine that carries a supplement onto the fallback, remove the
+.B supplement
+field from
+.I /var/lib/mosdns/lists/source\-lock.json
+and re\-run the same command; the pair on disk is untouched until a publication
+succeeds.
 .br
 The published lock outranks that default whenever there is one, so a machine
 that deliberately pinned the fallback keeps running it: a later unqualified

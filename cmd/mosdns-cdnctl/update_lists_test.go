@@ -654,6 +654,252 @@ func TestUpdateListsCheckReportsDriftWithTheRemoteArchiveDigest(t *testing.T) {
 	assertUnchanged(t, before, paths.dir, "")
 }
 
+// The published China list is built from TWO repositories, so the report has to name
+// both of them.
+//
+// The primary half is not the whole subject: a lock that names a supplement carries
+// that supplement's commit, and a report that printed only the primary would be a
+// complete-looking account of half the sources the list came from. Every line of the
+// supplement's identity is read off the lock on disk, so what this asserts is what a
+// reader can check the machine against.
+func TestUpdateListsCheckReportsTheSupplementTheLockNames(t *testing.T) {
+	paths := newListPaths(t)
+	published := append(rulesOf(200), supplementRules(2)...)
+	publishChinaPairWithSupplement(t, paths, lockedCommit, lockedSupplementCommit, published)
+	before := snapshot(t, paths.dir)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: lockedSupplementCommit,
+			archives: map[string][]byte{
+				lockedSupplementCommit: supplementArchive(t, lockedSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	for _, want := range []string{
+		"supplement-present: true",
+		"supplement-repository: " + rules.RepositoryV2Fly,
+		"supplement-commit: " + lockedSupplementCommit,
+		"supplement-kinds: " + strings.Join(rules.SupplementKinds(), " "),
+		"supplement-remote-commit: " + lockedSupplementCommit,
+		"up-to-date: true",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("check output does not report %q:\n%s", want, stdout)
+		}
+	}
+	// The supplement's archive digest is the lock's own: nothing moved, so nothing
+	// was downloaded to compute a new one.
+	if !strings.Contains(stdout, "supplement-archive-sha256: ") {
+		t.Errorf("check does not report the archive digest the lock records:\n%s", stdout)
+	}
+	if stderr != "" {
+		t.Errorf("check wrote a diagnostic: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
+// An ABSENT supplement is a state this machine can be in, and a report that is silent
+// about it is a report that cannot be told from a healthy pair's.
+//
+// `pinSupplement` publishes the primary alone when the v2fly repository cannot be
+// reached, and nothing about that pair looks wrong from the outside: the list converts,
+// sorts and routes, it just stops matching the ~70 rules only the second source can
+// express. So the check says so in so many words, and names the command that fixes it.
+func TestUpdateListsCheckReportsAnAbsentSupplement(t *testing.T) {
+	paths := newListPaths(t)
+	// A dnsmasq primary published alone: exactly the degraded pair pinSupplement
+	// leaves behind when the v2fly repository is unreachable.
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	before := snapshot(t, paths.dir)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {head: remoteCommit},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	if !strings.Contains(stdout, "supplement-present: false") {
+		t.Errorf("the report does not say the supplement is absent:\n%s", stdout)
+	}
+	for _, unwanted := range []string{"supplement-commit:", "supplement-remote-commit:", "supplement-repository:"} {
+		if strings.Contains(stdout, unwanted) {
+			t.Errorf("the report carries %q for a pair with no supplement:\n%s", unwanted, stdout)
+		}
+	}
+	// The remedy is named, because this is the state whose only fix is a command the
+	// operator has to know about.
+	for _, want := range []string{rules.RepositoryV2Fly, "--pin-remote HEAD"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("the absent-supplement line does not name %q:\n%s", want, stdout)
+		}
+	}
+	if stderr != "" {
+		t.Errorf("check wrote a diagnostic: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
+// A fallback publication -- v2fly as the primary -- has no supplement BY DESIGN, and
+// the report must not present that as a fault the operator should go and repair.
+//
+// v2fly already carries every rule kind a supplement could contribute, so a lock
+// naming one beside it would be untrue about how the list was built. The line still
+// says the supplement is absent -- that is a fact about the machine -- but it must not
+// tell this machine's operator to go and do something about it.
+func TestUpdateListsCheckDoesNotCallAFallbackPairBroken(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	before := snapshot(t, paths.dir)
+	origin := newFakeOrigin(t, lockedCommit, map[string][]byte{
+		lockedCommit: sourceArchive(t, lockedCommit, "domain:first.cn\n"),
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	if !strings.Contains(stdout, "supplement-present: false") {
+		t.Errorf("the report does not record the absent supplement:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "supplement-missing") {
+		t.Errorf("the report calls a fallback publication a machine to repair:\n%s", stdout)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
+// The verdict has to cover both pinned sources.
+//
+// This is the whole point of the finding. `up-to-date: true` is the line
+// mosdns-list-check.timer acts on, and with two sources a verdict computed from the
+// primary alone says "true" about a machine whose v2fly supplement has moved on. A
+// verdict that silently covers half its subject is worse than no verdict, because the
+// operator acts on it.
+func TestTheCheckVerdictCoversTheSupplementToo(t *testing.T) {
+	paths := newListPaths(t)
+	published := append(rulesOf(200), supplementRules(2)...)
+	publishChinaPairWithSupplement(t, paths, lockedCommit, lockedSupplementCommit, published)
+	before := snapshot(t, paths.dir)
+	// The primary has not moved. The supplement has.
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 3),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	if !strings.Contains(stdout, "up-to-date: false") {
+		t.Errorf("the primary is unchanged and the supplement has moved, so the verdict must be false:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "supplement-remote-commit: "+remoteSupplementCommit) {
+		t.Errorf("the report does not name the commit the supplement has moved to:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "supplement-remote-archive-sha256: ") {
+		t.Errorf("the report does not carry the digest the new pin would record for the supplement:\n%s", stdout)
+	}
+	// The primary's own verdict is still there and still true; only the machine's is
+	// stale. A report that said "up-to-date: false" without saying which source moved
+	// would send the operator to the wrong repository.
+	if !strings.Contains(stdout, "remote-commit: "+lockedCommit) {
+		t.Errorf("the report does not record that the primary itself has not moved:\n%s", stdout)
+	}
+	// The primary's own archive is not fetched when the primary is the source that
+	// has NOT moved: a report that carried a digest for it would be reporting a
+	// download that did not happen.
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(line, "remote-archive-sha256: ") {
+			t.Errorf("the primary has not drifted, so its archive digest is not reported:\n%s", stdout)
+		}
+	}
+	// The verdict is the LAST line and is spelled the way the timer that acts on it
+	// expects. Adding the second source to the report must not move it.
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	if last := lines[len(lines)-1]; last != "up-to-date: false" {
+		t.Errorf("the verdict is %q, want it last and spelled `up-to-date: false`:\n%s", last, stdout)
+	}
+	if stderr != "" {
+		t.Errorf("check wrote a diagnostic: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
+// The verdict is fail-closed about the second source as it is about the first.
+//
+// A machine that cannot reach the v2fly repository cannot be told whether its
+// supplement has moved on. It must not be told "up-to-date: true" for that reason, and
+// it must not be given a verdict at all -- stdout stays empty, the half of the report
+// that needed no request goes to stderr, and the exit status is the check's own.
+func TestTheCheckFailsClosedWhenTheSupplementCannotBeReached(t *testing.T) {
+	paths := newListPaths(t)
+	published := append(rulesOf(200), supplementRules(2)...)
+	publishChinaPairWithSupplement(t, paths, lockedCommit, lockedSupplementCommit, published)
+	before := snapshot(t, paths.dir)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		// Served with no HEAD of its own: the resolution cannot be answered.
+		rules.RepositoryV2Fly: {head: ""},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitStateUnavailable {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("a check that could not ask the second source wrote a verdict: %q", stdout)
+	}
+	if !strings.Contains(stderr, "supplement-commit: "+lockedSupplementCommit) {
+		t.Errorf("the disk half on the failure path does not carry the supplement's identity:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "ranges-pin:") {
+		t.Errorf("the ranges half is missing from the failure path:\n%s", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
 func TestUpdateListsCheckRefusesToRunWithoutAValidPinnedPair(t *testing.T) {
 	// A check that cannot see what it is comparing against is useless, and
 	// inventing a comparison from an invalid pair would report drift against
@@ -1268,7 +1514,7 @@ func TestTheDegradedNotePromisesARerunThatDeliversTheUnion(t *testing.T) {
 // other half is the settled decision that a degraded run is still a successful one:
 // exit 0, the primary published, and the gap named. This command's contract already
 // contains "published, degraded, loudly, exit 0" -- publishFallback writes an
-// 8,363-rule list in place of 111,357 and returns exitSuccess -- so an exit 3 here
+// 8,363-rule list in place of 110,551 and returns exitSuccess -- so an exit 3 here
 // would report "nothing was published" for a publication that happened.
 func TestADegradedRunOverALockThatNamesNoSecondSourceDoesNotClaimTheMachineIsEmpty(t *testing.T) {
 	paths := newListPaths(t)
@@ -2918,7 +3164,7 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 // incoming list is 2,003 rules of which the supplement contributed ONE: the union
 // GREW, so a comparison of the whole list against the whole list sees a healthy
 // update and publishes. Production has the same shape and a worse ratio -- seventy
-// rules beside 111,357 is 0.06%, so a supplement that lost every single rule would
+// rules beside 110,551 is 0.063%, so a supplement that lost every single rule would
 // move the union by less than a tenth of a percent and pass a 5% guardrail.
 //
 // The two counts are compared because they are the only two that are comparable: the
@@ -3171,7 +3417,7 @@ func TestAMachineWithAGoodListKeepsItWhenTheOriginIsUnreachable(t *testing.T) {
 // A cold start with no route out is a machine whose every query goes abroad. The
 // fallback is worse than the list it would have published and better than a hole, and
 // it is the ONLY publication a failed refresh may make: the guardrail is what keeps
-// that true, since 111,357 down to 8,363 is a 92.49% drop and no refresh could
+// that true, since 110,551 down to 8,363 is a 92.4% drop and no refresh could
 // mistake the fallback for a list that shrank.
 func TestAColdStartWithNoRoutePublishesTheFallbackRatherThanNothing(t *testing.T) {
 	paths := newListPaths(t)
@@ -3812,6 +4058,106 @@ func TestAMachineMovedToTheFallbackByHandTakesNoSupplement(t *testing.T) {
 	}
 }
 
+// Asking for the fallback on a machine that CARRIES a supplement is refused, and the
+// refusal has to say how to get past it.
+//
+// The case above is the deliberate move from a machine that had no supplement; this is
+// the same operator typing the same command on a machine that does. The run refuses --
+// correctly: a v2fly primary already holds every kind a supplement contributes, so the
+// pair would be a lock untrue about how the list was built, and publishing it is not an
+// option -- but with nothing published and no remedy named, the only way forward the
+// refusal leaves is editing a file under /var/lib by hand and hoping. That is the
+// outcome the refusals in this command exist to prevent, and this one is the last one
+// that still led there.
+func TestTheFallbackRefusalOverASupplementNamesHowToGetPastIt(t *testing.T) {
+	paths := newListPaths(t)
+	published := append(rulesOf(200), supplementRules(2)...)
+	publishChinaPairWithSupplement(t, paths, lockedCommit, lockedSupplementCommit, published)
+	before := snapshotWithout(t, paths.dir, paths.controlLock)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: lockedCommit,
+			archives: map[string][]byte{
+				lockedCommit: chinaSourceArchive(t, lockedCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryV2Fly,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitStateUnavailable {
+		t.Fatalf("the pin exited %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
+	}
+	for _, want := range []string{paths.sourceLock, "supplement"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the refusal does not name %q, so it leaves a hand edit as the only "+
+				"roadmap: %s", want, stderr)
+		}
+	}
+	// The machine is exactly as it was: a refusal that changed something would be a
+	// worse problem than the one it refused.
+	assertUnchanged(t, before, paths.dir, paths.controlLock)
+}
+
+// A supplement that RESOLVES but converts to nothing ends the install -- and the
+// message has to say the install is what failed, and what to roll back to.
+//
+// This is the one failure the "note, not refusal" contract does not cover. That
+// contract is about a second source that could not be REACHED: the pin is the
+// documented way out, so it publishes and says what is missing. Here the source was
+// reached, downloaded, digest-verified, and then yielded no `full:` or `regexp:` rule
+// at all. Publishing anyway would write a lock untrue about how the list was built, so
+// refusing is right -- but the error as it stood named an upstream change and nothing
+// else, on a first install, with nothing published and no forward road.
+func TestAnInstallThatCannotConvertTheSupplementSaysSoAndNamesWhatToRollBackTo(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				// Reached and verified, and its China list holds no rule of either
+				// kind a supplement contributes: upstream moved them.
+				remoteSupplementCommit: sourceArchive(t, remoteSupplementCommit, "domain:only.cn\n"),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitStateUnavailable {
+		t.Fatalf("the pin exited %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("a refused pin wrote a publication report: %q", stdout)
+	}
+	// Nothing was installed, and the message says so in the two ways an operator needs:
+	// that this run published nothing, and what is still running.
+	for _, want := range []string{"published nothing", paths.sourceLock} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the refusal does not say %q, so a first-install operator is left with an "+
+				"upstream complaint and no idea that the install is what failed: %s", want, stderr)
+		}
+	}
+	if _, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile); err != nil || found {
+		t.Errorf("a refused install left a pair behind: found=%t err=%v", found, err)
+	}
+}
+
 // A policy that cannot be loaded stops the run before anything is fetched. The
 // policy is what says whether to refresh, so a run that could not read it has no
 // business resolving a commit.
@@ -3983,6 +4329,38 @@ func TestTheCheckFlagSaysWhatItNowReports(t *testing.T) {
 	} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("the usage does not say %q about --check:\n%s", want, usage)
+		}
+	}
+}
+
+// The `--check` flag's own description is where the manual page inherits its meaning
+// from, so the two-source verdict has to be in it. A flag whose help says "the pinned
+// source" while the command judges two of them is a description that is one migration
+// out of date.
+func TestTheCheckFlagSaysTheVerdictCoversBothSources(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOrigin(t, remoteCommit, nil)
+	_, _, usage := runCLI(t, origin.services(), "--help",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile)
+	for _, want := range []string{"pinned sources", "both"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("the usage does not say %q about the two-source verdict:\n%s", want, usage)
+		}
+	}
+}
+
+// The fallback is named as such only on a machine that has nothing installed. On a
+// machine whose lock already carries a supplement, `--pin-source v2fly` is refused --
+// the supplement cannot travel beside a primary that already holds every kind it
+// contributes -- and the help is where an operator looks to find out why.
+func TestThePinSourceFlagCarriesTheFallbacksQualifier(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOrigin(t, remoteCommit, nil)
+	_, _, usage := runCLI(t, origin.services(), "--help",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile)
+	for _, want := range []string{"nothing installed", "supplement"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("the --pin-source help does not say %q:\n%s", want, usage)
 		}
 	}
 }

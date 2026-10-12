@@ -94,6 +94,17 @@ func SupplementKinds() []string {
 	return append([]string(nil), V2FlySupplementKinds...)
 }
 
+// ErrSupplementBesideFallback is the refusal for a lock that names a supplement
+// beside a primary which already carries every kind a supplement contributes.
+//
+// It is a sentinel rather than only a sentence so that the command refusing it can
+// attach the remedy. The refusal itself is correct and fail-closed -- publishing the
+// pair would write a lock untrue about how the list was built -- but a refusal with no
+// way forward leaves the operator editing a file by hand, which is the outcome the
+// refusals in this project exist to prevent. Callers match it with errors.Is; the
+// reason the message says what it says is here and not in the caller.
+var ErrSupplementBesideFallback = errors.New("a fallback primary cannot carry a supplement")
+
 // KnownRepository reports whether this gateway has reviewed name as a source.
 //
 // It is the one gate every repository name passes through before it reaches a
@@ -229,6 +240,15 @@ func whyVersionIsRefused(version int) string {
 		"re-pinning over it"
 }
 
+// ErrSupplementContributedNothing is the refusal for a supplement whose entry was
+// read successfully and yielded no rule of the kinds the lock records.
+//
+// It is a sentinel for the same reason ErrSupplementBesideFallback is: the failure is
+// upstream's, but what the operator needs is not a diagnosis -- it is the statement
+// that the install published nothing and that the pin already on disk is still what
+// this machine runs. Callers match it with errors.Is.
+var ErrSupplementContributedNothing = errors.New("a supplement contributed no rules")
+
 // Validate reports whether a published lock is complete. It is used when a lock
 // on disk is about to be replaced or compared, never as an input filter.
 func (l SourceLock) Validate() error {
@@ -272,7 +292,7 @@ func (l SourceLock) validatePinnedSource() error {
 		// by Validate on a pair already on disk. One shape covers both roles --
 		// the fallback publication names no supplement at all.
 		if l.Primary.Repository != RepositoryChina {
-			return fmt.Errorf("supplement: primary %q already carries every rule kind a supplement contributes; a v2fly primary is the fallback publication and has nothing to merge", l.Primary.Repository)
+			return fmt.Errorf("supplement: %w: primary %q already carries every rule kind a supplement contributes; a v2fly primary is the fallback publication and has nothing to merge", ErrSupplementBesideFallback, l.Primary.Repository)
 		}
 		if l.Supplement.Repository != RepositoryV2Fly {
 			return fmt.Errorf("supplement: repository %q is not the only source allowed as a supplement", l.Supplement.Repository)

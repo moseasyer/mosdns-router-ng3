@@ -154,7 +154,7 @@ func ConvertFSKinds(fsys fs.FS, entry string, kinds []string) ([]string, error) 
 		// a filter that matched nothing is a lock asking for a contribution this
 		// source cannot make.
 		if len(kinds) > 0 {
-			return nil, fmt.Errorf("%s: no rule of the requested kinds %v resolved", entry, kinds)
+			return nil, fmt.Errorf("%w: %s: no rule of the requested kinds %v resolved", ErrSupplementContributedNothing, entry, kinds)
 		}
 		return nil, fmt.Errorf("%s: entry resolved to no rules", entry)
 	}

@@ -323,9 +323,9 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	// than a second copy of it.
 	automatic := flags.Bool("automatic", false, "act on the policy's lists.china.automatic and lists.cloudflare.automatic: always report drift, and then refresh what the policy says to refresh, which by default is nothing at all. The mode a scheduled run uses")
 	policy := flags.String("policy", defaultPolicyPath, "path to the policy YAML file, read by --automatic to decide what to refresh")
-	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
+	check := flags.Bool("check", false, "report whether the pinned sources have changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. A published list is built from two repositories, so the report names both and the verdict covers both: `up-to-date: false` when either has moved on. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
-	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from. Without it the repository is the one this machine published, or -- on a machine with nothing published -- the reviewed primary `"+rules.RepositoryChina+"`; `"+rules.RepositoryV2Fly+"` is the fallback and is how you ask for it by name. With the flag the pin does not read the published lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
+	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from. Without it the repository is the one this machine published, or -- on a machine with nothing published -- the reviewed primary `"+rules.RepositoryChina+"`; `"+rules.RepositoryV2Fly+"` is the fallback and is how you ask for it by name on a machine that has nothing installed. On a machine whose lock already names a supplement it is refused: that source cannot travel beside a `"+rules.RepositoryV2Fly+"` primary, which already carries every rule kind a supplement contributes. With the flag the pin does not read the published lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
 	force := flags.Bool("force", false, "publish over a published pair that disagrees with itself -- a list whose digest the lock beside it does not record. That is the state a crash between this command's two renames leaves behind, and it is refused without this flag because nothing here archives the list, so publishing over it destroys the only trace of what was on disk. This waives NOTHING else: a collapsed list, an unreviewed repository and a lock that cannot be read are refused with or without it")
 	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
@@ -462,22 +462,34 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 }
 
-// runCheckLists reports whether the source the gateway runs on is still the one
-// the remote publishes. It writes nothing and takes no lock, so a daily check
-// never disturbs a running gateway. The report is assembled first and written
-// only once it is complete, so a check that fails half way through says so
-// instead of leaving a partial report behind.
+// runCheckLists reports whether the sources the gateway runs on are still the ones
+// the remote publishes. It writes nothing and takes no lock, so a daily check never
+// disturbs a running gateway. The report is assembled first and written only once it
+// is complete, so a check that fails half way through says so instead of leaving a
+// partial report behind.
 //
 // The published pair is read without the control lock, deliberately. Holding the
-// lock is what a pin does, and a pin on the same host is a handful of writes; a
-// daily check that took the lock would have to either block that pin or be
-// skipped whenever anything else was publishing, so it would stop being the
-// check an operator can run at any time. The consequence of reading unlocked is
-// that a check can observe a half-applied pair, and it is fail-closed about
-// that: ReadPublishedPair refuses a pair whose list and lock do not describe each
-// other, the check reports the refusal on stderr and exits 3, and it never
-// concludes "up-to-date" from a pair it could not verify. A transient exit 3 is
-// the correct answer for a check that caught a publication in flight.
+// lock is what a pin does, and a pin on the same host is a handful of writes; a daily
+// check that took the lock would have to either block that pin or be skipped whenever
+// anything else was publishing, so it would stop being the check an operator can run
+// at any time. The consequence of reading unlocked is that a check can observe a
+// half-applied pair, and it is fail-closed about that: ReadPublishedPair refuses a
+// pair whose list and lock do not describe each other, the check reports the refusal
+// on stderr and exits 3, and it never concludes "up-to-date" from a pair it could not
+// verify. A transient exit 3 is the correct answer for a check that caught a
+// publication in flight.
+//
+// BOTH pinned sources are asked and the verdict covers both. A v2 lock records a
+// primary and optionally a supplement, and the report used to be assembled from the
+// primary alone -- so a machine whose v2fly supplement had moved on was reported
+// `up-to-date: true`, and a machine published with no supplement at all (the degraded
+// pair pinSupplement leaves behind when the v2fly repository is unreachable) was
+// reported in a shape identical to a healthy pair's. `up-to-date:` is the line
+// mosdns-list-check.timer acts on, so a verdict covering half its subject is worse
+// than no verdict: the operator acts on it. Each source is resolved at its OWN
+// repository, because a commit id is only meaningful in the repository that issued
+// it, and a failure to reach EITHER one is the same fail-closed answer as a failure to
+// reach the primary.
 func runCheckLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	published, _, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
@@ -503,10 +515,10 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 
 	client := services.newHTTPClient()
 	var report bytes.Buffer
-	// The report names the primary of the lock that is on disk, and the drift
-	// check asks that repository whether it has moved on. A check that asked a
-	// hardcoded repository would answer "up to date" about a source this list
-	// was not built from, as soon as the two differ.
+	// The report names every source the lock on disk says the list was built from,
+	// and the drift check asks each of those repositories whether it has moved on. A
+	// check that asked a hardcoded repository would answer "up to date" about a
+	// source this list was not built from, as soon as the two differ.
 	writeReportLine(&report, "repository: %s\n", published.Primary.Repository)
 	if published.Primary.Entry != "" {
 		writeReportLine(&report, "entry: %s\n", published.Primary.Entry)
@@ -517,6 +529,7 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	}
 	writeReportLine(&report, "locked-commit: %s\n", published.Primary.Commit)
 	writeReportLine(&report, "locked-archive-sha256: %s\n", published.Primary.SHA256)
+	reportSupplement(&report, published)
 	writeReportLine(&report, "locked-list-sha256: %s\n", published.ListSHA256)
 
 	// The Cloudflare ranges are reported here, in the same report, and they cost
@@ -549,22 +562,106 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	}
 	writeReportLine(&report, "remote-commit: %s\n", remote.Primary.Commit)
 
-	if remote.Primary.Commit == published.Primary.Commit {
-		// The remote still publishes the commit the list was converted from, so
-		// the archive is not fetched at all.
+	// The second source is resolved at its own repository, and only when the lock
+	// names one: a fallback publication has none, and a check that asked a
+	// repository the machine does not publish from would be reporting on a source
+	// this list was not built from.
+	var supplementRemote string
+	if published.Supplement != nil {
+		resolved, err := rules.ResolveCommit(ctx, client, published.Supplement.Repository, "")
+		if err != nil {
+			// The same answer as above, and for the same reason: this machine
+			// cannot be told whether its second source has moved on, so it cannot be
+			// given a verdict. Reporting `up-to-date: true` off the primary alone is
+			// exactly the blindness this line exists to remove.
+			_, _ = stderr.Write([]byte("update-lists: " + err.Error() + "\n" +
+				"update-lists: what was read from the disk, which did not depend on that request:\n"))
+			_, _ = stderr.Write(report.Bytes())
+			return exitStateUnavailable
+		}
+		supplementRemote = resolved.Primary.Commit
+		writeReportLine(&report, "supplement-remote-commit: %s\n", supplementRemote)
+	}
+
+	// The verdict covers every source the lock names. Each is judged against its own
+	// locked commit, and each reports its own drift: "up-to-date: false" with no
+	// indication of which source moved sends the operator to the wrong repository.
+	primaryDrifted := remote.Primary.Commit != published.Primary.Commit
+	supplementDrifted := published.Supplement != nil && supplementRemote != published.Supplement.Commit
+	if !primaryDrifted && !supplementDrifted {
+		// Every remote still publishes the commit this machine was built from, so
+		// no archive is fetched at all -- on either source.
 		writeReportLine(&report, "up-to-date: true\n")
 		return writeReport(stdout, stderr, report.Bytes())
 	}
-	// The remote has moved on. The archive is read in memory only to report the
-	// digest the new pin would record; nothing is accepted here.
-	drifted, err := rules.ResolveHEAD(ctx, client, published.Primary.Repository)
-	if err != nil {
-		writeCLIError(stderr, "update-lists: %v", err)
-		return exitStateUnavailable
+	if primaryDrifted {
+		// The remote has moved on. The archive is read in memory only to report the
+		// digest the new pin would record; nothing is accepted here.
+		drifted, err := rules.ResolveHEAD(ctx, client, published.Primary.Repository)
+		if err != nil {
+			writeCLIError(stderr, "update-lists: %v", err)
+			return exitStateUnavailable
+		}
+		writeReportLine(&report, "remote-archive-sha256: %s\n", drifted.Primary.SHA256)
 	}
-	writeReportLine(&report, "remote-archive-sha256: %s\n", drifted.Primary.SHA256)
+	if supplementDrifted {
+		// The same, for the source that actually moved. Resolving it again is one
+		// request on a run that is already reporting drift, and it is the digest the
+		// refresh would verify -- a verdict that names a moved commit without the
+		// document behind it is half an answer.
+		drifted, err := rules.ResolveHEAD(ctx, client, published.Supplement.Repository)
+		if err != nil {
+			writeCLIError(stderr, "update-lists: %v", err)
+			return exitStateUnavailable
+		}
+		writeReportLine(&report, "supplement-remote-archive-sha256: %s\n", drifted.Primary.SHA256)
+	}
 	writeReportLine(&report, "up-to-date: false\n")
 	return writeReport(stdout, stderr, report.Bytes())
+}
+
+// reportSupplement writes what the lock on disk says about the list's second source.
+//
+// It reports the ABSENCE as a field rather than by leaving lines out. A report that
+// prints four supplement lines when there is one and nothing at all when there is not
+// cannot be told apart from a report about a different source: the degraded pair this
+// command itself publishes -- the primary alone, left behind when the v2fly repository
+// was unreachable -- used to produce a report identical in shape to a healthy pair's.
+// Nothing in it noticed that the ~70 rules only the second source can express were
+// gone, which is what the `supplement-missing` line is for.
+//
+// The missing line is conditional on the PRIMARY, because the two absences mean
+// opposite things. Beside a dnsmasq primary a supplement is required: the syntax that
+// primary is written in cannot say a `full:` or a `regexp:` rule, so their absence is
+// seventy names this machine is not matching, and the line names the command that puts
+// them back. Beside a v2fly primary there is nothing to repair: that source already
+// carries every rule kind a supplement could contribute, which is why a lock naming
+// one beside it is refused, so a fallback publication's `supplement-present: false` is
+// a fact about the machine and not a fault in it.
+func reportSupplement(report *bytes.Buffer, published rules.SourceLock) {
+	if published.Supplement == nil {
+		writeReportLine(report, "supplement-present: false\n")
+		if published.Primary.Repository == rules.RepositoryChina {
+			writeReportLine(report, "supplement-missing: the %s primary cannot express the %s rules "+
+				"only %s contributes, so this machine's list holds none of them. Publish one with "+
+				"`mosdns-cdnctl update-lists --pin-remote HEAD` once that repository is reachable; an "+
+				"unattended refresh does the same, but only where lists.china.automatic is on\n",
+				published.Primary.Repository, strings.Join(rules.SupplementKinds(), " and "), rules.RepositoryV2Fly)
+		}
+		return
+	}
+	writeReportLine(report, "supplement-present: true\n")
+	writeReportLine(report, "supplement-repository: %s\n", published.Supplement.Repository)
+	writeReportLine(report, "supplement-commit: %s\n", published.Supplement.Commit)
+	writeReportLine(report, "supplement-archive-sha256: %s\n", published.Supplement.SHA256)
+	if len(published.Supplement.Kinds) > 0 {
+		// The kinds are what the dnsmasq syntax cannot express, so they are what a
+		// reader counts the missing rules by. A lock with none is refused on
+		// publication, so this is a shape ReadPublishedPair would not have returned;
+		// the guard is here so the line is never written empty, which would read as a
+		// supplement contributing nothing.
+		writeReportLine(report, "supplement-kinds: %s\n", strings.Join(published.Supplement.Kinds, " "))
+	}
 }
 
 // reportRanges writes what the two published range artifacts currently hold into
@@ -886,19 +983,25 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// the list it was merged into.
 	//
 	// The union cannot stand in for either, and the arithmetic says why. The
-	// supplement is seventy rules beside 111,357, so a supplement that lost every one
-	// of them moves the union by 0.06% and sails through a 5% threshold; and a
-	// supplement that GAINED twenty rules can hide a primary that fell from twenty to
-	// four, because the union grew. Comparing each source with what this machine
-	// published for that same source is the only comparison whose two sides mean the
-	// same thing.
+	// supplement is seventy rules beside the 110,551 this machine publishes, so a
+	// supplement that lost every one of them moves the union by 0.063% and sails
+	// through a 5% threshold; and a supplement that GAINED twenty rules can hide a
+	// primary that fell from twenty to four, because the union grew. Comparing each
+	// source with what this machine published for that same source is the only
+	// comparison whose two sides mean the same thing.
+	//
+	// 110,551 is the measured figure rather than the 111,357 the design spec
+	// quotes, and the gap between them is accounted for in
+	// docs/measured-environment.md ("Where the spec's 111,357 / 111,287 came from
+	// -- 806"). It does not move this argument: the ratio is 0.063% either way
+	// against a 5% threshold, a factor of eighty.
 	wasPrimary, wasSupplement := sourceRuleCounts(current, pinned.Supplement)
 	isPrimary, isSupplement := sourceRuleCounts(list, supplement)
 	if migrating {
 		// The primary guardrail is SKIPPED here, and it is a branch rather than a
 		// comparison against something else because there is nothing to compare
 		// with: this machine has published no dnsmasq list at all, and the number on
-		// disk is the FALLBACK's. Judging 111,357 dnsmasq rules against 8,363
+		// disk is the FALLBACK's. Judging 110,551 dnsmasq rules against 8,363
 		// v2fly rules is the cross-source comparison the whole guardrail is built
 		// to refuse -- in the one direction that would refuse the intended
 		// upgrade.
@@ -1057,7 +1160,7 @@ func guardSize(stderr io.Writer, name string, ref *rules.SourceRef, incoming, pu
 // PRIMARY if this machine can reach it, and the fallback if it cannot.
 //
 // The predicate is the reachability of the PRIMARY, not "a failure happened". A
-// fresh install on a working network must get the 111,357-rule list and the
+// fresh install on a working network must get the 110,551-rule list and the
 // supplement beside it; the v2fly list is what this project falls back TO, not
 // what it starts on. Publishing the fallback to a reachable origin would be a
 // silent, eight-fold downgrade that no exit code distinguishes from a healthy
@@ -1099,7 +1202,7 @@ func publishPrimaryOrFallback(ctx context.Context, options updateListOptions, st
 // rather than lucky. refreshChinaList's destination is always the dnsmasq source --
 // a machine published from v2fly is treated as one that has not reached the primary
 // yet -- so the refresh can never publish this source at all, and the arithmetic
-// that used to make an 8,363-rule publication self-refusing against a 111,357-rule
+// that used to make an 8,363-rule publication self-refusing against a 110,551-rule
 // one is no longer what holds the property up. The single caller is.
 //
 // It does not take the control lock's archive step because there is nothing to
@@ -1358,6 +1461,43 @@ func pinSupplement(ctx context.Context, client *http.Client, options updateListO
 	return nil, false, nothing
 }
 
+// writeDownloadRemedy adds the way past a refusal to the message that names it, for
+// the two failures a Download can refuse that leave the operator with no command.
+//
+// Everything else Download refuses is upstream's fault and self-explaining: a digest
+// that does not match, a line the converter does not recognise, an archive larger than
+// the envelope. Those are read, judged, and published again once somebody has looked.
+// These two are not, because they end the run rather than the document:
+//
+//   - The supplement cannot travel beside a fallback primary. The operator asked for
+//     the fallback by name, the machine already publishes a supplement, and the two
+//     cannot be in one lock -- so nothing is published and the published pair is still
+//     the one the machine is running. Without the remedy below, the only route is a
+//     hand edit under /var/lib/mosdns/lists, which is the outcome this command's other
+//     refusals exist to prevent.
+//   - The supplement resolved but converted to nothing, which is a different failure
+//     from resolution and was not covered by the "note, not refusal" reasoning: the
+//     source WAS reached, so that contract does not apply, and a first install exits 3
+//     with nothing published. The source changed -- upstream moved the rules -- and the
+//     pin this machine was on is still on disk and still running, which is the thing to
+//     roll back to.
+func writeDownloadRemedy(stderr io.Writer, options updateListOptions, err error) {
+	switch {
+	case errors.Is(err, rules.ErrSupplementBesideFallback):
+		writeCLIError(stderr, "Nothing was published, and %s is still the pair this machine "+
+			"runs. The supplement it names cannot travel beside a %s primary, so the way past "+
+			"this is to remove the `supplement` field from that lock and run the same command "+
+			"again.",
+			options.sourceLock, rules.RepositoryV2Fly)
+	case errors.Is(err, rules.ErrSupplementContributedNothing):
+		writeCLIError(stderr, "The source changed upstream: %s resolved to nothing of the kinds "+
+			"the lock records, and this install has published nothing. The pin in %s is "+
+			"untouched and is still what this machine runs, so the thing to roll back to is the "+
+			"one already there -- pin a commit you have read the diff of, or leave it until "+
+			"upstream restores those rules.", rules.RepositoryV2Fly, options.sourceLock)
+	}
+}
+
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	client := services.newHTTPClient()
 	// Which repository the commit is resolved against, in the order the three ways
@@ -1500,6 +1640,7 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	})
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
+		writeDownloadRemedy(stderr, options, err)
 		return exitStateUnavailable
 	}
 
