@@ -233,15 +233,31 @@ primary and carries the
 .I v2fly/domain\-list\-community
 supplement the published lock already names, at the commit it already names \em
 this command was asked about one source, so the second source is not re\-resolved.
-The exception is the first pin, which is the only run with nothing to carry: it
-resolves the supplement against that repository's own HEAD and says so in its
-report, because a run that quietly acquires a second source and a run that quietly
-drops one are the same run seen from outside. If that second source cannot be
+The exception is a run with nothing to carry: the first pin, and also a later pin
+over a published lock that names no second source. Either way the run resolves the
+supplement against that repository's own HEAD and says so in its report, because a
+run that quietly acquires a second source and a run that quietly drops one are the
+same run seen from outside. The dnsmasq primary on its own cannot express the
+.B full
+and
+.B regexp
+rules only the second source contributes, so a list published without it is a
+shorter list rather than the same one \em a pin that resolves the supplement here
+is repairing a machine whose lock named a single source, not adding one to a
+machine that had the pair. A lock this build cannot read \em a schema version 1
+document, which is the one every machine upgrading carries \em is never treated
+this way: such a document has no supplement field and so cannot be said to name
+none, and the run says so rather than guessing. If that second source cannot be
 reached, the primary is published without it and standard error says what is
-missing from the list \em refusing would leave the machine with no China list at
-all, which is worse than one missing seventy rules out of a hundred and eleven
-thousand, and the next unattended refresh publishes the union once the repository
-is reachable again. A
+missing from the list \em refusing would strand the operator on the one command
+documented as the way out, and on a machine with nothing installed would leave no
+China list at all, which is worse than one missing seventy rules out of a hundred
+and eleven thousand. Run
+.B "mosdns\-cdnctl update\-lists \-\-pin\-remote HEAD"
+again once that repository is reachable and the run publishes the union; an
+unattended refresh does the same, but only on a machine whose
+.B lists.china.automatic
+switch is on, and that switch is off by default. A
 .BR v2fly/domain\-list\-community
 primary is the fallback publication and takes no supplement: that source already
 carries every rule kind a supplement contributes, so a lock naming one beside it
