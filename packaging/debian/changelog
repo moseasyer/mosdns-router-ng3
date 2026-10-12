@@ -1,0 +1,115 @@
+mosdns-router (0.3.2) unstable; urgency=high
+
+  * The install no longer refuses a machine this package provisions. preflight
+    demanded a default ACL from every state directory, and /run/mosdns is
+    deliberately provisioned at 2750 with no ACL at all, so the install refused and
+    dpkg left the package half-configured -- on every release, since the change that
+    made /run/mosdns 2750 shipped in 0.2.0. Found by the Podman integration matrix,
+    which had been blocked until now, failing on 22.04, 24.04 and 26.04 at once.
+  * The default ACL's requirement is now two questions rather than one. Where the
+    group can write the directory it must still grant the group at least what the
+    directory needs, because an unprivileged creator exists there. Where the group
+    cannot, no default ACL is required -- but one that is WIDER than the directory is
+    still refused: `default:group::rwx` on a 2750 directory makes a root-created file
+    group-writable, and rewriting a file in place needs no permission in the directory.
+  * An ACL granting more than the requirement is no longer refused for not matching
+    it exactly, and the two refusals now say which half of the ACL is at fault and
+    whether it is missing or too wide. The old wording read "its default ACL does not
+    grant the group 'r-x'" while listing, two words later, an ACL that grants exactly
+    that, and printed the whole getfacl output as the default half's contents when it
+    was printing the access half.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
+mosdns-router (0.3.1) unstable; urgency=medium
+
+  * Closing the response rewriter's ECH provider now WAITS for the background
+    refresher it stops, instead of signalling it and returning. A tick in flight
+    writes the state document, so a Close that returned early was a Close that said
+    "you may move this directory" to a goroutine about to write into it. The wait is
+    bounded by one fetch budget, because a tick carries its own timeout, so Close
+    cannot hang. Found as a CI test-teardown flake -- the testing framework removed a
+    temporary directory the refresher was still writing into -- and fixed as the
+    production defect it is rather than as the flake it showed up as.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
+mosdns-router (0.3.0) unstable; urgency=medium
+
+  * policy.yaml's `schedule` now changes when the daily list work runs. It was
+    validated as HH:MM and read by nothing, while the timer that actually decided
+    carried a hardcoded OnCalendar, so an operator who changed the policy got no
+    change at all. The timer is now rendered from the policy and systemd is
+    reloaded as part of writing it. The default moves from 03:00 to 03:30, which is
+    the time the hardcoded timer was already using, so making the field real did not
+    also move the machine half an hour earlier.
+  * Two new switches, both off: lists.china.automatic and lists.cloudflare.automatic.
+    They are separate because the risks differ -- Cloudflare's ranges choose which
+    CDN edge an answer is rewritten to, data/cn decides which names take the
+    foreign branch at all, so bundling them would mean opening the cheap one opens
+    the expensive one. The China list's refresh refuses a list that has lost more
+    than 5% of its rules, and leaves everything published untouched when it does.
+  * `update-lists --pin-remote` now takes an optional commit, and archives the
+    outgoing pin to source-lock.previous.json before publishing. Until now a pin
+    accepted by mistake could not be undone, because the command could only name
+    upstream's current HEAD. A publication that cannot be archived now stops rather
+    than proceeding without a rollback target.
+  * `mosdns-cdnctl render` publishes the generated timer into
+    /usr/lib/systemd/system and reloads systemd. It takes --unit-out for the
+    directory, which is separate from --out because systemd does not read units from
+    the document directory.
+  * The daily list work is no longer a report-only unit: it runs the new
+    `--automatic` mode, so it may publish. Its sandbox is sized for that --
+    ReadWritePaths for the two state directories, a umask, and exit 4 excused,
+    because publishing takes the control lock and a daily job that skipped because
+    the router was being reconfigured is not a failed day.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
+mosdns-router (0.2.1) unstable; urgency=medium
+
+  * No change to the shipped program. The package contents are identical to
+    0.2.0; what moved is how a Release is produced.
+  * Publishing is now a separate, explicit workflow that takes the ID of a build
+    run and promotes THAT artifact. build-deb.yml used to build and publish in one
+    run, so a Release was whatever the last run produced and nothing was ever
+    selected. There is still no path to a Release that is not a run in the Actions
+    list.
+  * The release tag must now equal the package version. A release tagged v0.2.1
+    carrying a package whose control field says 0.2.0 was possible and was a trap
+    for whoever installed it.
+  * The artifact assertions moved into scripts/assert-deb.sh so the build and the
+    publish step run the same ones, rather than two copies that would drift.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
+mosdns-router (0.2.0) unstable; urgency=medium
+
+  * The foreign route is configurable. policy.yaml gains `foreign.upstreams`, a
+    list of the packaged DNSCrypt resolver and/or mosdns-dialed upstreams in any
+    scheme mosdns accepts, plus `foreign.concurrent` (default 2) and a
+    `foreign_cache` block carrying the cache size and an optional record-time
+    bound. The routing document derives its forward list from it, and the ECH key
+    is fetched over TCP through whichever enabled entry can carry it -- a policy
+    with no such entry is refused by name rather than rendered.
+  * NEW VERB: `mosdns-cdnctl check-upstream` reports whether each enabled entry
+    can be dialled and can answer, and `mosdns-cdnctl flush-cache` empties the
+    router's foreign answer cache through the cache plugin's own endpoint.
+  * BREAKING, and it is the kind an operator has to act on: a policy.yaml that
+    predates `foreign.upstreams` no longer validates, and the refusal says what
+    to add. policy.yaml is a conffile, so a customised copy survives the upgrade
+    and the router will not start against it until `foreign.upstreams` is added --
+    the two lines the shipped policy carries restore the previous behaviour.
+  * The routing document gains an `api` block on 127.0.0.1:15354, which is what
+    makes the cache plugin's own flush endpoint reachable. It is loopback and
+    unprivileged, like every other listener this package configures.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 04 Oct 2026 00:00:00 +0000
+
+mosdns-router (0.1.0) unstable; urgency=medium
+
+  * First packaged release: the DNS router, the DNSCrypt foreign resolver, the
+    CDN optimizer and its timers, the DHCP bridge hook, and the transactional
+    installer that points this machine's NetworkManager connection at 127.0.0.1.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 27 Sep 2026 00:00:00 +0000

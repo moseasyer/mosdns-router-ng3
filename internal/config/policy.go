@@ -1,0 +1,271 @@
+package config
+
+import (
+	"fmt"
+	"math"
+	"net/netip"
+	"strings"
+)
+
+// The design selects IPv4 only, and the spec fixes hard upper bounds on the
+// daily measurement traffic, on a single candidate's transfer, and on how long
+// one candidate may be held open. A policy above these caps would let a later
+// optimizer exceed the approved budget, so the caps are rejected here instead
+// of at measurement time.
+const (
+	requiredIPVersion          = "IPv4"
+	maximumDailyBudgetBytes    = 100 * 1024 * 1024
+	maximumPerCandidateBytes   = 10 * 1024 * 1024
+	maximumPerCandidateSeconds = 3
+	maximumHostnameLength      = 253
+	maximumHostnameLabelLength = 63
+)
+
+type Policy struct {
+	SchemaVersion int           `yaml:"schema_version"`
+	Schedule      string        `yaml:"schedule"`
+	Lists         ListsPolicy   `yaml:"lists"`
+	Foreign       ForeignPolicy `yaml:"foreign"`
+	CDN           CDNPolicy     `yaml:"cdn"`
+	ECH           ECHPolicy     `yaml:"ech"`
+	DHCP          DHCPPolicy    `yaml:"dhcp"`
+	Cache         CachePolicy   `yaml:"cache"`
+	ForeignCache  ForeignCache  `yaml:"foreign_cache"`
+}
+
+// ListsPolicy is whether this package refreshes the two documents it fetches from
+// the internet on its own. It is two switches rather than one because the two are
+// not the same kind of risk: Cloudflare's ranges choose which CDN edge an answer is
+// rewritten to, while data/cn decides which names take the foreign branch at all, so
+// bundling them means opening the cheap one opens the expensive one.
+type ListsPolicy struct {
+	China      ChinaListPolicy      `yaml:"china"`
+	Cloudflare CloudflareListPolicy `yaml:"cloudflare"`
+}
+
+// ChinaListPolicy is unattended refresh of the pinned domain list. Off by default,
+// and the reason is a fact about the upstream document rather than a preference:
+// data/cn is curated by hand, so ANY commit to it moves the split, and accepting one
+// unattended is a routing change nobody reviewed. The switch exists because an
+// operator who has decided they want that trade can have it, not because it is a
+// good default.
+type ChinaListPolicy struct {
+	Automatic bool `yaml:"automatic"`
+}
+
+// CloudflareListPolicy is unattended refresh of the published Cloudflare address
+// ranges. Off by default for the same reason as every other fetch in this package:
+// the snapshot is pinned so that a document this project did not review cannot change
+// what the rewriter answers. The consequence of being wrong here is smaller than the
+// China list's -- these ranges never decide which names take which branch, only which
+// edge a rewritten answer points at.
+type CloudflareListPolicy struct {
+	Automatic bool `yaml:"automatic"`
+}
+
+type ForeignPolicy struct {
+	DefaultProvider string            `yaml:"default_provider"`
+	ECS             bool              `yaml:"ecs"`
+	Concurrent      int               `yaml:"concurrent"`
+	Upstreams       []ForeignUpstream `yaml:"upstreams"`
+}
+
+// ForeignCache is the router's own foreign-branch answer cache.
+type ForeignCache struct {
+	Size int `yaml:"size"`
+	// TTLMax and TTLMin are bounds in seconds, and 0 means NO bound -- which is why
+	// the renderer omits the whole clamp plugin rather than writing a zero: mosdns's
+	// ApplyMaximumTTL(m, 0) sets every record's TTL to 0, and ApplyMinimalTTL(m, 0)
+	// likewise floors everything at 0.
+	TTLMax int `yaml:"ttl_max"`
+	TTLMin int `yaml:"ttl_min"`
+}
+
+type CDNPolicy struct {
+	IPVersion                string           `yaml:"ip_version"`
+	SuppressAAAA             bool             `yaml:"suppress_aaaa"`
+	Cloudflare               CloudflarePolicy `yaml:"cloudflare"`
+	LatencyCandidateCount    int              `yaml:"latency_candidate_count"`
+	Combined                 CombinedPolicy   `yaml:"combined"`
+	SwitchImprovementPercent float64          `yaml:"switch_improvement_percent"`
+	Health                   HealthPolicy     `yaml:"health"`
+	Bandwidth                BandwidthPolicy  `yaml:"bandwidth"`
+}
+
+type CloudflarePolicy struct {
+	MaxCandidates int `yaml:"max_candidates"`
+}
+
+type CombinedPolicy struct {
+	LatencyTop   int `yaml:"latency_top"`
+	BandwidthTop int `yaml:"bandwidth_top"`
+}
+
+type HealthPolicy struct {
+	IntervalSeconds  int `yaml:"interval"`
+	FailureThreshold int `yaml:"failure_threshold"`
+}
+
+type BandwidthPolicy struct {
+	DailyBytes          int64 `yaml:"daily_budget"`
+	PerCandidateBytes   int64 `yaml:"per_candidate_limit"`
+	PerCandidateSeconds int   `yaml:"per_candidate_seconds"`
+}
+
+type ECHPolicy struct {
+	Enabled           bool     `yaml:"enabled"`
+	FailurePolicy     string   `yaml:"failure_policy"`
+	StaleGraceSeconds int      `yaml:"stale_grace"`
+	Sources           []string `yaml:"sources"`
+}
+
+type DHCPPolicy struct {
+	FailurePolicy string `yaml:"failure_policy"`
+}
+
+type CachePolicy struct {
+	PersistentDump bool `yaml:"persistent_dump"`
+}
+
+func (p Policy) Validate() error {
+	if p.SchemaVersion != 1 {
+		return fmt.Errorf("schema_version must be 1")
+	}
+	if !validSchedule(p.Schedule) {
+		return fmt.Errorf("schedule must be a valid HH:MM time")
+	}
+	if p.Foreign.DefaultProvider == "" {
+		return fmt.Errorf("foreign.default_provider must not be empty")
+	}
+	if err := ValidateForeignUpstreams(p.Foreign.Upstreams); err != nil {
+		return err
+	}
+	// 1 is mosdns's own default and it is a RANDOM PICK, not a race
+	// (pkg/executable/forward/forward.go:265-267), so an operator who set it to 1
+	// has a valid policy with no failover between their upstreams. 3 is mosdns's
+	// own hard cap, so a larger value would be silently truncated.
+	if p.Foreign.Concurrent < 1 || p.Foreign.Concurrent > 3 {
+		return fmt.Errorf("foreign.concurrent must be between 1 and 3, got %d; 1 is mosdns's own "+
+			"default and means a random pick with no failover, and 3 is the cap mosdns enforces",
+			p.Foreign.Concurrent)
+	}
+	if p.ForeignCache.Size <= 0 {
+		return fmt.Errorf("foreign_cache.size must be greater than zero")
+	}
+	if p.ForeignCache.TTLMax < 0 || p.ForeignCache.TTLMin < 0 {
+		return fmt.Errorf("foreign_cache.ttl_max and foreign_cache.ttl_min must not be negative")
+	}
+	if p.CDN.IPVersion != requiredIPVersion {
+		return fmt.Errorf("cdn.ip_version must be %s", requiredIPVersion)
+	}
+	if p.CDN.Cloudflare.MaxCandidates <= 0 {
+		return fmt.Errorf("cdn.cloudflare.max_candidates must be greater than zero")
+	}
+	if p.CDN.LatencyCandidateCount <= 0 {
+		return fmt.Errorf("cdn.latency_candidate_count must be greater than zero")
+	}
+	if p.CDN.Combined.LatencyTop <= 0 {
+		return fmt.Errorf("cdn.combined.latency_top must be greater than zero")
+	}
+	if p.CDN.Combined.BandwidthTop <= 0 {
+		return fmt.Errorf("cdn.combined.bandwidth_top must be greater than zero")
+	}
+	if math.IsNaN(p.CDN.SwitchImprovementPercent) || math.IsInf(p.CDN.SwitchImprovementPercent, 0) || p.CDN.SwitchImprovementPercent < 0 {
+		return fmt.Errorf("cdn.switch_improvement_percent must be non-negative and finite")
+	}
+	if p.CDN.Health.IntervalSeconds <= 0 {
+		return fmt.Errorf("cdn.health.interval must be greater than zero")
+	}
+	if p.CDN.Health.FailureThreshold <= 0 {
+		return fmt.Errorf("cdn.health.failure_threshold must be greater than zero")
+	}
+	if p.CDN.Bandwidth.DailyBytes <= 0 {
+		return fmt.Errorf("cdn.bandwidth.daily_budget must be greater than zero")
+	}
+	if p.CDN.Bandwidth.PerCandidateBytes <= 0 {
+		return fmt.Errorf("cdn.bandwidth.per_candidate_limit must be greater than zero")
+	}
+	if p.CDN.Bandwidth.PerCandidateSeconds <= 0 {
+		return fmt.Errorf("cdn.bandwidth.per_candidate_seconds must be greater than zero")
+	}
+	if p.CDN.Bandwidth.DailyBytes > maximumDailyBudgetBytes {
+		return fmt.Errorf("cdn.bandwidth.daily_budget must not exceed %d bytes", maximumDailyBudgetBytes)
+	}
+	if p.CDN.Bandwidth.PerCandidateBytes > maximumPerCandidateBytes {
+		return fmt.Errorf("cdn.bandwidth.per_candidate_limit must not exceed %d bytes", maximumPerCandidateBytes)
+	}
+	if p.CDN.Bandwidth.PerCandidateSeconds > maximumPerCandidateSeconds {
+		return fmt.Errorf("cdn.bandwidth.per_candidate_seconds must not exceed %d", maximumPerCandidateSeconds)
+	}
+	if p.ECH.StaleGraceSeconds < 0 {
+		return fmt.Errorf("ech.stale_grace must be non-negative")
+	}
+	if p.ECH.FailurePolicy != "strict" && p.ECH.FailurePolicy != "fallback" {
+		return fmt.Errorf("ech.failure_policy must be strict or fallback")
+	}
+	for _, source := range p.ECH.Sources {
+		if !validHostname(source) {
+			return fmt.Errorf("ech.sources must be DNS hostnames")
+		}
+	}
+	if p.DHCP.FailurePolicy != "disable-current" && p.DHCP.FailurePolicy != "use-last-good" {
+		return fmt.Errorf("dhcp.failure_policy must be disable-current or use-last-good")
+	}
+	return nil
+}
+
+// validHostname accepts a syntactically valid DNS name and nothing else. An ECH
+// source is queried as a host name over the foreign DNSCrypt path, so a URL
+// scheme, a path, an address literal, or a wildcard would silently turn a
+// configured source into something that cannot be queried. The state package
+// applies the same DNS presentation rule to the ECH source and public name it
+// reads back from disk; the two packages stay independent of each other.
+func validHostname(value string) bool {
+	if value == "" || len(value) > maximumHostnameLength || strings.HasSuffix(value, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(value); err == nil {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if !validHostnameLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func validHostnameLabel(label string) bool {
+	if label == "" || len(label) > maximumHostnameLabelLength {
+		return false
+	}
+	for index := 0; index < len(label); index++ {
+		character := label[index]
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9':
+		case character == '-':
+			if index == 0 || index == len(label)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validSchedule(value string) bool {
+	if len(value) != len("HH:MM") || value[2] != ':' {
+		return false
+	}
+	for _, index := range []int{0, 1, 3, 4} {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	hour := int(value[0]-'0')*10 + int(value[1]-'0')
+	minute := int(value[3]-'0')*10 + int(value[4]-'0')
+	return hour <= 23 && minute <= 59
+}

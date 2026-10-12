@@ -1,0 +1,768 @@
+package dhcp_forward
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/pkg/concurrent_lru"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
+	"github.com/miekg/dns"
+	"go.uber.org/zap"
+	"mosdns-router/internal/state"
+)
+
+// truncatedResponseBit is the TC flag in the second byte of a DNS header.
+const truncatedResponseBit = 1 << 1
+
+// minimumAnswerHeaderSize is the size of a DNS header, so a payload this short
+// cannot be read for its flags.
+const minimumAnswerHeaderSize = 12
+
+var (
+	errClosed       = errors.New("dhcp_forward: the plugin is closed")
+	errNoGeneration = errors.New("dhcp_forward: no valid DHCP state is available")
+	errDisabled     = errors.New("dhcp_forward: the current DHCP generation has no upstream")
+	errNoQuestion   = errors.New("dhcp_forward: a forwarded query must carry exactly one question")
+	errAllFailed    = errors.New("dhcp_forward: every DHCP upstream failed")
+)
+
+// readStateFunc loads one published state document and validates it.
+type readStateFunc func(path string) (state.DHCPState, error)
+
+// readDHCPState is the production reader. It goes through the strict state
+// decoder, so a state file carrying a local, multicast, zoned, or otherwise
+// unusable upstream is refused instead of redirecting domestic queries.
+func readDHCPState(path string) (state.DHCPState, error) {
+	var published state.DHCPState
+	if err := state.ReadJSON(path, &published); err != nil {
+		return state.DHCPState{}, err
+	}
+	return published, nil
+}
+
+// fileSignature is what the reload looks at before it reads the state file.
+//
+// The bridge publishes with a same-directory rename, so a new generation always
+// arrives as a new file. Identity is part of the signature for exactly that
+// reason: a replacement document that happens to be the same length and to carry
+// the same modification time as the file it replaces — which a publisher with
+// coarse timestamps, or two publications inside one clock tick, can produce — is
+// still a new document. os.SameFile compares the device and inode on every
+// platform the project builds for, so no build tag is needed.
+type fileSignature struct {
+	exists  bool
+	modTime time.Time
+	size    int64
+	info    os.FileInfo
+}
+
+// sameAs reports whether two observations describe the same published document.
+func (s fileSignature) sameAs(other fileSignature) bool {
+	if s.exists != other.exists || !s.modTime.Equal(other.modTime) || s.size != other.size {
+		return false
+	}
+	if s.info == nil || other.info == nil {
+		return s.info == nil && other.info == nil
+	}
+	return os.SameFile(s.info, other.info)
+}
+
+// runtime owns the published generations. One query at a time reloads the state
+// file, so every query sees the current generation before it looks in a cache.
+// Queries read the current generation through an atomic pointer and never wait
+// for the reload lock.
+type runtime struct {
+	logger    *zap.Logger
+	read      readStateFunc
+	stateFile string
+	port      uint16
+
+	timeout      time.Duration
+	concurrency  int
+	retireAfter  time.Duration
+	cacheEntries int
+	// failurePolicy is what a newer generation without a usable upstream means.
+	// It is resolved at init, so a query never has to know whether the policy
+	// was configured at all.
+	failurePolicy string
+
+	reloadMu sync.Mutex
+	current  atomic.Pointer[runtimeGeneration]
+	retired  []*runtimeGeneration
+	observed fileSignature
+	// unreadable records that the last read of the current file failed, so the
+	// file is read again on the next query and the failure is reported once.
+	unreadable bool
+	closed     bool
+}
+
+// runtimeGeneration is one published DHCP state: the upstream clients it needs,
+// the cache its answers live in, and the instant its clients may be released.
+type runtimeGeneration struct {
+	generation uint64
+	// observedAt is when the DHCP DNS this generation forwards to was seen. It
+	// is the only age the runtime can report about a generation it keeps
+	// serving, because a generation is adopted rather than aged by this process.
+	observedAt time.Time
+	endpoints  []*endpoint
+	cache      *responseCache
+
+	// retireAt is zero while the generation is current.
+	retireAt time.Time
+	closed   bool
+}
+
+// endpoint is one upstream address with the client pair a query needs. The UDP
+// client never falls back to TCP on its own, so a truncated answer is retried
+// over the TCP client this plugin owns and can account for.
+type endpoint struct {
+	address string
+	udp     upstream.Upstream
+	tcp     upstream.Upstream
+}
+
+func (e *endpoint) close() error {
+	return errors.Join(e.udp.Close(), e.tcp.Close())
+}
+
+// exchange answers one query from the current generation.
+func (r *runtime) exchange(ctx context.Context, query *dns.Msg) (*dns.Msg, error) {
+	// A mosdns context always carries exactly one question, so anything else is
+	// refused here instead of indexing into an empty slice.
+	if len(query.Question) != 1 {
+		return nil, errNoQuestion
+	}
+	generation, err := r.reload()
+	if err != nil {
+		return nil, err
+	}
+	if len(generation.endpoints) == 0 {
+		return nil, errDisabled
+	}
+
+	key := newCacheKey(generation.generation, query)
+	if answer, ok := generation.cache.get(key, query, time.Now()); ok {
+		return answer, nil
+	}
+
+	response, err := r.race(ctx, generation, query)
+	if err != nil {
+		return nil, err
+	}
+	// Only the current generation may publish an answer. A generation that was
+	// replaced while the query was in flight must not fill the new generation's
+	// cache with an answer its upstreams never produced.
+	if r.current.Load() == generation {
+		generation.cache.put(key, response, time.Now())
+	}
+	return response, nil
+}
+
+// race asks up to the configured number of distinct upstreams and prefers a
+// response that answers the question over one that reports a failure.
+func (r *runtime) race(ctx context.Context, generation *runtimeGeneration, query *dns.Msg) (*dns.Msg, error) {
+	wire, err := pool.PackBuffer(query)
+	if err != nil {
+		return nil, err
+	}
+	defer pool.ReleaseBuf(wire)
+
+	picked := generation.pick(query.Question[0].Name, r.concurrency)
+
+	type outcome struct {
+		response *dns.Msg
+		err      error
+	}
+	outcomes := make(chan outcome, len(picked))
+	for _, candidate := range picked {
+		payload := copyPayload(*wire)
+		go func(candidate *endpoint) {
+			response, err := r.ask(ctx, candidate, payload)
+			select {
+			case outcomes <- outcome{response: response, err: err}:
+			case <-ctx.Done():
+			}
+		}(candidate)
+	}
+
+	var failure *dns.Msg
+	var failureErr error
+	for range picked {
+		select {
+		case result := <-outcomes:
+			if result.err != nil {
+				if failureErr == nil {
+					failureErr = result.err
+				}
+				continue
+			}
+			if answerable(result.response) {
+				return result.response, nil
+			}
+			if failure == nil {
+				failure = result.response
+			}
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
+	}
+	if failure != nil {
+		return failure, nil
+	}
+	if failureErr != nil {
+		return nil, failureErr
+	}
+	return nil, errAllFailed
+}
+
+// ask runs one upstream attempt. The UDP answer and its TCP retry share a single
+// budget, which is what makes the upstream timeout a bound on any one exchange
+// and lets the retirement window be trusted to outlive it.
+func (r *runtime) ask(ctx context.Context, candidate *endpoint, payload []byte) (*dns.Msg, error) {
+	attempt, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	response, err := candidate.udp.ExchangeContext(attempt, payload)
+	if err != nil {
+		return nil, err
+	}
+	if !truncated(response) {
+		return unpack(response)
+	}
+	pool.ReleaseBuf(response)
+
+	response, err = candidate.tcp.ExchangeContext(attempt, payload)
+	if err != nil {
+		return nil, fmt.Errorf("dhcp_forward: %s: truncated udp answer, tcp retry: %w", candidate.address, err)
+	}
+	return unpack(response)
+}
+
+// reload returns the current generation, replacing it when the state file
+// publishes a strictly newer one. A missing, unreadable, invalid, or older file
+// leaves the last valid generation in place.
+func (r *runtime) reload() (*runtimeGeneration, error) {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
+	if r.closed {
+		return nil, errClosed
+	}
+	r.sweep(time.Now())
+
+	generation, err := r.reloadGeneration()
+	if err != nil {
+		return nil, err
+	}
+	if generation == nil {
+		return nil, errNoGeneration
+	}
+	return generation, nil
+}
+
+// reloadGeneration re-reads the state file if the file changed. It must be
+// called with the reload lock held.
+func (r *runtime) reloadGeneration() (*runtimeGeneration, error) {
+	signature, err := statStateFile(r.stateFile)
+	if err != nil {
+		// Nothing to read yet. The file is not read until it exists, and the
+		// current generation keeps serving.
+		r.logger.Debug("no dhcp state file yet", zap.String("path", r.stateFile), zap.Error(err))
+		return r.current.Load(), nil
+	}
+	if signature.sameAs(r.observed) && !r.unreadable {
+		return r.current.Load(), nil
+	}
+
+	published, err := r.read(r.stateFile)
+	if err != nil {
+		// The signature is deliberately not remembered. A read that failed once
+		// must not leave the router waiting for the next DHCP event, and the
+		// failure is reported once per streak instead of once per query.
+		if !r.unreadable {
+			r.unreadable = true
+			r.logger.Warn("keeping the current dhcp generation: the published state is unusable",
+				zap.String("path", r.stateFile), zap.Error(err))
+		}
+		return r.current.Load(), nil
+	}
+	r.unreadable = false
+	r.observed = signature
+
+	current := r.current.Load()
+	if current != nil && published.Generation <= current.generation {
+		r.logger.Warn("keeping the current dhcp generation: the published state is not newer",
+			zap.String("path", r.stateFile),
+			zap.Uint64("published_generation", published.Generation),
+			zap.Uint64("current_generation", current.generation))
+		return current, nil
+	}
+
+	replacement, err := newRuntimeGeneration(published, r)
+	if err != nil {
+		r.logger.Warn("keeping the current dhcp generation: the published state cannot be served",
+			zap.String("path", r.stateFile),
+			zap.Uint64("published_generation", published.Generation),
+			zap.Error(err))
+		return current, nil
+	}
+
+	now := time.Now()
+	// The use-last-good policy keeps a generation that can answer. With no
+	// current generation there is nothing to keep, so the empty one is adopted
+	// and the branch fails closed exactly as it does under the other policy.
+	if current != nil && len(replacement.endpoints) == 0 && r.failurePolicy == failurePolicyUseLastGood {
+		// The decision is made once, when the generation is first seen: the
+		// signature above is already recorded, so an unchanged file never
+		// reaches this point again and the report cannot repeat per query.
+		r.logger.Warn("keeping the last dhcp generation that has an upstream",
+			zap.Uint64("published_generation", published.Generation),
+			zap.Uint64("retained_generation", current.generation),
+			zap.Time("observed_at", current.observedAt),
+			zap.Duration("age", now.Sub(current.observedAt)))
+		_ = replacement.close()
+		return current, nil
+	}
+
+	if current != nil {
+		current.retireAt = now.Add(r.retireAfter)
+		r.retired = append(r.retired, current)
+		r.logger.Info("dhcp upstream generation replaced",
+			zap.Uint64("generation", replacement.generation),
+			zap.Uint64("replaced_generation", current.generation),
+			zap.Int("upstreams", len(replacement.endpoints)),
+			zap.Duration("retire_after", r.retireAfter))
+	}
+	r.current.Store(replacement)
+	return replacement, nil
+}
+
+// sweep releases the generations whose retirement window has passed. It must be
+// called with the reload lock held.
+func (r *runtime) sweep(now time.Time) {
+	kept := r.retired[:0]
+	for _, generation := range r.retired {
+		if now.Before(generation.retireAt) {
+			kept = append(kept, generation)
+			continue
+		}
+		r.logger.Info("releasing a retired dhcp upstream generation", zap.Uint64("generation", generation.generation))
+		_ = generation.close()
+	}
+	r.retired = kept
+}
+
+// close releases every client the runtime owns. It is safe to call more than
+// once, and a query after it fails closed.
+func (r *runtime) close() error {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+
+	var err error
+	if generation := r.current.Swap(nil); generation != nil {
+		err = errors.Join(err, generation.close())
+	}
+	for _, generation := range r.retired {
+		err = errors.Join(err, generation.close())
+	}
+	r.retired = nil
+	return err
+}
+
+// newRuntimeGeneration builds the clients and the cache of one published state.
+// An empty upstream list is a valid, disabled generation.
+func newRuntimeGeneration(published state.DHCPState, r *runtime) (*runtimeGeneration, error) {
+	// A state that is not last known good must not name an upstream. The bridge
+	// publishes that combination when it cannot vouch for a set, and a set nobody
+	// vouched for is not a set a query may be forwarded to. An empty list is the
+	// documented way to disable the branch, so only the inconsistent combination
+	// is refused here.
+	if !published.LastGood && len(published.Upstreams) > 0 {
+		return nil, fmt.Errorf(
+			"dhcp_forward: generation %d is not last known good but names %d upstream(s)",
+			published.Generation, len(published.Upstreams),
+		)
+	}
+	generation := &runtimeGeneration{
+		generation: published.Generation,
+		observedAt: published.ObservedAt,
+		cache:      newResponseCache(r.cacheEntries),
+	}
+	for _, address := range published.Upstreams {
+		candidate, err := newEndpoint(address, published.Interface, r.port, r.logger)
+		if err != nil {
+			_ = generation.close()
+			return nil, err
+		}
+		if generation.hasEndpoint(candidate.address) {
+			// A repeated address would make the rotation pick the same upstream
+			// twice in one query.
+			_ = candidate.close()
+			continue
+		}
+		generation.endpoints = append(generation.endpoints, candidate)
+	}
+	return generation, nil
+}
+
+func (g *runtimeGeneration) hasEndpoint(address string) bool {
+	for _, candidate := range g.endpoints {
+		if candidate.address == address {
+			return true
+		}
+	}
+	return false
+}
+
+// close releases the clients of a generation that is never used again. Its cache
+// entries go with it: no query reads a released generation's cache.
+func (g *runtimeGeneration) close() error {
+	if g.closed {
+		return nil
+	}
+	g.closed = true
+	var err error
+	for _, candidate := range g.endpoints {
+		err = errors.Join(err, candidate.close())
+	}
+	return err
+}
+
+// pick chooses the endpoints one query races. The rotation is a hash of the
+// question name, so the same question always starts at the same upstream, with
+// no global random source, while different questions spread over the whole set.
+func (g *runtimeGeneration) pick(qname string, concurrency int) []*endpoint {
+	count := min(concurrency, len(g.endpoints))
+	if count <= 0 {
+		return nil
+	}
+	total := uint64(len(g.endpoints))
+	start := hashName(qname) % total
+	picked := make([]*endpoint, count)
+	for index := range picked {
+		picked[index] = g.endpoints[(start+uint64(index))%total]
+	}
+	return picked
+}
+
+// hashName is FNV-1a over the question name, which is stable across processes
+// and needs no seeding.
+func hashName(name string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	hash := uint64(offset)
+	for index := range len(name) {
+		hash ^= uint64(name[index])
+		hash *= prime
+	}
+	return hash
+}
+
+// newEndpoint turns one published address into a dialable endpoint. A bare IPv6
+// link-local address only routes through the interface that owns it, and the
+// state records that interface instead of a zone in the address, so the zone is
+// added here. The address is assembled from parsed parts only.
+func newEndpoint(address, interfaceName string, port uint16, logger *zap.Logger) (*endpoint, error) {
+	parsed, err := netip.ParseAddr(address)
+	if err != nil {
+		return nil, fmt.Errorf("dhcp_forward: upstream %q is not an IP address: %w", address, err)
+	}
+	if parsed.Zone() == "" && parsed.Is6() && parsed.IsLinkLocalUnicast() {
+		if interfaceName == "" {
+			return nil, fmt.Errorf("dhcp_forward: upstream %q is link-local and the state records no interface", address)
+		}
+		parsed = parsed.WithZone(interfaceName)
+	}
+
+	addrPort := netip.AddrPortFrom(parsed, port)
+	candidate := &endpoint{address: addrPort.String()}
+	candidate.udp = &udpClient{target: net.UDPAddrFromAddrPort(addrPort)}
+
+	// The TCP client is built from a parsed host and port, so an address that
+	// needs brackets or carries a zone cannot be mangled by concatenation.
+	tcpURL := (&url.URL{Scheme: "tcp", Host: net.JoinHostPort(parsed.String(), strconv.Itoa(int(port)))}).String()
+	tcpUpstream, err := upstream.NewUpstream(tcpURL, upstream.Opt{Logger: logger})
+	if err != nil {
+		_ = candidate.udp.Close()
+		return nil, fmt.Errorf("dhcp_forward: upstream %q has no usable tcp client: %w", address, err)
+	}
+	candidate.tcp = tcpUpstream
+	return candidate, nil
+}
+
+// udpClient exchanges a query over one connected UDP socket that lives exactly as
+// long as the query.
+//
+// The plugin keeps this exchange itself on purpose. mosdns's pipelined UDP
+// transport re-sends any query that has not been answered within a second, which
+// would send a DHCP query to the upstream twice, and it can drop an answer that
+// arrives before its exchange starts waiting for it, which costs a full timeout.
+// One write and one read on one socket the caller owns can do neither.
+type udpClient struct {
+	target *net.UDPAddr
+}
+
+func (c *udpClient) ExchangeContext(ctx context.Context, query []byte) (*[]byte, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", c.target.String())
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+
+	payload := pool.GetBuf(dns.MaxMsgSize)
+	// The reader owns the buffer until it is no longer writing into it, and the
+	// caller owns it as soon as the reader hands it over. A read that failed
+	// produced nothing to hand over, so the reader returns the buffer itself; a
+	// read that succeeded passes ownership across. A caller that stops waiting
+	// closes the socket, which ends the read, and then waits for the reader
+	// either way: a read that completed in the meantime still owns a buffer, and
+	// dropping it would leak it, while a read that failed has already returned
+	// its own and must not be released twice.
+	type readResult struct {
+		payload *[]byte
+		size    int
+		err     error
+	}
+	read := make(chan readResult, 1)
+	go func() {
+		size, err := conn.Read(*payload)
+		if err != nil {
+			pool.ReleaseBuf(payload)
+			read <- readResult{size: size, err: err}
+			return
+		}
+		*payload = (*payload)[:size]
+		read <- readResult{payload: payload, size: size}
+	}()
+
+	select {
+	case result := <-read:
+		if result.err != nil {
+			return nil, result.err
+		}
+		return result.payload, nil
+	case <-ctx.Done():
+		_ = conn.Close()
+		abandoned := <-read
+		if abandoned.err == nil {
+			pool.ReleaseBuf(abandoned.payload)
+		}
+		return nil, context.Cause(ctx)
+	}
+}
+
+// Close releases the client. Every socket belongs to one exchange, so there is
+// nothing left to hold.
+func (c *udpClient) Close() error {
+	return nil
+}
+
+// answerable reports whether a response answers the question. Only those are
+// preferred over a failure, and only those are cacheable.
+func answerable(response *dns.Msg) bool {
+	return response.Rcode == dns.RcodeSuccess || response.Rcode == dns.RcodeNameError
+}
+
+func truncated(payload *[]byte) bool {
+	return len(*payload) >= minimumAnswerHeaderSize && (*payload)[2]&truncatedResponseBit != 0
+}
+
+func unpack(payload *[]byte) (*dns.Msg, error) {
+	defer pool.ReleaseBuf(payload)
+	response := new(dns.Msg)
+	if err := response.Unpack(*payload); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func copyPayload(payload []byte) []byte {
+	duplicate := make([]byte, len(payload))
+	copy(duplicate, payload)
+	return duplicate
+}
+
+func statStateFile(path string) (fileSignature, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileSignature{}, err
+	}
+	return fileSignature{exists: true, modTime: info.ModTime(), size: info.Size(), info: info}, nil
+}
+
+// --- the generation scoped cache ---
+
+// cacheKey identifies one cached answer. Two questions share a key only when the
+// upstream could not have answered them differently: the same name in the exact
+// case it arrived, the same type and class, the same DNSSEC, checking-disabled,
+// and authenticated-data flags, and the same client subnet. The generation is
+// part of the key so an entry can never be attributed to another set of
+// upstreams.
+//
+// The question name is the bytes that arrived rather than a lowercased form of
+// them: 0x20 is a request for randomised case, so one client's case can be
+// answered differently from another's, and the case a client sent is also the
+// case its own response has to echo.
+type cacheKey struct {
+	generation uint64
+	qname      string
+	qtype      uint16
+	qclass     uint16
+	do         bool
+	cd         bool
+	ad         bool
+	clientNet  string
+}
+
+func newCacheKey(generation uint64, query *dns.Msg) cacheKey {
+	question := query.Question[0]
+	key := cacheKey{
+		generation: generation,
+		qname:      question.Name,
+		qtype:      question.Qtype,
+		qclass:     question.Qclass,
+		ad:         query.AuthenticatedData,
+		cd:         query.CheckingDisabled,
+	}
+	if opt := query.IsEdns0(); opt != nil {
+		key.do = opt.Do()
+		key.clientNet = clientSubnetIdentity(opt)
+	}
+	return key
+}
+
+// clientSubnetIdentity describes the client subnet option, the only EDNS0 option
+// this router forwards upstream that changes the answer.
+func clientSubnetIdentity(opt *dns.OPT) string {
+	for _, option := range opt.Option {
+		subnet, ok := option.(*dns.EDNS0_SUBNET)
+		if !ok {
+			continue
+		}
+		return strconv.Itoa(int(subnet.Family)) + "/" + subnet.Address.String() + "/" + strconv.Itoa(int(subnet.SourceNetmask))
+	}
+	return ""
+}
+
+type cacheEntry struct {
+	message  *dns.Msg
+	storedAt time.Time
+	ttl      uint32
+}
+
+// responseCache is one generation's bounded cache. It holds copies only, so a
+// caller can never change an entry another query will be served.
+type responseCache struct {
+	entries *concurrent_lru.ConcurrentLRU[cacheKey, cacheEntry]
+}
+
+func newResponseCache(maxEntries int) *responseCache {
+	return &responseCache{entries: concurrent_lru.NewConecurrentLRU[cacheKey, cacheEntry](maxEntries, nil)}
+}
+
+// get returns a copy of the cached answer with the time it has been waiting
+// subtracted from its TTLs and with the fetching query's identity put on it. An
+// entry with no time left is a miss, not an answer with a zero TTL.
+//
+// The entry is a response to whichever query fetched it, so the transaction id
+// and the question section are the ones that went upstream now: an id from the
+// transaction that filled the cache is a response the client will discard, and a
+// question section in another client's case breaks 0x20 echoing. The question is
+// copied rather than shared, so a caller that edits its own query afterwards
+// cannot change an answer another query is holding.
+func (c *responseCache) get(key cacheKey, query *dns.Msg, now time.Time) (*dns.Msg, bool) {
+	entry, ok := c.entries.Get(key)
+	if !ok {
+		return nil, false
+	}
+	waited := time.Duration(0)
+	if now.After(entry.storedAt) {
+		waited = now.Sub(entry.storedAt)
+	}
+	elapsed := uint32(waited / time.Second)
+	if elapsed >= entry.ttl {
+		c.entries.Del(key)
+		return nil, false
+	}
+	remaining := entry.ttl - elapsed
+	answer := entry.message.Copy()
+	answer.Id = query.Id
+	answer.Question = make([]dns.Question, len(query.Question))
+	copy(answer.Question, query.Question)
+	setTTL(answer, remaining)
+	return answer, true
+}
+
+// put stores an answer that can be reused: a response that answers the question
+// and carries a positive TTL. A SERVFAIL, a REFUSED, a bare NXDOMAIN without an
+// SOA, and a zero TTL are all left uncached.
+//
+// The stored copy carries a neutral id, because the entry is not a response to
+// any one transaction: get puts the fetching query's id on the answer it hands
+// out, so an id kept here could only ever leak into a different transaction.
+func (c *responseCache) put(key cacheKey, response *dns.Msg, now time.Time) {
+	ttl, ok := cacheableTTL(response)
+	if !ok {
+		return
+	}
+	stored := response.Copy()
+	stored.Id = 0
+	c.entries.Add(key, cacheEntry{message: stored, storedAt: now, ttl: ttl})
+}
+
+// cacheableTTL is the smallest TTL in the answer, which is how long every record
+// in it stays valid.
+func cacheableTTL(response *dns.Msg) (uint32, bool) {
+	if !answerable(response) {
+		return 0, false
+	}
+	minimum := uint32(0)
+	found := false
+	for _, section := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
+		for _, record := range section {
+			if _, isOPT := record.(*dns.OPT); isOPT {
+				continue
+			}
+			ttl := record.Header().Ttl
+			if !found || ttl < minimum {
+				minimum, found = ttl, true
+			}
+		}
+	}
+	if !found || minimum == 0 {
+		return 0, false
+	}
+	return minimum, true
+}
+
+func setTTL(response *dns.Msg, ttl uint32) {
+	for _, section := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
+		for _, record := range section {
+			if _, isOPT := record.(*dns.OPT); isOPT {
+				continue
+			}
+			record.Header().Ttl = ttl
+		}
+	}
+}

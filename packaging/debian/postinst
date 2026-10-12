@@ -1,0 +1,727 @@
+#!/bin/sh
+# Provision what the services need, and then let the installer take the machine's
+# DNS over. The order in this file is the whole of its design, and four of its
+# steps are load-bearing in a way that is easy to get backwards.
+#
+# STEP 1 is the accounts. The group comes first, then the two users, and both
+# users have that group as their PRIMARY group rather than each having one of their
+# own. That is not tidiness: the state directories' default ACL grants by group, so
+# per-service groups would give the grant to exactly one identity and leave the
+# other unable to replace the other's files. dnscrypt-proxy is a third identity with
+# a third group, because it shares no state with either of the other two and its
+# umask is 0077 rather than 0007.
+#
+# STEP 2 is the state directories, and the order inside it is measured rather than
+# reasoned about. For each directory: `install -d -o root -g $STATE_GROUP -m 2770` and
+# THEN `setfacl -d -m g::rwx`. The reverse order is wrong, and the way it is wrong
+# is not obvious: install's chmod sets the group-class MASK, so a setfacl that ran
+# first has its mask narrowed by the chmod that follows, and the directory is left
+# with `default:other::r-x` and an access mask that lets the group list and traverse
+# but not write. Such a directory passes every default-ACL check and no service
+# identity can create a state file in it. The eight commands below are written out
+# one pair at a time rather than hidden in a loop or a function, so that the order
+# is visible here to a reader and to the test that holds it.
+#
+# The mode is 2770 and not the 2750 this plan first wrote. A member of a
+# root:$STATE_GROUP directory's own group cannot create a file in it at all at 2750 --
+# measured on the system-level test machine -- and can at 2770. There is no third
+# option, because when a directory carries an extended ACL the mode's group field IS
+# the group-class mask, so 2750 caps the group at r-x and no default ACL can
+# restore what the mask removed.
+#
+# /run/mosdns is here as well as in the tmpfiles.d entry, and both is right: this
+# script needs it to exist for the install transaction that follows, and the
+# tmpfiles.d entry is the only thing that brings it back after a reboot, because
+# /run is a tmpfs and the group, the setgid bit and the default ACL are all gone.
+#
+# STEP 3 is the pinned data this package ships. It is TWO pairs now. The China
+# list is placed and its digest is verified against the list_sha256 in the lock
+# that describes it; the Cloudflare range document is verified against the sha256
+# in the lock beside it and is never written at all. NEITHER is ever re-pinned
+# here. A re-pin at install time is how an operator's reviewed pin becomes
+# something nobody reviewed, and a refusal to install because a reviewed pin
+# cannot be verified is a machine that is left exactly as it was.
+#
+# The range pair is what makes an installation on a machine with no route to the
+# internet possible at all: the prefix list the response rewriter refuses to
+# construct without comes from one endpoint, so a package that ships no snapshot
+# of it cannot be installed offline. Every container cell of this project's own
+# test matrix refused for exactly that reason, and nothing downstream of the
+# refusal ever ran.
+#
+# STEP 4 is the install transaction, and it is after everything above because
+# everything above is a prerequisite for it: a ReadWritePaths entry naming a
+# directory that is not there fails its unit at start with a mount-namespace error,
+# which on the only resolver this machine has is an outage rather than a failed
+# installation. The transaction rolls itself back on any failure.
+#
+# STEP 5 is the four timers, and it is LAST and not next to the transaction on
+# purpose. The first version of this script enabled them immediately before the
+# transaction, and then said, in the arm that runs when the transaction refuses, that
+# nothing was enabled and running. That was false, and the difference was three
+# enabled root timers: a nightly `mosdns-cdnctl test --apply` publishing into
+# /var/lib/mosdns/lists, a health check every two minutes, and a daily list check,
+# all running on a machine whose install had been refused and whose operator had
+# been told nothing was going on. Enabling them after a transaction that returned
+# zero makes the sentence true.
+#
+# It also means the failure arm has to be honest about WHICH case it is in, because
+# on an UPGRADE the claim is different and equally false in the other direction. dpkg
+# hands `postinst configure` the previously configured version as its second
+# argument, and a null one means there was none: a fresh install leaves nothing
+# enabled, while an upgrade of an installation that was already running this package
+# leaves whatever was already enabled, because this run did not touch it. The two
+# sentences below say which of those happened.
+set -e
+
+STATE_GROUP=mosdns-router
+ROUTER_USER=mosdns-router
+CONTROL_USER=mosdns-router-cdn
+RESOLVER_USER=mosdns-router-dnscrypt
+
+# The identities this package used before ruling 191(d), kept only so an upgrade can
+# move the machine off them. They are the names most likely to be somebody else's:
+# `dnscrypt-proxy` is the upstream package's own group, and `mosdns` is short enough
+# that an unrelated system package can plausibly have claimed it. The postinst used
+# to say so out loud when it found the resolver group already present -- "this
+# install is using it rather than creating it ... the two are now sharing one
+# identity" -- which is an admission that this package could take an identity away
+# from a purge. Renaming removes the collision rather than reporting it.
+#
+# These are read, never created. A machine that has never run this package has no
+# old accounts and the migration below does nothing at all.
+LEGACY_STATE_GROUP=mosdns
+LEGACY_ROUTER_USER=mosdns
+LEGACY_CONTROL_USER=mosdns-cdn
+LEGACY_RESOLVER_USER=dnscrypt-proxy
+INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
+SOURCE_LIST=/usr/share/mosdns-router/cn-domains.txt
+SOURCE_LOCK=/usr/share/mosdns-router/source-lock.json
+SOURCE_RANGES=/usr/share/mosdns-router/cloudflare-ranges.json
+SOURCE_RANGES_LOCK=/usr/share/mosdns-router/cloudflare-ranges.lock.json
+PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains.txt
+PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock.json
+
+# Debian Policy 6.5 lists four ways dpkg may call this script. `configure` is the one
+# that does the work; the other three are error unwinds, and all three still unpack
+# the files, so all three provision and then hand the machine to the transaction --
+# which is idempotent for a machine that is already running this router, and which is
+# the only reason an unwind can safely go through the same path as an install.
+case "$1" in
+configure | abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+	echo "postinst called with an argument Debian Policy 6.5 does not list: $*" >&2
+	exit 1
+	;;
+esac
+
+# --- STEP 1: the accounts ----------------------------------------------------
+
+# addgroup/adduser are used rather than groupadd/useradd because they are the
+# Debian interface and they are idempotent: on an upgrade every one of these lines
+# runs again and none of them may fail because the account is already there. The
+# `--system` forms put the accounts below UID 1000 with no home directory and a
+# non-expiring password, which is what a service identity is.
+#
+# A group this package did not create is a collision, and `addgroup --system` exits
+# zero when the group is already there, so without the check below this install would
+# silently adopt somebody else's ids. It is reported rather than refused because a
+# re-run of THIS package's own postinst also finds the group already there, and
+# refusing that would make a `dpkg --configure` retry impossible.
+#
+# A GROUP ALONE IS NOT ENOUGH TO CALL IT A COLLISION, and the version of this that
+# tested only the group was wrong on the machine this package is installed on most
+# often: its own. These lines run on every `postinst configure`, so every
+# `dpkg --configure` retry -- which is exactly what dpkg suggests after a refused
+# install and exactly what an operator does next -- printed four lines saying this
+# package's own group belonged to another package. MEASURED on a 24.04 cell: a
+# second install over the first said exactly that, about a group the same run had
+# created four lines earlier:
+#
+#     postinst: the mosdns-router group already exists (mosdns-router:x:102:)
+#     postinst: and this install is using it rather than creating it. Nothing in
+#     postinst: this package creates that name, so it belongs to another package,
+#
+# which is the false sentence in a different direction from the misplaced `fi` above
+# the transaction, and worse here because it is printed on the SUCCESS path too --
+# there is no install this warning would have been a useful aside to.
+#
+# So the test is the PAIR. A group with no service identity behind it is a bare group
+# somebody else made, and this install would be adopting an id it cannot account for.
+# A group AND the identity that goes with it are this package's own accounts from a
+# previous run, and "the two will share one identity" would be false -- there is only
+# one. Nested `if`s rather than an `&&` chain, because this script runs with `set -e`
+# and a chain is a list whose status is its last command's.
+#
+# The upstream `dnscrypt-proxy` package is the case this was written for, and ruling
+# 191(d) renamed the resolver's identity away from that name -- which removes the
+# collision rather than reporting it. These two blocks stay because the names are not
+# a namespace this project owns, and a `postrm purge` is entitled to be told when it
+# is about to remove an account that arrived from somewhere else.
+if getent group "$STATE_GROUP" >/dev/null 2>&1; then
+	if ! getent passwd "$ROUTER_USER" >/dev/null 2>&1; then
+		echo "postinst: the $STATE_GROUP group already exists ($(getent group "$STATE_GROUP"))" >&2
+		echo "postinst: and this install is using it rather than creating it, and there" >&2
+		echo "postinst: is no $ROUTER_USER account behind it, so nothing in this package" >&2
+		echo "postinst: created that name: it belongs to another package, and the two will" >&2
+		echo "postinst: share one identity until one of them is removed." >&2
+	fi
+fi
+if getent group "$RESOLVER_USER" >/dev/null 2>&1; then
+	if ! getent passwd "$RESOLVER_USER" >/dev/null 2>&1; then
+		echo "postinst: the $RESOLVER_USER group already exists ($(getent group "$RESOLVER_USER"))" >&2
+		echo "postinst: and this install is using it rather than creating it, and there is" >&2
+		echo "postinst: no $RESOLVER_USER account behind it, so nothing in this package" >&2
+		echo "postinst: created that name: it belongs to another package, and the two will" >&2
+		echo "postinst: share one identity until one of them is removed." >&2
+	fi
+fi
+addgroup --system "$STATE_GROUP"
+adduser --system --no-create-home --home /nonexistent \
+	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
+	--gecos "mosdns-router DNS router" "$ROUTER_USER"
+adduser --system --no-create-home --home /nonexistent \
+	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
+	--gecos "mosdns-router CDN optimizer and health check" "$CONTROL_USER"
+# Its own group, not the shared one: it creates no file and shares no state with
+# either of the other identities, and giving it the shared group would hand it
+# write access to the state directories for no reason.
+addgroup --system "$RESOLVER_USER"
+adduser --system --no-create-home --home /nonexistent \
+	--ingroup "$RESOLVER_USER" --shell /usr/sbin/nologin \
+	--gecos "mosdns-router DNSCrypt foreign resolver" "$RESOLVER_USER"
+
+# --- STEP 1b: move an upgraded machine off the identities it used before ------
+#
+# The unit files are package files, so `User=`/`Group=` became the new names the
+# moment dpkg unpacked them, which is why this runs before anything is started. All
+# that is left is to hand the state trees to the new group and then drop the old
+# accounts, and the order of those two is the whole of it: a file still owned by a
+# group that is about to be deleted leaves the units unable to read it, and nothing
+# in the transaction would say why.
+#
+# WHY THE `chgrp` IS RECURSIVE, because the non-recursive version of this line was
+# correct-looking, passed a shape test, and took a machine's DNS down.
+#
+# `chgrp` on a directory moves THE DIRECTORY'S group and nothing else: every file
+# inside it keeps the gid it was created with. So walking the four state directories
+# one at a time moved the directories and left the files behind -- and the next
+# paragraph deletes the group those files were group-owned by, which leaves them
+# owned by a gid that resolves to nothing at all.
+#
+# At 0640, a file whose group does not exist is a file ONLY ROOT CAN READ. That is
+# where this stopped being a rename and became an outage, in two directions:
+#
+#   * `/var/lib/mosdns/lists/cloudflare-ips.json` is what the response rewriter
+#     builds its prefix watcher from, and it does that before anything else. So the
+#     router started, failed to build the watcher, and bound NOTHING on port 53 --
+#     while the transaction had already pointed NetworkManager at 127.0.0.1. The
+#     machine had no resolver, and nothing watching for one: the health timer and
+#     the watchdog are enabled in STEP 5, which is below the transaction this run
+#     had just failed.
+#   * `/var/lib/mosdns/runtime/control.lock` became the same, and preflight reports
+#     it as a lock this package did not write -- so every later `dpkg --configure`
+#     refused forever, with a message about a mode and a group rather than about a
+#     rename.
+#
+# And `/var/lib/mosdns/installer`, which holds the ownership marker and the recorded
+# NetworkManager values, is not one of the four directories at all: the old build
+# created it too, so it kept the old gid outright. Those are the two documents an
+# uninstall reads to decide whether it may put the machine's DNS back, so a machine
+# in that state cannot be uninstalled cleanly either.
+#
+# MEASURED, in a container reproducing a machine the old build had provisioned: after
+# the migration the four directories were on the new group, every file inside them
+# was on a gid nothing resolved, and preflight refused on the control lock by name.
+# Two roots, both named in one command, rather than a list: everything inside these
+# two trees is this package's own state and its own services' output, and
+# enumerating the files is how the first version missed three of them.
+#
+# The `[ -d ]` guard is load-bearing rather than defensive. A machine that has never
+# run this package has neither tree, and the migration runs on every `postinst
+# configure` including the `dpkg --configure` retry dpkg itself recommends -- so a
+# step that treated an absent tree as a failure would fail before the transaction,
+# with a message about a rename rather than about whatever the operator was sent
+# back to fix.
+#
+# The ACL needs re-applying rather than inheriting. `setfacl -d -m g::rwx` records a
+# permission on the OWNING GROUP and does not name it, so the chgrp above is what
+# moves the grant to the new group -- there is no stale named-group entry to clear.
+# The line is run anyway because it is the one that states the grant, and a
+# directory from before the rename is one this script cannot have inspected.
+for tree in /var/lib/mosdns /run/mosdns; do
+	if [ -d "$tree" ]; then
+		chgrp -R "$STATE_GROUP" "$tree"
+	fi
+done
+# And the ACL, on the four directories the package provisions, after the ownership:
+# `setfacl -d -m g::rwx` records a permission on the OWNING GROUP and does not name
+# it, so the chgrp above is what moves the grant to the new group -- there is no
+# stale named-group entry to clear, and this line is re-run anyway because it is the
+# one that states the grant and a directory from before the rename is one this
+# script cannot have inspected. See the STEP 2 header for why a directory carried by
+# a renamed group is the case that needed fixing rather than the ACL.
+# /run/mosdns is NOT in this list, and its absence is the point rather than an
+# oversight: it is 2750 with no default ACL, because only root writes it. The
+# default ACL has to be removed as well as not re-applied -- a directory carrying
+# one from before this change would keep granting the group the write through it,
+# and `install -d`'s chmod does not touch an extended ACL.
+if [ -d /run/mosdns ]; then
+	setfacl -b -k /run/mosdns
+	chmod 2750 /run/mosdns
+fi
+
+for directory in /var/lib/mosdns /var/lib/mosdns/runtime /var/lib/mosdns/lists; do
+	if [ -d "$directory" ]; then
+		setfacl -d -m g::rwx "$directory"
+	fi
+done
+# The watchdog's failure record is root's alone and stays that way. STEP 2 below
+# provisions it as 0700 root:root and would re-assert that, but a recursive chgrp
+# that is not told about this one directory would hand it to a group it has no
+# reason to belong to in between, and the record it holds decides when this machine
+# takes its own DNS back.
+if [ -d /run/mosdns/watchdog ]; then
+	chgrp root /run/mosdns/watchdog
+fi
+# Then the old accounts, and only those this package's own postinst created: the
+# three users, then the two groups. `deluser --system` removes the account and leaves
+# files it owns alone, which is the behaviour wanted here -- a file owned by the old
+# `mosdns` group outside the two trees above is left for an operator, and is named
+# in postrm's purge arm if it is still there at that point.
+#
+# Every removal is `||` a message rather than fatal: an upgrade that cannot drop an
+# old account has still moved the state directories, and refusing to finish leaves a
+# machine that cannot resolve rather than one with a stale account.
+for user in "$LEGACY_ROUTER_USER" "$LEGACY_CONTROL_USER"; do
+	if getent passwd "$user" >/dev/null 2>&1; then
+		deluser --system "$user" || echo "postinst: could not remove the old $user account; it is" \
+			"left alone rather than forced, and postrm will say so again on a purge." >&2
+	fi
+done
+if getent passwd "$LEGACY_RESOLVER_USER" >/dev/null 2>&1; then
+	# Its own group has to go too, and the user first because the group is its
+	# primary group.
+	deluser --system "$LEGACY_RESOLVER_USER" || echo "postinst: could not remove the old" \
+		"$LEGACY_RESOLVER_USER account; it is left alone rather than forced." >&2
+fi
+for group in "$LEGACY_RESOLVER_USER" "$LEGACY_STATE_GROUP"; do
+	if getent group "$group" >/dev/null 2>&1; then
+		delgroup --system "$group" || echo "postinst: could not remove the old $group group; it" \
+			"is left alone rather than forced, and files owned by it are named in" \
+			"postrm's purge arm." >&2
+	fi
+done
+
+# --- STEP 2: the state directories, mode first and then the ACL -------------
+
+install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns
+setfacl -d -m g::rwx /var/lib/mosdns
+
+install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns/runtime
+setfacl -d -m g::rwx /var/lib/mosdns/runtime
+
+install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns/lists
+setfacl -d -m g::rwx /var/lib/mosdns/lists
+
+# 2750 and no default ACL, and this is the ONE directory in this step that is
+# neither. It is a narrowing rather than an oversight, and the reason the other
+# three are 2770 does not hold here: those are written by both service identities,
+# and this one is written by exactly one writer, which is root. The bridge is a
+# NetworkManager dispatcher script, so it runs as root; it is not mosdns-router-cdn,
+# which is what the comment above this step used to say and what this mode was
+# provisioned from. Every unit's ReadWritePaths was read to confirm it: nothing
+# unprivileged writes /run/mosdns at all.
+#
+# It cost more than it was worth. Unlink and rename are decided by this directory
+# rather than by the mode of the file inside it, so at 2770 a member of the
+# mosdns-router group could replace dhcp-upstreams.json wholesale -- whatever mode
+# that file carried -- and redirect every domestic query from the next one on. That
+# is the same reason /run/mosdns/watchdog exists as a separate 0700 root:root
+# directory, and the same reasoning was applied there and not here.
+install -d -o root -g "$STATE_GROUP" -m 2750 /run/mosdns
+
+# ...and the ONE directory in this step that is not 2770 root:$STATE_GROUP with a
+# default ACL: the resolver watchdog's failure record, in a directory of its own.
+#
+# `mosdns-router-cdn` is in the `mosdns-router` group and the directory above gives
+# that group `w`, and a `0600` file inside a group-WRITABLE directory is still
+# deletable and still replaceable -- unlink and rename are the containing
+# directory's decision, not the file's. So in `/run/mosdns` that identity could
+# delete the record, which switches off the only automatic DNS protection on the
+# machine with nothing written anywhere, or replace it with a document claiming a
+# threshold of 99 and a first failure long past, which tears the machine down on
+# the next run with no window in front of it. 0700 root:root, no setfacl, because
+# unlike the four above nothing here is read by any other identity: the watchdog
+# runs as root and is the only reader.
+#
+# A subdirectory rather than a change to `/run/mosdns` itself, because the 2770
+# above is measured, not preferred: the DHCP bridge publishes as
+# `mosdns-router-cdn` and needs directory `w`. Both directories are needed and
+# they are not the same directory.
+#
+# This one is here as well as in the tmpfiles.d entry, and both is right for the
+# reason the entry exists at all: /run is a tmpfs, so the mode and the ownership
+# are gone after a reboot and only the tmpfiles entry brings them back. The
+# watchdog starts three minutes after boot and would otherwise refuse to count
+# anything on every boot.
+install -d -o root -g root -m 0700 /run/mosdns/watchdog
+
+# --- STEP 3: the pinned data this package ships ------------------------------
+
+# Two pairs are verified here and NEITHER is ever re-pinned, and the second pair
+# is what makes an installation on a machine with no route to the internet
+# possible at all.
+#
+# The first is the China list. Two files under /var/lib/mosdns/lists are the
+# OPERATOR's, not this package's:
+# `mosdns-cdnctl update-lists --pin-remote HEAD` writes both of them there, and
+# the render reads the list. Replacing them with the snapshot this package ships
+# is the same act as re-pinning them -- it is how a pin somebody reviewed becomes
+# a pin nobody reviewed -- and doing it on `configure` means every upgrade of
+# every machine does it.
+#
+# It is also invisible, which is what made it worth fixing rather than only
+# documenting. The pair an operator's pin wrote is SELF-CONSISTENT: the lock's
+# list_sha256 is the digest of the list beside it. Replace both with the shipped
+# pair and the pair is still self-consistent, the digest check below still passes,
+# and nothing reports anything until `update-lists --check` notices that the
+# selector was built from a list other than the one now on disk.
+#
+# So the pair is placed ONLY when it is absent or unreadable, and otherwise both
+# files are left exactly as they are. The PAIR is the unit: one half of it is not
+# a record of anything, so a missing lock means the pair is placed rather than the
+# lock alone.
+if [ ! -r "$PUBLISHED_LIST" ] || [ ! -r "$PUBLISHED_LOCK" ]; then
+	# `install` rather than `cp`, so the mode and the group are the published ones
+	# and not whatever the caller's umask left behind: 0640 root:$STATE_GROUP is the mode
+	# internal/rules publishes at, and it is the mode that lets the list-check
+	# identity read a document the optimizer replaces.
+	install -o root -g "$STATE_GROUP" -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"
+	install -o root -g "$STATE_GROUP" -m 0640 "$SOURCE_LOCK" "$PUBLISHED_LOCK"
+	echo "postinst: placed the reviewed snapshot this package ships at $PUBLISHED_LIST," >&2
+	echo "postinst: because the published pair was absent or unreadable. Nothing has" >&2
+	echo "postinst: been re-pinned." >&2
+else
+	echo "postinst: $PUBLISHED_LIST and $PUBLISHED_LOCK are already published and" >&2
+	echo "postinst: readable, so they are left exactly as they are. An upgrade does" >&2
+	echo "postinst: not re-pin an operator's list; mosdns-cdnctl(1) says how an" >&2
+	echo "postinst: operator re-pins one deliberately." >&2
+fi
+
+# The digest is compared, not recomputed from a re-pin, and a mismatch is fatal here
+# rather than a warning: a list nobody can verify is a routing document whose
+# domestic branch this project cannot account for. The comparison reads the two
+# files as they are now on disk, so what it verifies is the list the router is
+# ABOUT to read -- the operator's own list where there is one, and the shipped
+# snapshot on a first install -- and not the archive the package claims to carry.
+expected_digest=$(sed -n 's/.*"list_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$PUBLISHED_LOCK")
+if [ -z "$expected_digest" ]; then
+	echo "postinst: $PUBLISHED_LOCK names no list_sha256, so the published list cannot" >&2
+	echo "postinst: be verified, and a list this project cannot account for is not one" >&2
+	echo "postinst: it will install over a pair it cannot read. Nothing has been" >&2
+	echo "postinst: changed on this machine's DNS, and the published pair was left" >&2
+	echo "postinst: exactly as it was found. Re-pin it deliberately with:" >&2
+	echo "postinst:   sudo mosdns-cdnctl update-lists --pin-remote HEAD" >&2
+	exit 1
+fi
+actual_digest=$(sha256sum "$PUBLISHED_LIST" | cut -d' ' -f1)
+if [ "$actual_digest" != "$expected_digest" ]; then
+	echo "postinst: $PUBLISHED_LIST is $actual_digest and the lock says $expected_digest;" >&2
+	echo "postinst: refusing to install a routing list this project cannot account for." >&2
+	echo "postinst: nothing has been changed on this machine's DNS, and the published" >&2
+	echo "postinst: pair was left exactly as it was found. The reviewed snapshot this" >&2
+	echo "postinst: package carries is $SOURCE_LIST; compare the two, and read" >&2
+	echo "postinst: mosdns-cdnctl(1) for how an operator re-pins the list deliberately." >&2
+	exit 1
+fi
+
+# ...and the second is the Cloudflare range document, which the response rewriter
+# refuses to CONSTRUCT without: it builds its prefix watcher before anything else
+# and returns the error, so a router with no published ranges binds nothing on
+# port 53. Its only producer fetches from one endpoint, so without a snapshot of
+# that document in the package a machine with no route to that endpoint cannot
+# start this router at all -- which is what made every installation in this
+# project's own test matrix refuse, and what left nothing downstream of the
+# refusal ever running.
+#
+# It is VERIFIED HERE AND WRITTEN NOWHERE IN THIS SCRIPT, and the two halves of
+# that sentence have separate reasons.
+#
+# Verified, because the file is the input to every classification the rewriter
+# makes: a snapshot whose bytes the lock beside it does not record is a set of
+# prefixes this project cannot name, and a router answering over prefixes
+# nobody can name resolves every query the machine makes and tells nobody. The
+# lock's `sha256` is checked with the same `sha256sum` and the same fatal
+# mismatch the China pair uses, and a lock that records no digest or no date is
+# refused for the same reason a missing list_sha256 is: a record of nothing is not
+# a record. The DATE is not decoration beside it. A three-month-old pin is a fine
+# input for a selector, and a pin whose age is written down nowhere is not, and
+# there is no way to notice the difference later -- the machine resolves, no timer
+# complains, and the ranges drift away one prefix at a time. `mosdns-cdnctl
+# update-lists --check` prints it, and this is the file it reads it from.
+#
+# Never written here, because the published artifacts under /var/lib are not this
+# package's to replace any more than the China pair's are. `mosdns-cdnctl
+# update-lists --refresh-ranges` is the one program that publishes them, and it
+# reads THIS MACHINE's own document before it reads the package's snapshot, so a
+# `dpkg` upgrade on a machine that cannot reach the origin republishes exactly
+# what its selector was built against. A write here would be the same act as
+# re-pinning the China list, done by the script whose entire argument is that it
+# does not do that.
+#
+# The absence of the snapshot is a REFUSAL rather than a fallback, on purpose and
+# against the obvious argument: a machine that has published a document of its
+# own needs no snapshot and would install without one. But this step is what
+# PROMISES the installation, and a package that ships a file and cannot verify it
+# is a package whose other promises are worth exactly as much -- so it refuses
+# here, before the machine's DNS is touched, and names the way out. `dpkg` owns
+# both files, so the way out is reinstalling the package and is NOT a re-pin.
+if [ ! -r "$SOURCE_RANGES" ] || [ ! -r "$SOURCE_RANGES_LOCK" ]; then
+	echo "postinst: $SOURCE_RANGES and $SOURCE_RANGES_LOCK are the pinned Cloudflare range" >&2
+	echo "postinst: document this package installs, and one or both of them is not" >&2
+	echo "postinst: readable at $SOURCE_RANGES. The response rewriter classifies every" >&2
+	echo "postinst: query it answers against exactly that file, so this package will not run" >&2
+	echo "postinst: an install transaction over a range list it cannot account for." >&2
+	echo "postinst: nothing has been changed on this machine's DNS. Both files belong to" >&2
+	echo "postinst: dpkg rather than to an operator's pin, so nothing has to be re-pinned:" >&2
+	echo "postinst: reinstall the package from wherever you install it, which puts both back," >&2
+	echo "postinst: and then:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+expected_ranges_digest=$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$SOURCE_RANGES_LOCK")
+expected_ranges_prefix_digest=$(sed -n 's/.*"prefix_list_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$SOURCE_RANGES_LOCK")
+expected_ranges_pinned_at=$(sed -n 's/.*"fetched_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SOURCE_RANGES_LOCK")
+if [ -z "$expected_ranges_digest" ] || [ -z "$expected_ranges_prefix_digest" ] || [ -z "$expected_ranges_pinned_at" ]; then
+	echo "postinst: $SOURCE_RANGES_LOCK records no sha256, no prefix_list_sha256 or no" >&2
+	echo "postinst: fetched_at, so the snapshot beside it is a file of ranges with nothing" >&2
+	echo "postinst: accounting for it -- and a pin nobody can measure the age of is a pin" >&2
+	echo "postinst: nobody is measuring. Nothing has been changed on this machine's DNS." >&2
+	echo "postinst: Run 'mosdns-cdnctl update-lists --check' after reinstalling the package." >&2
+	exit 1
+fi
+actual_ranges_digest=$(sha256sum "$SOURCE_RANGES" | cut -d' ' -f1)
+if [ "$actual_ranges_digest" != "$expected_ranges_digest" ]; then
+	echo "postinst: $SOURCE_RANGES is $actual_ranges_digest and $SOURCE_RANGES_LOCK records" >&2
+	echo "postinst: $expected_ranges_digest for it, so this package cannot account for the ranges" >&2
+	echo "postinst: in it. Refusing to install a selector over a range list this project cannot" >&2
+	echo "postinst: name. Nothing has been changed on this machine's DNS." >&2
+	echo "postinst: The lock also records the prefix list the snapshot renders to, as" >&2
+	echo "postinst: $expected_ranges_prefix_digest, and the revision it was taken at, which is" >&2
+	echo "postinst: dated $expected_ranges_pinned_at. Compare them with the two digests and the" >&2
+	echo "postinst: date 'mosdns-cdnctl update-lists --check' prints, and reinstall the package" >&2
+	echo "postinst: from wherever you install it, which puts both files back, if the pair is not" >&2
+	echo "postinst: what you expected:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+echo "postinst: the pinned range document at $SOURCE_RANGES is $actual_ranges_digest, as" >&2
+echo "postinst: $SOURCE_RANGES_LOCK records, taken at $expected_ranges_pinned_at. It is read" >&2
+echo "postinst: here and never written: 'mosdns-cdnctl update-lists --refresh-ranges' is what" >&2
+echo "postinst: publishes it, and it reads this machine's own published document first. Run" >&2
+echo "postinst: 'mosdns-cdnctl update-lists --check' to see how old the pin is and whether" >&2
+echo "postinst: what is published has drifted from it." >&2
+
+# --- STEP 4: the install transaction -----------------------------------------
+
+# The unit files are new, so systemd's cached copy of them is stale and the
+# transaction's own `systemctl enable` and `start` would be acting on the previous
+# version's units. A reload is a cache refresh and changes nothing else, so it is the
+# one thing that can safely happen before the transaction.
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+fi
+
+# The argument array, never a shell string. A path an operator could influence
+# reaching a shell is the one thing this transaction exists to make impossible, and
+# a string here would undo that for the one command in this package that changes
+# the machine's DNS.
+#
+# THE ARMS ARE INSIDE THE `else`, and that is not a style preference. It is
+# `prerm`'s shape, and it is the only shape in which a successful run cannot reach
+# a status arm at all. The version before this one put the `fi` that closed the
+# capture immediately after `install_status=$?` and left the arms below it, so on a
+# SUCCESSFUL run the variable was never assigned, the `${install_status:-1}`
+# default made every test read as 1, the default arm printed "the install
+# transaction exited 1, which is not a status this script knows" about a
+# transaction that had exited 0, and the unconditional `exit 1` ended EVERY
+# install. dpkg then recorded the package unpacked-but-unconfigured, told the
+# operator the transaction had failed, and offered `dpkg --configure` -- which
+# does the same thing again. The three timers in STEP 5, which is below this `fi`,
+# were never enabled on any install. The three tests that let that through
+# asserted that `install_status=$?` was present, that `if "$INSTALLER" install`
+# was present, and that the status-4 body mentioned a missing resolver: all three
+# were TRUE of the broken script, because a substring cannot see a `fi` in the
+# wrong place. So the gate in test_package.py RUNS the script from this header to
+# its last line with a stubbed installer and reads the script's own exit status.
+if "$INSTALLER" install; then
+	:
+else
+	# The status is captured from an `if`/`else` and not from `if ! cmd`, because
+	# `$?` after a `!` is the status of the `!` -- which is always zero -- so a
+	# script that read it there would print the same sentence for every failure
+	# there is. The same trap `prerm`'s remove arm names, for the same reason.
+	install_status=$?
+	# The arms are on the installer's STATUS and not on a phrase, because there
+	# are five machines behind a non-zero exit and one sentence is false on four
+	# of them:
+	#
+	#   1  the installer's own EXIT_REFUSED: a machine its preflight will not
+	#      install onto, and the one this script sees most often. Nothing was
+	#      written to this machine's DNS configuration, so the messages above are
+	#      the whole of the report and the run can simply be repeated.
+	#   3  every change this run made has been rolled back. The one thing it
+	#      cannot claim is that nothing at all changed: the transaction captures
+	#      the current DHCP lease FIRST, which publishes a new lease generation
+	#      under /run/mosdns. That is this package's own state and says nothing
+	#      about this machine's DNS, so the sentence is about the DNS and not
+	#      about the disk.
+	#   4  the rollback itself did not finish, so what the run changed may still
+	#      be applied -- and the unit that matters is one that was ALREADY
+	#      RUNNING and could not be restarted, which leaves a machine with no
+	#      resolver at all. The installer's own message names it; this must not
+	#      contradict it by claiming everything is as it was.
+	#
+	# 5 and 6 are the two halves of the UNINSTALL verb -- nothing was changed
+	# because the claim on the DNS could not be proved, and a restore that did
+	# not finish -- and the install verb returns neither of them. They are
+	# armed anyway, and each arm says so rather than describing a machine this
+	# script cannot be in: an arm that describes a transaction that cannot
+	# happen is the same kind of false sentence the misplaced `fi` above
+	# produced. A status outside the installer's own table lands in `*`, which
+	# is the only arm that may claim to know nothing.
+	case "$install_status" in
+	1)
+		echo "postinst: the install transaction refused this machine before it changed" >&2
+		echo "postinst: anything. That is the installer's own refusal, and the list of" >&2
+		echo "postinst: what its preflight found is the messages above. Nothing was" >&2
+		echo "postinst: written to this machine's DNS configuration by this run, and" >&2
+		echo "postinst: nothing here has to be put back by hand: fix what was named" >&2
+		echo "postinst: and the install can simply be repeated." >&2
+		;;
+	3)
+		echo "postinst: the install transaction refused this machine and rolled back" >&2
+		echo "postinst: every change it made, so nothing on this machine's DNS" >&2
+		echo "postinst: configuration is different from how this script found it. (The" >&2
+		echo "postinst: transaction did publish a new DHCP lease generation under" >&2
+		echo "postinst: /run/mosdns before it got that far; that is this package's own" >&2
+		echo "postinst: state, not a change to this machine's resolver.) See" >&2
+		echo "postinst: /var/lib/mosdns/installer for what was recorded, and the" >&2
+		echo "postinst: messages above for why." >&2
+		if [ -n "${2:-}" ]; then
+			echo "postinst: This machine had this package configured before (it was at" >&2
+			echo "postinst: version $2), so this was an UPGRADE rather than a first" >&2
+			echo "postinst: install. This run enabled none of the four timers, because" >&2
+			echo "postinst: they are enabled only after this step succeeds. What was" >&2
+			echo "postinst: already enabled is what the installer's messages above say" >&2
+			echo "postinst: about -- the transaction is the authority on that, not this" >&2
+			echo "postinst: script, because it is the only thing that knows which units" >&2
+			echo "postinst: were running." >&2
+		else
+			echo "postinst: Nothing is enabled and nothing was started: this was a first" >&2
+			echo "postinst: install, and the four timers are enabled only after this step" >&2
+			echo "postinst: succeeds, so there is nothing here for them to run against." >&2
+		fi
+		;;
+	4)
+		echo "postinst: the install transaction did not finish AND its rollback did not" >&2
+		echo "postinst: either, so some of what it did may still be applied on this" >&2
+		echo "postinst: machine. The messages above say exactly what: read them before" >&2
+		echo "postinst: anything else, and in particular do not assume the two daemons" >&2
+		echo "postinst: are still running. A unit that was already running is RESTARTED" >&2
+		echo "postinst: rather than started, and a restart that fails leaves it down, so" >&2
+		echo "postinst: this machine may have no resolver at all right now." >&2
+		echo "postinst:   sudo mosdns-cdnctl emergency-rollback" >&2
+		echo "postinst: puts the recorded DNS settings back, and is the one action that" >&2
+		echo "postinst: does not depend on a unit coming up." >&2
+		;;
+	5)
+		echo "postinst: the install transaction exited 5, which is the installer's OWNERSHIP" >&2
+		echo "postinst: refusal: nothing was changed, because it could not prove the DNS on" >&2
+		echo "postinst: this machine is its own to change. The install verb does not" >&2
+		echo "postinst: return this status -- the uninstall verb does -- so the messages" >&2
+		echo "postinst: above are what this is, and nothing about this machine's DNS can" >&2
+		echo "postinst: be promised from here." >&2
+		;;
+	6)
+		echo "postinst: the install transaction exited 6, which is the installer's" >&2
+		echo "postinst: RESTORE-INCOMPLETE: a restore was attempted and did not finish, so" >&2
+		echo "postinst: some of this package's values may still be on the connection and" >&2
+		echo "postinst: the units this package installs have NOT been stopped. The install" >&2
+		echo "postinst: verb does not return this status -- the uninstall verb does -- so" >&2
+		echo "postinst: the messages above are what this is. It is the one status here" >&2
+		echo "postinst: that means something may still be applied, so read them." >&2
+		;;
+	*)
+		echo "postinst: the install transaction exited $install_status, which is not a" >&2
+		echo "postinst: status this script knows; the messages above say why, and nothing" >&2
+		echo "postinst: about this machine's DNS can be promised from here." >&2
+		;;
+	esac
+	echo "postinst: to try again after fixing what it named:" >&2
+	echo "postinst:   sudo $INSTALLER preflight --check-only" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+
+# --- STEP 5: the three timers, and only now ----------------------------------
+
+# Their services are oneshots that must not be enabled: a timer is what starts them,
+# and an enabled oneshot would run a nightly measurement at boot as well. The two
+# daemons were enabled and started by the transaction above, which is the one thing
+# that knows whether they were already active -- an upgrade on a machine that is
+# already running this router is the normal case, not a conflict.
+#
+# A FAILING ENABLE IS REPORTED AND NOT FATAL, and that is a decision rather than an
+# oversight. This step is below the transaction, so reaching it means the machine's
+# DNS was taken over successfully, the daemons are serving, and the marker is
+# written: everything `postinst` is for has happened. dpkg's answer to a non-zero
+# `postinst configure` is to record the package unpacked-but-UNCONFIGURED -- so a
+# machine with a working resolver, a marker and a running transaction would be
+# reported as a broken install, `apt` would offer `dpkg --configure`, and that runs
+# the whole transaction again. Reporting a successful install as a failure is the
+# defect `88bc2af` shipped, and it is the same defect wearing the opposite sign.
+#
+# Silent tolerance is the other wrong answer, and worse for this step than for any
+# other: `mosdns-cdn-health.timer` is the only thing on a machine that ever asks
+# whether `127.0.0.1:53` still resolves, and `mosdns-watchdog.timer` is the only
+# thing on it that will put the machine's own resolvers back when it does not, so
+# an enable that fails quietly leaves a machine whose resolver can stop answering
+# with nothing watching for it. So the failure is LOUD, names all four units and
+# the consequence, and gives the command to run -- and the script still exits 0,
+# because dpkg's record should describe the transaction that happened rather than
+# a timer that did not.
+#
+# `mosdns-watchdog.timer` is here for the same reason the transaction is above
+# rather than after it: reaching this step means the machine's DNS was taken over
+# and the daemons are serving, which is exactly the state in which the watchdog
+# has something to protect. Enabling it on a machine whose transaction was refused
+# would put an unattended DNS-restoring mechanism on a machine that is already
+# back where it was.
+if [ -d /run/systemd/system ]; then
+	if systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
+		mosdns-list-check.timer mosdns-watchdog.timer; then
+		:
+	else
+		echo "postinst: WARNING: the install transaction above SUCCEEDED, but these" >&2
+		echo "postinst: four timers were not enabled, so nothing will run them:" >&2
+		echo "postinst:   mosdns-cdn-optimizer.timer   the nightly optimization run" >&2
+		echo "postinst:   mosdns-cdn-health.timer       the two-minute health check" >&2
+		echo "postinst:   mosdns-list-check.timer       the daily list-drift check" >&2
+		echo "postinst:   mosdns-watchdog.timer         the resolver watchdog" >&2
+		echo "postinst: The health timer is the only thing on this machine that asks" >&2
+		echo "postinst: whether 127.0.0.1:53 is still being served, and the watchdog is" >&2
+		echo "postinst: the only thing on it that will PUT THE MACHINE'S OWN RESOLVERS" >&2
+		echo "postinst: BACK when it is not, so these two matter even though the" >&2
+		echo "postinst: resolver is up right now. Nothing about this machine's DNS was" >&2
+		echo "postinst: changed by the failure, and the two daemons are running." >&2
+		echo "postinst: Enable them by hand with:" >&2
+		echo "postinst:   sudo systemctl enable mosdns-cdn-optimizer.timer" >&2
+		echo "postinst:   sudo systemctl enable mosdns-cdn-health.timer" >&2
+		echo "postinst:   sudo systemctl enable mosdns-list-check.timer" >&2
+		echo "postinst:   sudo systemctl enable mosdns-watchdog.timer" >&2
+	fi
+fi
+
+exit 0

@@ -1,0 +1,128 @@
+# The daily list work: mosdns-cdnctl update-lists --automatic.
+#
+# It ALWAYS reports whether the China domain list this router reads is still the one
+# the reviewed source publishes -- that report is the only place this machine's
+# answer about its own source is written down. Then it refreshes exactly what
+# /etc/mosdns/policy.yaml says to refresh, which by default is nothing at all.
+#
+# Both switches are off in the shipped policy, and that is the decision rather than
+# an omission: data/cn is curated by hand, so ANY upstream commit moves the split
+# between domestic and foreign names, and accepting one unattended is a routing
+# change nobody reviewed. An operator who has decided they want that trade sets
+# lists.china.automatic in the policy; lists.cloudflare.automatic is a separate
+# switch because refreshing which CDN edge an answer is rewritten to is a much
+# smaller thing than changing which names take the foreign branch.
+#
+# What it can write is bounded by ReadWritePaths below, and it takes the control
+# lock for as long as a publication takes -- which is why SuccessExitStatus=4 is
+# here now. The lock is what stops this job from publishing a pair while the router
+# is being reconfigured, and a daily job that finds the lock held is a daily job
+# that did the right thing.
+#
+# It is Type=oneshot, it is not enabled, and its timer starts it. The TIMER is
+# generated from the policy's schedule by `mosdns-cdnctl render`; this service is
+# not generated, and the two are edited separately for that reason.
+
+# VERSION FLOOR: systemd 249, the oldest supported release (Ubuntu 22.04). The
+# newest directive in this file is ProtectProc= and ProcSubset=, both 247. A
+# directive newer than 249 must not be added here without checking the floor, and
+# `systemd-analyze verify` cannot check it for you: it runs against whatever
+# systemd the build host has (259 on the machine this was written on), so it
+# accepts a 255 directive that Ubuntu 22.04 would refuse at boot. Proving the
+# floor is a container run -- the spec's isolation testing, not this file.
+
+[Unit]
+Description=Daily list work: report drift, and refresh what the policy says to refresh
+Documentation=man:mosdns-cdnctl(1)
+After=network.target
+
+[Service]
+Type=oneshot
+User=mosdns-router-cdn
+Group=mosdns-router
+ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl update-lists --automatic
+# The budget is arithmetic, not a preference, and the arithmetic is this: EVERY
+# request this command makes is capped by the command's own client timeout
+# (updateListTimeout, 60 seconds, cmd/mosdns-cdnctl/update_lists.go), so a run can
+# take at most (requests x 60s) and a unit that budgets less than that gets a
+# SIGKILL instead of the report. The 90-second default for a oneshot would cut a
+# slow origin off before it could report that it was slow, which is the whole
+# reason this directive exists and is not a consequence of the number below.
+#
+# At most 20 requests, and that figure is MEASURED rather than counted by hand:
+# cmd/mosdns-cdnctl/update_lists_budget_test.go drives `update-lists --automatic`
+# through every path against a fake origin that records each request, and 20 is
+# what the most expensive one costs. The shape that reaches it is the FULLY
+# ENABLED cold start -- a machine with nothing published, BOTH policy switches on,
+# and upstream committing while the run is in flight, which is what makes the
+# second refresh in one run publish rather than report already-at.
+#
+# So 20 x 60 = 1200, and this is 1260: the arithmetic plus one more
+# request-timeout for everything a run does that is NOT a request -- extracting a
+# source tarball, converting and sorting a list of 110,551 rules, rendering the
+# range prefix list, and replacing two files by two renames under the control
+# lock. Generous, and free: this budget only ever binds when an origin is slow.
+#
+# The SHIPPED DEFAULT is far cheaper, and it is what nearly every machine runs,
+# because both switches are off in configs/policy.yaml: the drift report alone
+# costs 6 requests when both pinned sources have moved and 2 when neither has.
+# One TimeoutStartSec has to cover the larger of the two, so it covers 20 -- and
+# the comment says both, because "two budgets and one directive" is the honest
+# description, and a comment quoting only the cheap one is how the 180 this
+# replaced came to describe a command that no longer runs.
+#
+# A change that adds a request has to change this number with it. The gate is in
+# cmd/mosdns-cdnctl, it re-reads THIS file, and it goes red when a path costs more
+# than 20 requests, when the per-request timeout changes, or when this stops
+# covering the product.
+TimeoutStartSec=1260
+# Exit 4 is the control lock being held. This unit takes that lock now, so the exit
+# is reachable, and excusing it is the difference between "the daily job skipped
+# because the router was being reconfigured" and "the daily job failed" -- which is
+# the outcome this whole feature has to be able to produce honestly.
+SuccessExitStatus=4
+#
+# Exit 3 is NOT excused. A run that produced no report at all is information rather
+# than noise, including the documented transient of a check that caught a
+# publication in flight: an operator sees one failed day and asks why, and that is
+# the outcome the drift report exists to produce.
+CapabilityBoundingSet=
+
+# What it may write. Two directories, both the ones this package's own state
+# directories, and nothing under /etc -- which is why the policy is read and never
+# rewritten by this job: a scheduled job that could edit the configuration that
+# tells it what to do is a job that can eventually tell itself to do anything.
+ReadWritePaths=/var/lib/mosdns/lists /var/lib/mosdns/runtime
+#
+# A umask, because it creates files now. 0007, the same as the other two units that
+# write, so the files it publishes are as private as the ones they publish.
+UMask=0007
+
+# The same sandbox as the other four. This command reads the policy and two documents
+# under /etc, reads and writes the state directories above, makes HTTPS requests, and
+# holds a lock for as long as a publication takes. It uses a temporary file beside
+# each file it replaces, no device, no kernel setting, no process list and no
+# namespace, and it changes no identity, no clock and no real-time priority.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# It resolves the repository's host name and reads the CA store under /etc. It
+# enumerates no interface and opens no UNIX socket of its own, but the system
+# resolver may be one, so AF_UNIX is kept.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

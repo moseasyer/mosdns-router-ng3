@@ -1,0 +1,24 @@
+{
+  "schema_version": 2,
+  "primary": {
+    "repository": "felixonmars/dnsmasq-china-list",
+    "commit": "a66b6ffc158681a3be06c258893d58a4265b76e5",
+    "sha256": "693dc0f13395d766ad4c7ef0a1cfade5954388d7a94e9d0d594877cc850edfdb",
+    "entries": [
+      "accelerated-domains.china.conf",
+      "google.china.conf",
+      "apple.china.conf"
+    ]
+  },
+  "supplement": {
+    "repository": "v2fly/domain-list-community",
+    "commit": "c6adacf29cc4fb05e04651fcf03e00989ef9f797",
+    "sha256": "d5a59ddc7b1577741ab910b1b5b0aa662f1456d41477bbfe056599f9e97f8ef0",
+    "entry": "data/cn",
+    "kinds": [
+      "full",
+      "regexp"
+    ]
+  },
+  "list_sha256": "0bcf8e8369ed32fc686ea79fff38569aa9fb75a56c79e7197ca69fbbaf0ffbfc"
+}

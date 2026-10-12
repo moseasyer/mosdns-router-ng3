@@ -1,0 +1,228 @@
+# The target: a disposable Ubuntu that runs systemd, and on which NetworkManager
+# manages a real ethernet device.
+#
+# The base image is a build argument and nothing else. `FROM ubuntu:24.04` here
+# would float to whatever the registry serves that day, which is the one thing
+# `tests/podman/images.lock.json` exists to prevent; the build command reads the
+# digest from that file and passes `docker.io/library/ubuntu:24.04@sha256:…`. There
+# is deliberately no default, so a build that forgets the argument fails at the
+# first instruction instead of pulling a moving tag.
+#
+# **This project's package is NOT installed here.** A scenario copies the built
+# `.deb` in and installs it, so the install transaction -- the claim this whole
+# plan exists to close -- is exercised by `install_test.py` rather than by this
+# image build. An image that installed the package would make its own packaging
+# the thing under test before a single scenario ran. That rule is a test
+# (`test_no_containerfile_installs_the_project_package`).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# What the scenarios need, by name, because they are not interchangeable:
+#
+#   systemd-sysv       supplies /sbin/init, which --systemd=always makes PID 1
+#   dbus               NetworkManager's control channel; nmcli cannot run without it
+#   network-manager    the thing whose device state the harness asserts
+#   libnss-resolve     the resolver daemon, and the NSS module that makes a
+#                      lookup in the target go to 127.0.0.53 rather than past it
+#   python3            the scenarios themselves
+#   iproute2           `ss`, which the failure scenarios read and Task 4 asserts
+#   dnsutils           `dig`, which is how the routing scenarios measure anything
+#   curl, ca-certificates  for the scenarios that fetch, and to fetch with
+#   procps             `ps`, for the failure scenarios that look at processes
+#   acl                `setfacl`/`getfacl`, and this is NOT optional: the
+#                      package's `postinst` provisions every state directory with
+#                      `install -d -m 2770` FOLLOWED BY `setfacl -d -m g::rwx`,
+#                      and the ordering is load-bearing (a chmod after a setfacl
+#                      narrows the mask, leaving a directory no service identity
+#                      can write). Under `set -e` a target without `setfacl` dies
+#                      in STEP 2 of the postinst, so `dpkg -i` leaves the package
+#                      `unpacked` and never `installed` -- measured on 24.04 with
+#                      this package absent:
+#
+#                          $ dpkg -i mosdns-router_0.1.0_amd64.deb ; echo $?
+#                          ... /usr/sbin/dpkg-reconfigure: mosdns-router is
+#                              broken or not fully installed
+#                          1
+#
+#                      and every file the package ships IS unpacked, which is the
+#                      confusing part: the units are in /usr/lib/systemd/system
+#                      and the setting is in /etc/mosdns, and dpkg still calls
+#                      the package uninstalled. The package declares
+#                      `Depends: acl` and the container has no reason to install
+#                      a dependency of the thing under test by hand.
+#
+# `libnss-resolve` rather than `systemd-resolved`, and that is measured rather
+# than preferred: `systemd-resolved` is a binary package on 24.04 and 26.04 and
+# **does not exist on 22.04**, where the daemon is part of `systemd` -- so
+# naming it fails the 22.04 build with `E: Unable to locate package
+# systemd-resolved`. `libnss-resolve` exists on all three and brings the daemon
+# with it where it is a separate package (24.04: `Depends: … systemd-resolved
+# (= 255.4-…)`) and is the NSS module everywhere. Without it, `getent hosts` in a
+# target would read /etc/hosts and then the network and never ask the stub, and a
+# scenario that measured names rather than queries would measure the wrong
+# resolver.
+#
+# `--no-install-recommends` because a reproducible image is one whose contents
+# are the list above: a recommendation pulled in by a future upload is a
+# difference between two runs of "the same" image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd-sysv \
+        dbus \
+        network-manager \
+        libnss-resolve \
+        python3 \
+        iproute2 \
+        dnsutils \
+        curl \
+        ca-certificates \
+        procps \
+        acl \
+    && rm -rf /var/lib/apt/lists/*
+
+# The resolved **daemon**, on the releases that package it separately. 24.04
+# already has it (a hard `Depends` of `libnss-resolve`) and 22.04 does not have the
+# package at all (the daemon is part of `systemd`, installed above). **26.04 is
+# the one that needed this**, and the measurement is in the image the previous
+# version of this file built:
+#
+#     $ dpkg -s libnss-resolve | grep -E '^(Depends|Recommends)'
+#     Depends: libc6 (>= 2.39)
+#     Recommends: systemd-resolved
+#     $ command -v resolvectl
+#     NO_RESOLVECTL
+#
+# So `--no-install-recommends` above left 26.04 with `libnss_resolve.so.2` and
+# **nothing behind it**: every lookup in a target goes to 127.0.0.53, nothing is
+# listening there, and the DHCP scenario's own `resolvectl dns eth0` exits 127.
+# That is not a scenario failure, it is a target that cannot resolve anything --
+# and it would have been reported as one.
+#
+# So the package is installed **where it exists**, and "where it exists" is a
+# test rather than a comment. The `if` and the `install` name the same package on
+# purpose: that is the whole safety of the shape, and
+# `tests/podman/tests/test_images.py` holds the two names equal, holds the
+# package against the availability table, and counts every `apt-get install` in
+# the file so a third spelling cannot slip past both parsers.
+#
+# On 22.04 `apt-cache show systemd-resolved` finds nothing and the daemon is
+# already in `systemd`; the `else` says so rather than passing silently, because
+# "there is no daemon" and "the daemon is in another package" are the same image
+# and very different explanations.
+RUN apt-get update \
+    && if apt-cache show systemd-resolved >/dev/null 2>&1; then \
+         apt-get install -y --no-install-recommends systemd-resolved; \
+       else \
+         echo "systemd-resolved is not a package on this release; the resolved daemon is part of systemd here"; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
+
+# `/etc/resolv.conf` is NOT touched here, and that is a measurement rather than
+# an omission.
+#
+# Podman mounts a generated resolv.conf over `/etc/resolv.conf` in every build
+# step as well as in every container, so a `RUN ln -sf …/stub-resolv.conf
+# /etc/resolv.conf` in this file fails with:
+#
+#   ln: failed to create symbolic link '/etc/resolv.conf': Device or resource busy
+#
+# (measured, at the step that carried it, before it was removed.) The base image
+# also ships a regular file here and systemd-resolved does not take it over by
+# itself -- it writes `/run/systemd/resolve/stub-resolv.conf` and leaves
+# /etc/resolv.conf alone -- so a target that keeps the runtime's file answers
+# through the bridge gateway and the routing scenarios measure the wrong
+# resolver.
+#
+# So the target's entrypoint replaces it at boot, inside the container's own
+# mount namespace. `tests/podman/tests/test_images.py` holds both halves of that.
+
+# `eth0` is declared managed by NetworkManager, on every release.
+#
+# NetworkManager's shipped default leaves every non-radio device unmanaged
+# (`unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma`), and
+# the `device set` + restart sequence in the setup unit cannot override that on
+# 22.04: NetworkManager 1.36 has no persistent device override, so the command is
+# accepted and does nothing. `except:interface-name:eth0` is NetworkManager's own
+# key for "this device is handled by NetworkManager even when it would not
+# otherwise be", and in a disposable target whose interface is not special that
+# is the mechanism rather than a way around one.
+#
+# The snippet is a file, `COPY`ed into `conf.d/` and nowhere else: a `RUN` that
+# wrote it would be a second copy of the same text that could drift from this one,
+# and overwriting the main `NetworkManager.conf` would drop every other `lib:`
+# snippet the distribution ships.
+COPY tests/podman/images/10-mosdns-target.conf /etc/NetworkManager/conf.d/10-mosdns-target.conf
+
+# `systemd-networkd` is disabled, and NetworkManager is the only manager.
+#
+# Both daemons claim the same device. With both enabled, which one owns eth0 is a
+# race, and the symptom is an intermittent DHCP failure on one release and none at
+# all on another -- which is a very expensive thing to debug from a later failure.
+#
+# **Disabled and masked in two instructions, not one with `||` between them.**
+# `systemctl disable X || systemctl mask X && systemctl mask Y` is a chain whose
+# meaning depends on whether `disable` succeeded: when it did, the `&&` branch never
+# ran and the image masked one unit instead of two. So the image's masked set was
+# a function of the release, and a case reading the file's text could not tell --
+# which is the same "a claim about intent" the review named. Two instructions, one
+# unconditional `mask`, and a case that reads the *instructions* has a set to hold.
+#
+# `netplan-configure.service` is masked because it **fails on every boot**: it is
+# netplan's backend configuration unit, this image has no netplan configuration to
+# apply, and it exits non-zero regardless. Measured as the only failed unit in a
+# fresh 26.04 target. Nothing is broken by it and every scenario still runs, which
+# is exactly the problem -- a scenario asserting `systemctl --failed` would have to
+# special-case it, and a target that boots with a red unit is the shape of thing an
+# operator stops trusting. The mask is held to this unit and
+# `systemd-networkd.service` by a case, because masking the world would make the
+# next failure invisible instead.
+RUN systemctl disable systemd-networkd.service || true
+RUN systemctl mask systemd-networkd.service netplan-configure.service
+
+# The two unprivileged accounts the two-user scenario acts as, and the
+# setgid-shared directory it checks the control lock in. The package creates these
+# too; the image creates them because the image does not carry the package, and a
+# scenario that had to `useradd` first would be testing `useradd` by the time it
+# reached the lock.
+RUN groupadd --system mosdns \
+    && groupadd --system mosdns-cdn \
+    && useradd --system --gid mosdns --home-dir /var/lib/mosdns --no-create-home mosdns \
+    && useradd --system --gid mosdns-cdn --home-dir /var/lib/mosdns --no-create-home mosdns-cdn \
+    && groupadd mosdns-router-mosdns-cdn \
+    && usermod --append --groups mosdns-router-mosdns-cdn mosdns \
+    && install -d -m 2775 -o mosdns -g mosdns /var/lib/mosdns/runtime
+
+# The NetworkManager sequence, and the boot check that makes a target that could
+# not be measured refuse to look like an installer bug.
+#
+# This is a systemd unit rather than a line in the entrypoint, and the reason is
+# measured rather than stylistic: `nmcli` talks to NetworkManager over D-Bus, so
+# before `/sbin/init` there is no bus to connect to. An entrypoint that ran the
+# three steps itself would fail its first command with `Error: Could not create
+# NMClient object: Could not connect: No such file or directory` and leave every
+# target unmanaged. So the sequence runs once, at boot, from the image's own init,
+# and it is enabled here rather than by a scenario.
+#
+# The COPY paths are relative to the build's **context**, which is the repository
+# root -- not to this file's own directory. A path that is correct in an editor
+# and wrong in a build fails at the last step of a build that has already
+# installed a systemd and a NetworkManager, so `CopySourceTest` checks them.
+COPY tests/podman/images/target-nm-setup.sh /usr/local/bin/mosdns-target-nm-setup
+RUN chmod 0755 /usr/local/bin/mosdns-target-nm-setup
+COPY tests/podman/images/target-nm-setup.service /etc/systemd/system/target-nm-setup.service
+RUN systemctl enable target-nm-setup.service
+
+# The entrypoint is a hand-off and nothing else. `exec` rather than a call, so
+# systemd becomes PID 1 rather than a child of a shell -- the shape that makes
+# `--systemd=always` a no-op and a target's units something no PID 1 systemd
+# manages. It is asserted as well as written:
+# `test_the_entrypoint_does_not_perform_the_sequence_itself`.
+COPY tests/podman/images/target-entrypoint.sh /usr/local/bin/mosdns-target-entrypoint
+RUN chmod 0755 /usr/local/bin/mosdns-target-entrypoint
+ENTRYPOINT ["/usr/local/bin/mosdns-target-entrypoint"]
+
+# No `CMD`, and nothing of this project's started here. The package installs its
+# own units and enables them itself; an image that pre-enabled one would make
+# `systemctl is-enabled` pass on a package that never installed anything.

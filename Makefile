@@ -1,0 +1,229 @@
+GO ?= go
+
+# The DHCP bridge is half of this project: the state document the Go plugin reads
+# is written by Python, and a change to one half that only the other half's tests
+# can see is a change nobody notices. Its suite therefore runs with the Go one.
+PYTHON ?= python3
+BRIDGE_TESTS := bridge/tests
+# The installer suite is the other half of the Python in this package: it is what
+# holds the units, the preflight, the transaction, the uninstall AND the package's
+# own content to the machine they are allowed to make. `test-python` discovers the
+# bridge suite only, so it needs its own target or none of it runs in the gate.
+INSTALLER_TESTS := installer/tests
+
+# The package build. It compiles three programs and writes a .deb, and it is part
+# of `verify` because a package that cannot be built is a real problem rather than
+# something to skip: the ledger's ruling is explicit about that. It needs the
+# pinned dnscrypt-proxy source archive, which is NOT committed, and the build fails
+# loudly and says how to seed it when it is absent.
+#
+# Nothing in it installs anything on the machine that runs it, and the entry-point
+# regression below asserts that as well.
+#
+# BUILD PREREQUISITES, in the order you meet them:
+#
+#   go 1.25.8          exact, not a minor version. `check-go` refuses anything else
+#                      and so does the build script, because the packaged resolver's
+#                      own go.mod asks for exactly this release.
+#   bwrap              the bubblewrap package. The two generated documents are
+#                      rendered for the INSTALLED layout, and a private view of / is
+#                      what makes /etc/mosdns/policy.yaml resolve without a byte being
+#                      written to the build host's /etc. Without it the build stops
+#                      with a message naming the package; it does not fall back.
+#   the source archive below, seeded once with
+#                      mkdir -p build && curl -L -o build/dnscrypt-proxy-2.1.18.tar.gz \
+#                        https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/2.1.18.tar.gz
+#                      and thereafter verified against packaging/debian/dnscrypt-proxy.sha256
+#                      on every build. The digest and the tag's commit are both there.
+#
+# GOTMPDIR and GOCACHE: this host's /tmp is a 1.7 GB tmpfs, so a Go build fails with
+# "disk quota exceeded" unless both are pointed at the disk-backed filesystem. That
+# is an environment note and not a Makefile change, for the reason the ledger gives:
+# the failure is loud enough that it cannot produce a false pass, a Makefile cannot
+# know a disk-backed path on an arbitrary host, and this file's contents are asserted.
+DNSCRYPT_ARCHIVE ?= build/dnscrypt-proxy-2.1.18.tar.gz
+PACKAGE_SCRIPT := scripts/build-deb.sh
+
+# Every entry point refuses to run on a different Go release: the module pins
+# go 1.25.8, the reproducible build metadata assumes exactly that compiler, and
+# the packaged dnscrypt-proxy 2.1.18 declares `go 1.25.8` in its own go.mod.
+GO_REQUIRED_VERSION := 1.25.8
+
+LDFLAGS ?= -s -w
+BUILDINFO_PKG := mosdns-router/internal/buildinfo
+
+# The build identity is supplied by the caller, or derived from this checkout.
+# `ifndef` keeps an explicit VERSION=, REVISION=, or BUILD_TIME= override
+# authoritative while still freezing the derived value once.
+ifndef VERSION
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+endif
+ifndef REVISION
+REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+endif
+ifndef BUILD_TIME
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+endif
+
+METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
+
+.PHONY: check-go test test-integration test-python test-installer test-make-entrypoints \
+	build cross-build verify verify-build-info package
+
+# The guard is the only place that decides whether this host's Go is acceptable.
+check-go:
+	@if ! version=$$($(GO) version 2>&1); then \
+		echo "mosdns-router: '$(GO)' is not a usable Go toolchain: $$version" >&2; \
+		exit 1; \
+	fi; \
+	set -- $$version; \
+	if [ "$$3" != "go$(GO_REQUIRED_VERSION)" ]; then \
+		echo "mosdns-router: Go $(GO_REQUIRED_VERSION) is required, found $${3:-unknown}" >&2; \
+		exit 1; \
+	fi
+
+# -mod=readonly on every Go command makes the entry points unable to act as an
+# implicit dependency updater: a stale go.mod or go.sum fails the command
+# instead of being silently rewritten. Run `go mod tidy` explicitly and review
+# its module-file changes as a separate step.
+#
+# -short is what makes this the unit suite. The end-to-end suite in
+# tests/integration builds the router and starts a process per case, so it
+# honours -short and skips itself. `verify` reaches it through test-integration
+# below, and the entry-point regression asserts that it does, so the acceptance
+# gate cannot pass without the end-to-end cases and cannot pay for them twice.
+test: check-go test-python
+	@$(GO) test -mod=readonly -short ./...
+	@sh scripts/test-make-entrypoints.sh
+
+# A separate, non-recursive target, so the end-to-end suite can be run on its own
+# while the routing is being changed. It builds the router itself rather than
+# reading build/mosdns-router, because `go test ./...` runs this package and
+# nothing guarantees that a `make build` has already happened. MOSDNS_ROUTER_GO
+# carries GO through, so the binary under test is built by the toolchain check-go
+# just accepted rather than by whichever go happens to be on PATH.
+#
+# The suite is the only place the two promises this router makes about answers are
+# checked together: that a name reaches only its own branch, and that a response
+# this router rewrites is rewritten on the way out rather than stored rewritten.
+# Every other test in this repository reads bytes, so a case that starts the real
+# binary and follows its queries is the only thing that can fail when the document
+# is right and the behaviour is not.
+#
+# -count=1 because this suite's work is not something the test cache can see: it
+# binds sockets and runs a child process, and a cached pass would be a gate
+# satisfied without a single case having been asked. The entry-point regression
+# asserts this flag is here, for this target AND for verify, so it cannot be
+# dropped and left as a comment.
+#
+# The suite skips on a host with no non-loopback IPv4 address, because the
+# production DHCP state decoder refuses a loopback upstream and the alternative
+# would be a bypass of the validation these cases exist to hold to. A skip is the
+# right answer on a laptop and the wrong answer in a gate, so MOSDNS_REQUIRE_INTEGRATION=1
+# turns it into a failure. It is exported from the recipe rather than left to CI,
+# because nothing else set it: a loopback-only host passed this gate with zero
+# end-to-end coverage and said nothing about it. `?=` so a developer on such a host
+# can still run the gate and take the skip, with
+# `make verify MOSDNS_REQUIRE_INTEGRATION=0`; the entry-point regression asserts
+# both the export and the default, so neither can be dropped and left as a comment.
+#
+# The value is assigned in the recipe line rather than by a bare `export`
+# directive, so what reaches the suite is the make variable and nothing else. A
+# caller relaxes it either way -- `make verify MOSDNS_REQUIRE_INTEGRATION=0` or a
+# MOSDNS_REQUIRE_INTEGRATION=0 in the environment, since `?=` respects both -- but
+# the recipe line is what `make -n` prints, and that is the line the entry-point
+# regression asserts, so the two cannot drift apart while the recipe still works.
+MOSDNS_REQUIRE_INTEGRATION ?= 1
+
+test-integration: check-go
+	@MOSDNS_REQUIRE_INTEGRATION='$(MOSDNS_REQUIRE_INTEGRATION)' MOSDNS_ROUTER_GO='$(GO)' $(GO) test -mod=readonly -count=1 ./tests/integration
+
+# A separate, non-recursive target, so the bridge suite can be run on its own
+# while it is being changed. `test` and therefore `verify` depend on it, because
+# the two halves of the bridge share one state schema and one committed fixture.
+test-python:
+	@$(PYTHON) -m unittest discover -s $(BRIDGE_TESTS)
+
+# A separate, non-recursive target, for the same reason and one more: the installer
+# suite is the only thing that holds the eight unit files, the preflight, the
+# transaction, the uninstall and the PACKAGE CONTENT to what this project decided,
+# and `test-python` discovers the bridge suite only. A gate that stopped depending
+# on this target would keep passing while the rules a package is built under stopped
+# being enforced -- which is the failure this target was added to prevent, and the
+# same one that put the bridge suite's fixture outside the gate.
+#
+# The suite builds the staging root itself, by running the real build script, so
+# `make verify` builds a package. That is the point: the package is the artifact
+# whose content matters, and a content test that read a checked-in expectation
+# instead of the build would be testing the expectation.
+#
+# Which is also why GO and the archive location are passed here and not left to the
+# environment. `scripts/build-deb.sh` requires exactly Go 1.25.8 and verifies the
+# pinned dnscrypt-proxy archive's digest, and it reads both from the environment, so
+# a `test-installer` recipe that passed neither would build the staging root with
+# whatever `go` happened to be first on PATH and with whatever archive happened to
+# sit in build/ -- while `package`, three lines below, was given the pinned toolchain
+# explicitly. That is not a theoretical split: a gate run as `make GO=… verify` would
+# have tested the package with one toolchain and built it with another, and a host with
+# no Go at all produced nine setUpClass errors and a gate that looked like a pass
+# because the failures were in a class that never ran.
+#
+# Both variables are named here rather than derived, so `make -n test-installer`
+# prints the same command a run would use and the entry-point regression can read it.
+test-installer:
+	@GO='$(GO)' MOSDNS_DNSCRYPT_ARCHIVE='$(DNSCRYPT_ARCHIVE)' \
+		$(PYTHON) -m unittest discover -s $(INSTALLER_TESTS)
+
+# This is a separate, non-recursive target: the regression harness inspects the
+# real Makefile with `make -n` and never invokes `make test` recursively.
+test-make-entrypoints:
+	@sh scripts/test-make-entrypoints.sh
+
+build: check-go
+	@mkdir -p build
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
+
+cross-build: check-go
+	@mkdir -p build/linux-amd64 build/linux-arm64
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+
+# A build that forgot the metadata injection would otherwise ship a binary that
+# reports dev/unknown/unknown, so verification reads the metadata back out of
+# the built router instead of trusting the linker flags.
+verify-build-info: build
+	@$(GO) run -mod=readonly ./internal/buildinfo/cmd/check build/mosdns-router
+
+# The Debian package. It installs nothing here: no dpkg -i, no apt, no systemctl, no
+# nmcli, and no maintainer script is executed, so running it cannot change the
+# machine it runs on. `scripts/build-deb.sh` builds the staging root, renders the
+# two routing documents through the control tool the package itself installs, and
+# writes build/mosdns-router_<PACKAGE_VERSION>_<arch>.deb from it. The version is
+# PACKAGE_VERSION in scripts/build-deb.sh and nowhere else; this comment used to
+# spell out 0.1.0 as a literal, which is how it stayed true after the package moved
+# to 0.2.0 and the script moved with it.
+#
+# GO and the archive location are passed through rather than read out of the
+# environment, so `make -n package` prints the same command a run would use -- and
+# so the entry-point regression can read what this target plans.
+#
+# The three build-identity values go in as well, for the reason the recipe of
+# test-installer now explains: a build that injects no metadata ships a router that
+# reports dev/unknown/unknown, and `make build` and `make package` must not be two
+# different compilations of the same source.
+package:
+	@GO='$(GO)' MOSDNS_DNSCRYPT_ARCHIVE='$(DNSCRYPT_ARCHIVE)' \
+		VERSION='$(VERSION)' REVISION='$(REVISION)' BUILD_TIME='$(BUILD_TIME)' \
+		sh $(PACKAGE_SCRIPT)
+
+# What the built package SAYS, as opposed to whether the build exited zero. These
+# are the assertions the CI publish step runs against a downloaded artifact, and
+# they belong here too: a version that exists in two places can diverge, and it did,
+# and the only thing that noticed was a CI run a minute and a half after the bump.
+# The cost of finding that out locally instead is one make target.
+verify-package: package
+	@sh scripts/assert-deb.sh build/mosdns-router_$$(sed -n 's/^PACKAGE_VERSION=//p' $(PACKAGE_SCRIPT))_$$(dpkg --print-architecture).deb
+
+verify: test test-integration test-installer verify-build-info verify-package
+	@$(GO) vet -mod=readonly ./...

@@ -6,7 +6,7 @@
 
 **Architecture:** A small Go module named `mosdns-router` wraps upstream MOSDNS v5.3.4 through its public plugin APIs rather than forking the repository. Shared policy and runtime-state contracts live under `internal/`; later plans implement the DHCP bridge, DNSCrypt integration, optimizer, and response plugins against those contracts.
 
-**Tech Stack:** Go 1.25, MOSDNS v5.3.4, `miekg/dns` v1.1.72 through MOSDNS, Cobra v1.10.2, YAML v3, standard-library tests, Make.
+**Tech Stack:** Go 1.25, MOSDNS v5.3.4, `miekg/dns` v1.1.70 through MOSDNS, Cobra v1.10.2, YAML v3, standard-library tests, Make.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`
 
@@ -17,7 +17,7 @@
 - Never generate a default Chinese public DNS address.
 - Never add a local DoH listener, custom CA, TLS MITM, SNI DPI, ClearDNS, or Docker runtime dependency.
 - All runtime state files use schema version 1, same-directory temporary files, `fsync`, validation, and atomic rename.
-- Initial pinned versions are MOSDNS v5.3.4, dnscrypt-proxy 2.1.18, and Go 1.25.0.
+- Initial pinned versions are MOSDNS v5.3.4, dnscrypt-proxy 2.1.18, and Go 1.25.8.
 - TDD is mandatory; every task ends with a focused commit.
 
 ## Review Focus
@@ -41,6 +41,9 @@ cmd/mosdns-router/main.go
 cmd/mosdns-cdnctl/main.go
 internal/buildinfo/buildinfo.go
 internal/buildinfo/buildinfo_test.go
+internal/buildinfo/check.go
+internal/buildinfo/cmd/check/main.go
+internal/buildinfo/cmd/check/main_test.go
 internal/config/policy.go
 internal/config/defaults.go
 internal/config/load.go
@@ -53,6 +56,7 @@ internal/filelock/lock.go
 internal/filelock/lock_test.go
 internal/status/render.go
 internal/status/render_test.go
+scripts/test-make-entrypoints.sh
 ```
 
 ### Shared interfaces produced by this plan
@@ -96,10 +100,10 @@ type Selector struct {
     Mode             string            `json:"mode"`
     Provider         string            `json:"provider"`
     WinnerIP         string            `json:"winner_ip,omitempty"`
-    WinnerProofUntil time.Time         `json:"winner_proof_until,omitempty"`
+    WinnerProofUntil time.Time         `json:"winner_proof_until,omitzero"`
     FallbackIP       string            `json:"fallback_ip,omitempty"`
     CloudFront       map[string]string `json:"cloudfront,omitempty"`
-    LastSuccess      time.Time         `json:"last_success,omitempty"`
+    LastSuccess      time.Time         `json:"last_success,omitzero"`
     LastFailure      string            `json:"last_failure,omitempty"`
     ConfigSHA256     string            `json:"config_sha256"`
 }
@@ -127,8 +131,8 @@ type HealthState struct {
     SchemaVersion       int       `json:"schema_version"`
     Healthy             bool      `json:"healthy"`
     ConsecutiveFailures int       `json:"consecutive_failures"`
-    LastSuccess         time.Time `json:"last_success,omitempty"`
-    LastFailure         time.Time `json:"last_failure,omitempty"`
+    LastSuccess         time.Time `json:"last_success,omitzero"`
+    LastFailure         time.Time `json:"last_failure,omitzero"`
 }
 
 func WriteJSONAtomic(path string, value any) error
@@ -165,9 +169,7 @@ Create `go.mod`:
 ```go
 module mosdns-router
 
-go 1.25.0
-
-toolchain go1.25.0
+go 1.25.8
 
 require (
     github.com/IrineSistiana/mosdns/v5 v5.3.4
@@ -175,6 +177,10 @@ require (
     gopkg.in/yaml.v3 v3.0.1
 )
 ```
+
+A `toolchain` directive is not added: `go 1.25.8` already pins the language
+version, `go mod tidy` strips a redundant `toolchain` line, and the Make entry
+points enforce the exact compiler instead.
 
 Create `internal/buildinfo/buildinfo_test.go`:
 
@@ -378,7 +384,17 @@ type CachePolicy struct { PersistentDump bool `yaml:"persistent_dump"` }
 
 - [ ] **Step 5: Implement strict YAML loading and validation**
 
-Use `yaml.NewDecoder`, call `KnownFields(true)`, reject multiple documents, require exactly one `---` document, and return path-wrapped errors. `Validate()` must enforce every numeric lower bound and the exact enums `strict|fallback` and `disable-current|use-last-good`.
+Use `yaml.NewDecoder`, call `KnownFields(true)`, reject multiple documents, require exactly one `---` document, and return path-wrapped errors. `Validate()` must enforce every numeric lower bound, the approved upper bounds, and the exact enums `strict|fallback` and `disable-current|use-last-good`.
+
+`Validate()` also enforces the spec's hard limits, because a policy above them would
+make a later optimizer exceed the approved budget:
+
+- `cdn.ip_version` must be exactly `IPv4`; the design selects IPv4 only;
+- `cdn.bandwidth.daily_budget` must not exceed 100 MiB;
+- `cdn.bandwidth.per_candidate_limit` must not exceed 10 MiB;
+- `cdn.bandwidth.per_candidate_seconds` must not exceed 3;
+- every `ech.sources` entry must be a DNS hostname, so a URL scheme, a path, an
+  address literal, or a wildcard cannot be configured as an ECH source.
 
 - [ ] **Step 6: Run focused and package tests**
 
@@ -443,6 +459,20 @@ func (s ECHState) Validate() error
 
 Require `SchemaVersion == 1`, valid IP addresses, non-empty provider, `ECHState.Status` in `fresh|stale|invalid`, RFC3339 `BandwidthBudgetState.LocalDate`, non-negative budget bytes, and non-negative health failure counters.
 
+`time.Time` fields carry `omitzero`, not `omitempty`: `omitempty` never applies to a
+struct, so it encoded a zero time as the literal year 1 instead of omitting it.
+
+DHCP upstreams must be routable unicast addresses, never loopback (including
+`127.0.0.53`/`127.0.0.54`), unspecified, multicast, IPv4 link-local, or zoned;
+a bare IPv6 link-local, ULA, or global address stays valid because the interface
+is stored in the same record. `DHCPState` also requires an interface name, a
+source token, an observation time, and at least one upstream when `LastGood` is
+set. `Selector` requires public IPv4 CloudFront values, DNS-hostname CloudFront
+keys, an optional lowercase SHA-256 `ConfigSHA256`, and a consistent
+winner/fallback/proof relationship. `ECHState` requires a DNS-hostname source and
+public name, a SHA-256 digest, and a `fetched_at` < `expires_at` <= `stale_until`
+timeline.
+
 - [ ] **Step 4: Implement atomic JSON writes**
 
 `WriteJSONAtomic` must:
@@ -452,7 +482,14 @@ Require `SchemaVersion == 1`, valid IP addresses, non-empty provider, `ECHState.
 3. Create a file in the same directory with mode `0640`.
 4. Encode one indented JSON document.
 5. Call `Sync`, `Close`, `Rename`, then sync the parent directory.
-6. Remove the temporary file on every error path.
+6. Remove the temporary file on every error path, and report a failed removal to
+   the caller instead of discarding it, because a surviving temporary file or
+   backup leaves a stale copy of runtime state in the state directory.
+
+The state package does not inspect the mode of a directory it did not create. A
+pre-existing runtime directory with the wrong mode, group, or setgid bit is
+reported by the packaging preflight, which knows the identities and groups that
+are allowed to share the directory.
 
 - [ ] **Step 5: Implement strict reads**
 
@@ -513,6 +550,16 @@ Expected: compile failure.
 - [ ] **Step 3: Implement the lock**
 
 Use `golang.org/x/sys/unix.Flock` with `LOCK_EX|LOCK_NB`, mode `0640`, sentinel `ErrLocked = errors.New("control lock is already held")`, and a `sync.Once`-guarded close. If the dependency is indirect, run `go mod tidy` rather than adding an unpinned version manually.
+
+Open the lock file with `os.O_CREATE|os.O_RDONLY`: creating it needs write
+permission on the directory, while the descriptor itself must stay incapable of
+modifying the state the lock protects. A same-package test reads the descriptor
+flags with `F_GETFL` and asserts `O_RDONLY`, because the kernel still takes the
+exclusive lock on a read-only descriptor. The shared ownership of the lock file
+between the router service, the DHCP bridge, and the optimizer is provisioned by
+the packaging plan with setgid directories, group ownership, and default ACLs;
+that plan also owns the real two-user systemd test, and the packaging preflight
+reports a pre-existing directory whose mode is wrong.
 
 - [ ] **Step 4: Run tests**
 
@@ -589,19 +636,48 @@ mosdns-cdnctl status --selector PATH --dhcp PATH --ech PATH
 
 ```make
 GO ?= go
-LDFLAGS = -s -w
-.PHONY: test build cross-build verify
-build:
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
-cross-build:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+GO_REQUIRED_VERSION := 1.25.8
+LDFLAGS ?= -s -w
+BUILDINFO_PKG := mosdns-router/internal/buildinfo
+ifndef VERSION
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+endif
+ifndef REVISION
+REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+endif
+ifndef BUILD_TIME
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+endif
+METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
+.PHONY: check-go test build cross-build verify verify-build-info
+check-go:
+	@# refuse any Go release other than $(GO_REQUIRED_VERSION)
 test:
-	$(GO) test ./...
-verify: test
-	$(GO) vet ./...
+	@$(GO) test -mod=readonly ./...
+	@sh scripts/test-make-entrypoints.sh
+build:
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
+cross-build:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+verify-build-info: build
+	@$(GO) run -mod=readonly ./internal/buildinfo/cmd/check build/mosdns-router
+verify: test verify-build-info
+	@$(GO) vet -mod=readonly ./...
 ```
+
+Every entry point depends on `check-go`, and every Go command uses
+`-mod=readonly`, so no build target can act as an implicit dependency updater.
+`scripts/test-make-entrypoints.sh` proves the guard and the readonly flag on
+every entry point; a stale `go.mod` or `go.sum` therefore has to be fixed by an
+explicit `go mod tidy` that a developer reviews.
+
+`VERSION`, `REVISION`, and `BUILD_TIME` are overridable, so a release build is
+described by the caller instead of by whatever this checkout happens to say.
+`verify-build-info` parses the metadata back out of the built router and fails
+on `dev`/`unknown`/`unknown`, so a build that forgot the injection cannot pass
+verification.
 
 - [ ] **Step 6: Run complete local verification**
 
@@ -627,6 +703,9 @@ git commit -m "build: add reproducible project entry points"
 Run:
 
 ```bash
+go mod tidy -diff
+go test ./...
+go vet ./...
 make verify
 make cross-build
 git status --short
@@ -634,6 +713,8 @@ git status --short
 
 Expected:
 
+- `go mod tidy -diff` reports no difference and leaves `go.mod`/`go.sum` untouched;
+- plain `go test ./...` and `go vet ./...` work with no `GOFLAGS` and no `-mod=mod`;
 - all Go tests and vet pass;
 - amd64 and arm64 static binaries build;
 - no system networking or browser configuration changed;

@@ -1,0 +1,515 @@
+.\" Manual page for the mosdns-router DNS router as this package installs it.
+.TH MOSDNS\-ROUTER 8 "2026-09-27" "mosdns-router 0.1.0" "System Administration"
+.SH NAME
+mosdns\-router \- the machine's DNS router, on loopback only
+.SH SYNOPSIS
+.B mosdns\-router
+.B start
+.B \-c
+.I /etc/mosdns/mosdns.yaml
+.SH DESCRIPTION
+.BR mosdns\-router (8)
+is the resolver this package makes a machine's own. It binds
+.B 127.0.0.1:53
+on UDP and TCP, and nothing else on any other address; it also opens a second
+loopback listener, on
+.B 127.0.0.1:15354
+with no address outside the loopback, which is where
+.BR "mosdns\-cdnctl" (1)
+asks it to drop the foreign cache. It is started by
+.BR mosdns\-router.service (5).
+The routing document it reads is
+.IR /etc/mosdns/mosdns.yaml ,
+and that document is GENERATED: it is the output of
+.BR "mosdns\-cdnctl render" (1)
+for the policy in
+.IR /etc/mosdns/policy.yaml .
+A hand edit to it is an edit the next render overwrites, and the file says in its
+own header that it is generated and by what.
+.SS The two branches
+There are two and there is no third. A name the pinned China list matches goes to
+the DNS servers NetworkManager has in use for that device, and every other name
+goes to the loopback DNSCrypt resolver over TCP. There is no fallback between them:
+a foreign query that cannot be answered fails, and is never re\-asked inside the
+network the user is leaving.
+.SS "Where the domestic branch gets its resolvers"
+A NetworkManager dispatcher hook publishes the resolvers in use, and the router
+reads what it published. The hook is not this package's idea of a DHCP client: it
+asks NetworkManager, in order, for the raw lease's
+.B domain_name_servers
+, then this event's own dispatcher variables, then the device's effective DNS, and
+only then
+.BR "resolvectl dns" .
+The first of those that answers is the one recorded, and it is recorded as the
+SOURCE rather than the event \(em a lease renewal, an interface coming up, and a
+resolver list that changed are one state when the addresses did not move, and
+treating them as three would flush the router's cache for resolvers that never
+changed.
+.PP
+So a
+.B manually configured
+resolver is found, and found the ordinary way: a connection with
+.B ipv4.method manual
+has no lease at all, the lease queries answer with nothing, and the device's
+effective DNS is the operator's own
+.BR ipv4.dns .
+The event that carries it is
+.BR dns\-change ,
+which is the one whose name promises a lease and never delivers one.
+.PP
+Two things about that case are worth knowing.
+.IP \(bu 2
+The install records and restores
+.BR ipv4.dns ,
+.BR ipv6.dns ,
+and both
+.B ignore\-auto\-dns
+properties, so an operator's manual resolver list survives an uninstall. It is
+recorded whether or not this package changed it, because a hand restore is how a
+machine ends up with no DNS.
+.IP \(bu 2
+A statically configured resolver that is
+.B changed
+is picked up without rebooting the interface. The hook fires on
+.B dns\-change
+and the router adopts the new list on its next query.
+.PP
+The one thing that is not automatic is the resolver being reachable. This package
+records what the machine was told to use; it does not keep a hand\-typed address
+alive.
+.SH WHEN THE NETWORK CHANGES
+The hook runs for
+.BR up ,
+.BR dhcp4\-change ,
+.BR dhcp6\-change " and " dns\-change ,
+and does nothing at all for any other event NetworkManager sends it \(em it exits
+zero without touching a file, because NetworkManager calls it for events that have
+nothing to do with DNS and an error there would be noise in its log).
+.PP
+.B down
+is the one event that publishes rather than collects, and it publishes an
+EMPTY list: the addresses the collector would find belong to a lease that no
+longer exists. The router's domestic branch then fails closed, by design \(em
+forwarding a domestic query to a resolver on a network that is gone would be a
+worse answer than no answer. Foreign names are unaffected; they go to the loopback
+DNSCrypt resolver and never depended on the lease.
+.PP
+On a machine that is unplugged for a while, that means domestic names do not
+resolve until the interface comes back and a
+.B up
+or
+.B dhcp4\-change
+event arrives. This is the shipped behaviour and it is a policy rather than a
+default:
+.B dhcp.failure_policy
+in
+.IR /etc/mosdns/policy.yaml
+is
+.BR disable\-current ,
+and
+.B use\-last\-good
+instead keeps serving the last published set that had resolvers and reports how old
+it is. Both are honest answers; only one of them will talk to a dead address.
+.SS "What the router does while nothing has changed"
+It re\-reads the published state on every query rather than at start\-up, comparing
+the file's device and inode as well as its size and timestamp, so a replacement
+that happens to be the same length and the same age is still a new document. A
+generation that is not newer than the one in service is refused, and a read that
+fails leaves the current generation serving and is retried on the next query rather
+than at the next event.
+.PP
+A replaced generation keeps its clients for sixty seconds while the new one takes
+over, so a resolver change does not interrupt an exchange already in flight. That
+window is a fixed property of the plugin and not a policy key: the only settings
+for
+.B dhcp_forward
+are in the generated routing document, and
+.IR dhcp.failure_policy
+in
+.I /etc/mosdns/policy.yaml
+is the one an operator is expected to change.
+.PP
+To see what the router believes, without reading JSON:
+.RB " sudo mosdns\-cdnctl status \-\-dhcp /run/mosdns/dhcp\-upstreams.json"
+.SS What is rewritten
+Only what comes back from the foreign branch, and only that:
+.B cdn_rewrite
+runs before the cache, so a rewritten answer is never itself stored, and a cached
+answer is rewritten on the way out to every client rather than stored rewritten.
+It replaces an address only for a response every one of whose addresses is inside
+a published range, and only while the published selection's proof window is open.
+Nothing in the domestic branch is rewritten: those answers come from the network
+the user is not leaving, and nothing here has proved anything about them.
+.SH THE RESOLVER WATCHDOG
+.BR mosdns\-watchdog.service (5)
+is the one unit in this package that changes the machine with nobody watching.
+It runs every minute, asks this machine's own resolver one question, and when the
+answer is no for long enough it runs
+.BR "mosdns\-cdnctl emergency\-rollback" (1)
+**by itself**.
+
+This is a default and it is switchable, and both facts matter. The
+.B automatic
+key in
+.I /etc/mosdns/watchdog.yaml
+is
+.B true
+as shipped.
+.SS What it restores, and what it does not
+The rollback puts the DNS settings the install RECORDED back on the connection
+\- on a machine this package has taken over, the resolvers the machine's own DHCP
+lease published \- so ordinary name resolution works again.
+
+**Foreign\-name resolution through DNSCrypt does not work afterwards.** That is
+the condition this package was installed to fix, and the rollback does not fix
+it: it stops nothing, removes nothing and starts nothing, so the router, the
+resolver and the configuration are all still installed and the local resolver is
+still not serving. The fault is no longer in the way; it is not fixed. The
+watchdog says both halves in its own message every time it acts, and the message
+is in the journal where the action is.
+.SS Why it waits
+A single failed probe is not evidence that the router is down: a slow upstream, a
+cold boot before NTP has synchronised and a loaded machine each produce one.
+With automatic rollback as the default, acting on one would be a mechanism that
+can tear down a working configuration while somebody is using it, and a
+self\-inflicted outage is worse than a false alarm. So the default acts on the
+.BR 3rd
+consecutive failure, or once
+.B 10
+minutes have passed since the first, whichever comes first \- and both numbers
+are in
+.IR /etc/mosdns/watchdog.yaml ,
+because the false\-positive rate has never been measured and a number nobody
+measured does not get baked in as a constant.
+.PP
+The ten minutes are measured on the machine's **boot clock**, not on the wall
+clock. A machine whose clock steps \- a cold boot before NTP has synchronised, a
+hypervisor adjusting it, a person running
+.B hwclock
+\- must not be able to satisfy the window by having had its clock moved, and a
+cold boot with a wrong clock is exactly the case the first sentence of this
+section names. The boot clock cannot be stepped and it keeps counting across a
+suspend, which is the case the elapsed half exists for.
+.PP
+An **empty** setting file is a refusal, and an **absent** one is not. A file
+that is not there is a deletion, and a deletion is not a decision, so the
+shipped default stands; a file that is there and says nothing is a statement
+this program will not act on, because a truncated file, a
+.B "sed \-i"
+that matched every line and a deployment that wrote a placeholder all leave one.
+.SS While something else is changing the machine
+An install transaction restarts the two units that serve
+.BR 127.0.0.1:53 ,
+so during an upgrade the local resolver is not answering by construction \- the
+transaction creates that failure deliberately. The watchdog therefore takes the
+shared control lock before it counts or acts, and while anything else holds that
+lock it counts nothing, acts on nothing, and says which lock and who holds it.
+The transaction holds the same lock for the window in which it moves the
+machine's DNS, and for its rollback. The first run after a boot is also three
+minutes after boot, for the same underlying reason.
+.SS Turning it off
+Set
+.B automatic: false
+in
+.IR /etc/mosdns/watchdog.yaml .
+The probe keeps running and the messages keep appearing; what stops is the
+unattended part.
+.BR "mosdns\-cdnctl emergency\-rollback" (1)
+is unaffected, because a switch that stopped the action for the operator as well
+would leave a broken machine with no way back. Turning the mechanism back on
+starts its window again rather than resuming a streak that was interrupted.
+.SS If the setting cannot be read
+The watchdog does nothing and says so loudly, because a setting it cannot read
+exactly is one it would have to guess at \- and guessing there decides whether a
+working machine is taken apart. That is deliberately the opposite of this
+package's usual fail\-open. The message says the machine is not being watched.
+.SH FILES
+.TP
+.I /etc/mosdns/watchdog.yaml
+The watchdog's setting: whether automatic rollback is on, the consecutive\-failure
+count, and the elapsed\-time window. Ships with
+.B automatic: true
+and the two numbers the unit's header explains; a conffile, so an upgrade asks
+before replacing an operator's
+.BR automatic:\ false .
+Its own comments say what a rollback restores and what it does not, because an
+operator who has read only this file has to be able to learn that.
+.TP
+.I /usr/lib/systemd/system/mosdns\-list\-check.timer
+The daily list work's schedule. GENERATED, and it says so in its own header: it is
+rendered from the policy's
+.B schedule
+by
+.BR "mosdns\-cdnctl render" (1),
+which reloads systemd as part of writing it. Edit the policy, not this file \em a
+hand edit here is overwritten by the next render, which is what its header says.
+.PP
+This file is the reason
+.B schedule
+in
+.I /etc/mosdns/policy.yaml
+is a field rather than a comment. It was validated as HH:MM and read by nothing,
+while this timer carried a hardcoded
+.BR OnCalendar ,
+so an operator who changed the policy got no change at all \em and a field that is
+silently ignored is worse than no field, because the file claimed the machine's
+schedule was in it. The default is
+.BR 03:30 ,
+which is the time the hardcoded timer was already using, so making the field real
+did not also move the machine half an hour earlier.
+.PP
+The work the timer starts does two things, and which of them happens is the policy's
+decision rather than the unit's: it always reports whether the pinned China domain
+list has moved, and it refreshes what
+.B lists.china.automatic
+and
+.B lists.cloudflare.automatic
+say to refresh. Both default off, for reasons the
+.BR "mosdns\-cdnctl" (1)
+page gives. The unit's own header says which sandbox it runs in, and that sandbox is
+sized around the fact that it may publish.
+.TP
+.I /etc/mosdns/mosdns.yaml
+The routing document. Generated; a conffile, so an upgrade asks before replacing
+it. Regenerate it with
+.BR "mosdns\-cdnctl render" (1).
+.TP
+.I /etc/mosdns/policy.yaml
+The policy both generated documents are rendered from. Edit this, not the
+documents. Validate it with
+.BR "mosdns\-cdnctl validate" (1).
+.PP
+Its
+.B foreign
+block names the route foreign queries leave by:
+.B foreign.upstreams
+is a list whose entries are either the packaged resolver
+.RB ( kind:\ dnscrypt ,
+which carries no address because that listener is the resolver's own) or an
+address mosdns dials
+.RB ( kind:\ upstream ).
+.B foreign.concurrent
+is how many of them one query is sent to, and
+.B 1
+is a random pick rather than a race \(em the shipped value is
+.BR 2 .
+Each upstream's
+.B bootstrap
+resolves that upstream's own host name and is
+.I not
+a query path.
+.B foreign_cache
+carries the router's own answer cache size and, optionally, a record-time bound
+in seconds.
+.PP
+A policy left with no enabled entry the ECH key can be fetched through is refused
+by name rather than rendered, because the consequence of rendering it is that every
+force\-ECH domain fails closed once the key's grace ends with nothing in the log
+saying why. Add a
+.B dnscrypt
+entry, or one whose
+.B addr
+is
+.BR tcp:// .
+.PP
+.BR "mosdns\-cdnctl check\-upstream" (1)
+reports which of them can be reached, and
+.BR "mosdns\-cdnctl flush\-cache" (1)
+empties the router's answer cache.
+.TP
+.I /etc/mosdns/force\-ech\-domains.txt
+Domains to force ECH for. One per line; a line whose first non\-space character is
+# is a comment, a blank line is nothing, and everything after a # on a line ends the
+entry. Ships with no entries, and carries a comment line rather than being zero bytes
+because a zero\-byte list is refused.
+.PP
+No restart is needed to edit this file: the rewriter reads it about twice a second,
+so a new entry is in force immediately. /etc/mosdns/policy.yaml is the file that
+needs
+.BR "systemctl restart mosdns\-router" ,
+because
+.BR ech.enabled ,
+.BR ech.failure_policy
+and
+.BR ech.stale_grace
+are resolved once at start\-up. This file is a conffile, so a package upgrade asks
+before replacing it.
+.PP
+Forcing a name is not free. The router answers the name's HTTPS (type 65) query
+itself, and the ECH key it installs is BORROWED from the sources named in the policy
+rather than published by the origin for that name. A listed name's A and AAAA queries
+are ordinary queries and are answered as such: this router runs only on the foreign
+path, so the HTTPS query has already disclosed the name to the foreign resolver
+before any address lookup follows, and withholding the address bought no privacy
+while leaving the client with nothing to connect to. The synthesized record carries
+the address the CDN selector proved, or the upstream's own published address when
+there is no proved one, and no hint at all when there is neither.
+.PP
+A browser must be told to use the key or it will arrive and be ignored. Firefox 129
+and later default both of these to the unsafe side, and both are in about:config:
+.B network.dns.force_waiting_https_rr
+must be true, or a slow HTTPS record is treated as no HTTPS record and the browser
+silently connects unencrypted; and
+.B network.dns.echconfig.fallback_to_origin_when_all_failed
+must be false, or a failed ECH connection falls back to the plaintext origin name.
+This package does not set them and does not read your browser profile, so this is
+stated, not checked.
+.TP
+.I /etc/mosdns/cloudflare.txt
+Addresses and prefixes to measure in addition to the published ones. Ships empty.
+.TP
+.I /etc/mosdns/cloudfront\-domains.yaml
+Per\-hostname CloudFront candidate profiles. Ships with an empty profile list.
+.TP
+.I /var/lib/mosdns/runtime/ech\-state.json
+The ECH state the response rewriter publishes. Generated; the router's only write.
+.TP
+.I /run/mosdns/dhcp\-upstreams.json
+The DHCP generation the router follows, published by the NetworkManager dispatcher
+hook. Its absence is not an error: the router keeps the generation it has and
+starts green.
+.SH STATE DIRECTORIES
+The state directories are
+.BR /var/lib/mosdns ,
+.BR /var/lib/mosdns/runtime ,
+.B /var/lib/mosdns/lists
+and
+.BR /run/mosdns ,
+each
+.BR root:mosdns\-router " 2770"
+with a default ACL granting the group
+.BR rwx ,
+and it is the one exception that matters:
+.B /run/mosdns
+is
+.B 2750
+with no ACL, because only
+.BR root
+writes it \(em the NetworkManager dispatcher that runs the DHCP bridge is a
+dispatcher script, so it runs as root \(em and a group
+.B w
+on that directory would let any member of
+.BR mosdns\-router
+unlink and replace
+.IR dhcp-upstreams.json ,
+since unlink and rename are decided by the directory rather than by the mode of
+the file inside it. One group serves two service users under
+.IR /var/lib/mosdns ,
+because a default ACL grants by group and per\-service groups would let only one of
+them replace the other's files.
+.B /var/lib/mosdns
+is provisioned by the package's
+.B postinst
+and
+.B /run/mosdns
+by the package's
+.BR tmpfiles.d (5)
+entry, because
+.B /run
+is a tmpfs and the group, the setgid bit and the default ACL do not survive a
+reboot.
+.PP
+One further directory is the exception and is not in that set:
+.BR /run/mosdns/watchdog ,
+which is
+.BR root:root " 0700"
+with no default ACL. It holds the resolver watchdog's failure record and nothing
+else. The record is 0600 and this directory is 0700 because unlink and rename are
+decided by the containing directory and not by a file's own mode, so a 0600 file
+in the group\-writable
+.B /run/mosdns
+above could still be deleted, or replaced with a streak that has already reached
+its window, by
+.BR mosdns\-router\-cdn .
+No other identity in this package reads the record.
+.PP
+The record is on a tmpfs, so it does not survive a reboot, and a machine that has
+just been rebooted gets its window again rather than inheriting one. That tmpfs
+is the guard in force.
+.PP
+The record also names the boot it belongs to, which is a second answer to the same
+question for a machine whose
+.B /run
+is a disk rather than a tmpfs \- and it does
+.B not
+fire in this package's own unit.
+.BR mosdns\-watchdog.service (5)
+carries the packaged
+.BR ProcSubset=pid ,
+which mounts a reduced
+.B /proc
+with no
+.BR /proc/sys ,
+so the kernel's
+.I boot_id
+cannot be read inside it and the record carries no boot id. Each run says so.
+Run
+.B "mosdns_installer.py watchdog"
+by hand, where
+.B /proc/sys
+is readable, and the boot id is recorded and a carried\-over streak re\-seeded
+rather than acted on.
+.SH ACCOUNTS AND REMOVAL
+A purge removes
+.BR /var/lib/mosdns ,
+the ownership marker, the NetworkManager dispatcher hook under
+.IR /etc/NetworkManager/dispatcher.d/no-wait.d/ ,
+and the bridge's
+.B __pycache__
+directory under
+.IR /usr/lib/mosdns-router/mosdns_dhcp_bridge/ .
+The last of those is not a package file: Python writes the cache beside the bridge
+module the first time anything imports it, so it appears after unpacking, and
+.BR dpkg (1)
+leaves a directory it does not own with the warning "not empty so not removed".
+.PP
+A purge also removes the three service accounts
+.RB ( mosdns\-router ,
+.BR mosdns\-router\-cdn ,
+.BR mosdns\-router\-dnscrypt )
+and the two groups
+.RB ( mosdns\-router ,
+.BR mosdns\-router\-dnscrypt ).
+Each name carries this package's own, which is the point of them: before, they were
+.BR mosdns ,
+.BR mosdns\-cdn
+and
+.BR dnscrypt\-proxy ,
+and the third of those is the upstream
+.B dnscrypt\-proxy
+package's own account. An upgrade from the earlier names moves the four state
+directories to the new group and then removes the old accounts; a purge that finds
+an account still in use leaves it and says so, rather than taking the name away from
+a process that is using it.
+.PP
+"Still in use" is two checks, and both are reported by name. A process running as
+the account, or a file outside this package's own four directories that the account
+owns, means something else is using the identity. The account is then
+.B left alone
+and the message names the command that would remove it
+.RB ( deluser\ \-\-system
+or
+.BR delgroup\ \-\-system ),
+because that is a decision for whoever owns the machine rather than one a package
+should take for them.
+The recorded NetworkManager settings are the one thing a removal cannot recreate.
+A plain
+.B dpkg \-\-remove
+leaves them in place for exactly that reason: a machine with no marker is a
+machine a later install will treat as somebody else's. Put them back first with
+.BR "mosdns\-cdnctl emergency\-rollback" (1).
+.SH OPTIONS
+The router takes one subcommand and one flag, and this package's unit uses both:
+.B start
+and
+.BR \-c .
+.SH EXIT STATUS
+The router is a long\-running server and does not have a useful exit status of its
+own; a unit that has failed says why in the journal.
+.SH SEE ALSO
+.BR "mosdns\-cdnctl" (1),
+.BR dnscrypt\-proxy (8),
+.BR mosdns\-watchdog.service (5),
+.BR systemd.unit (5),
+.BR resolv.conf (5),
+.BR tmpfiles.d (5)

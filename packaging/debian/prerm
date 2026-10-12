@@ -1,0 +1,142 @@
+#!/bin/sh
+# Take the machine's DNS back, and stop this package from being started again.
+#
+# TWO things happen here and the order matters.
+#
+# First, the `systemctl disable` that the installer's own uninstall deliberately does
+# NOT do. That is a handoff, not an omission: a plain `mosdns_installer.py
+# uninstall` with no package removal behind it would disable a unit the operator
+# still has installed, and leaving a machine's resolver enabled when the operator
+# asked for the daemon to stop -- but the package to stay -- is not what anyone
+# meant. prerm knows the files are about to go: dpkg is removing this package.
+# Here an unconditional disable of every unit in this package is correct, and it
+# costs one call each.
+#
+# Second, the uninstall transaction, which is the part that changes the machine.
+# It stops the three timers first, because they are the only units that write
+# anything, then puts the recorded NetworkManager values back and reactivates the
+# connection, then reads the device to prove it took them, and only then stops the
+# two daemons. A failure at any step leaves the rest alone and prints a manual
+# recovery report with argument arrays a person can paste.
+#
+# The uninstaller refuses to restore automatically when it cannot prove the
+# connection's current values are the ones this package set: an absent marker, an
+# unknown schema, a missing connection, or a value somebody else has since changed.
+# That refusal is the correct answer, and the report it prints is the deliverable
+# rather than a log line.
+#
+# WHAT dpkg DOES WITH A FAILURE, because it is the sentence the first version of
+# this script got wrong in the direction that matters. dpkg ABORTS a removal whose
+# pre-removal script exits non-zero: the package stays installed and not one file
+# is removed. So this script must never say that the files are about to be
+# removed, and it must never tell an operator to avoid rebooting a machine dpkg is
+# not touching. What it does say, per status, is what the situation is -- because
+# the installer's two refusals are two different machines and an operator told
+# they are the same one does the wrong thing:
+#
+#   5  nothing was changed, because this program could not prove the values on the
+#      connection are ones it set. There is no half-restored connection to finish,
+#      and the report above is the whole deliverable.
+#   6  a restore was attempted and did not finish, so some of this package's
+#      values may still be on the connection and the units are still running.
+#
+# Neither arm claims anything about WHOSE the DNS on this machine is. The
+# uninstaller can, because it can read the marker and the record; this script
+# cannot, and a claim it could not check is exactly the kind that is false on the
+# one case that matters -- a marker with no record behind it, which the installer
+# itself documents as the more dangerous of the two states.
+#
+# The status is captured from an `if`/`else` rather than from `if !`, because `$?`
+# after `!` is the status of the `!` -- which is always zero -- so a script that
+# read it there would print the same arm for every failure there is.
+#
+# For a purge, the state directory goes in postrm, and only when the purge was
+# asked for: `dpkg --purge` is the operator saying the data goes too, and a plain
+# `dpkg --remove` must leave /var/lib/mosdns with the backup and the marker in it,
+# because a machine with no marker is a machine a later install will treat as
+# somebody else's.
+#
+# The four verbs below are Debian Policy 6.5's complete list for a prerm, and the
+# test holds this script against that list rather than against a copy of it, so a
+# verb added to the policy and not here fails the build rather than a mid-upgrade
+# unwind.
+set -e
+
+INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
+
+case "$1" in
+remove|deconfigure)
+	# The two daemons and the four timers, and nothing else: a unit that is
+	# already stopped is left stopped, and one that was never enabled is not
+	# touched, so this is cheap on a machine where the transaction refused.
+	#
+	# The watchdog is in this list and the reason is not tidiness. It is the only
+	# unit in this package that changes the machine by itself, and a removal that
+	# left its timer enabled would leave a mechanism running
+	# `emergency-rollback` against a connection whose record the uninstaller is
+	# about to delete -- unattended, on a timer, on the machine somebody is
+	# trying to put back.
+	if [ -d /run/systemd/system ]; then
+		systemctl disable mosdns-router.service dnscrypt-proxy.service \
+			mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
+			mosdns-list-check.timer mosdns-watchdog.timer
+	fi
+
+	if "$INSTALLER" uninstall; then
+		:
+	else
+		status=$?
+		case "$status" in
+		5)
+			echo "prerm: the uninstaller exited 5: it would not write to a connection it" >&2
+			echo "prerm: cannot prove this package set, so it changed NOTHING and printed" >&2
+			echo "prerm: the recovery report above. That is the only claim made here, and" >&2
+			echo "prerm: it is deliberately the only one: whether the DNS on this machine" >&2
+			echo "prerm: is this package's to change is a question this script cannot ask," >&2
+			echo "prerm: and the case the uninstaller itself calls the more dangerous one" >&2
+			echo "prerm: is a marker with NO record behind it, where the record is the" >&2
+			echo "prerm: thing that would say what the connection was set to. The report" >&2
+			echo "prerm: above is what names it. dpkg is ABORTING this removal: the package" >&2
+			echo "prerm: is still installed and not one file has been removed. Follow the" >&2
+			echo "prerm: report above, then remove the package with:" >&2
+			echo "prerm:   sudo dpkg --remove mosdns-router" >&2
+			;;
+		6)
+			echo "prerm: the uninstaller exited 6: it began putting this package's recorded DNS" >&2
+			echo "prerm: settings back and did not finish, so SOME of them may still be on the" >&2
+			echo "prerm: connection and the units this package installs have NOT been stopped." >&2
+			echo "prerm: The recovery report above is the command block that finishes the job;" >&2
+			echo "prerm: it is the deliverable, not a log line. dpkg is ABORTING this removal:" >&2
+			echo "prerm: the package is still installed and not one file has been removed, so" >&2
+			echo "prerm: the units and the files are both still here. Complete the report, then" >&2
+			echo "prerm: try the removal again." >&2
+			;;
+		*)
+			echo "prerm: the uninstaller exited $status, which is not a status this script" >&2
+			echo "prerm: knows; the messages above say why. dpkg is ABORTING this removal: the" >&2
+			echo "prerm: package is still installed and not one file has been removed." >&2
+			;;
+		esac
+		exit 1
+	fi
+	;;
+upgrade | failed-upgrade)
+	# An upgrade keeps everything enabled and running: the units are about to be
+	# replaced, not removed, and the transaction in postinst is idempotent for a
+	# machine that is already running this router.
+	#
+	# `failed-upgrade` is here because Debian Policy 6.5 lists it: dpkg calls
+	# `new-prerm failed-upgrade old-version new-version` when `old-prerm upgrade`
+	# failed, and this package's new prerm is idempotent, so doing nothing here is
+	# right. The two arms Policy does NOT list for prerm -- abort-install and
+	# abort-upgrade -- are gone rather than handled anyway: a case dpkg cannot reach
+	# is a case nobody reasoned about, and a default arm that refuses an argument
+	# dpkg never passes is a fact about dpkg this package can be loud about.
+	;;
+*)
+	echo "prerm called with an argument this script does not understand: $*" >&2
+	exit 1
+	;;
+esac
+
+exit 0
