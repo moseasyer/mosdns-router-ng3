@@ -25,6 +25,11 @@ their transcripts are in the gitignored
 `.superpowers/sdd/2026-09-25-podman-integration-matrix/` task reports. Those
 transcripts are the record; this file is the index into them.
 
+The one exception to that date range is
+[the China list](#the-china-list-as-mosdns-loads-it), measured on **2026-10-12**
+on this host with no container involved. Its transcript is
+`.superpowers/sdd/2026-10-11-china-list-dnsmasq-source/task-7-report.md`.
+
 ---
 
 ## When to re-measure
@@ -38,6 +43,7 @@ not a generic "if in doubt".
 | **NetworkManager changes version on a target release** — a point release bump on 22.04, 24.04 or 26.04, or a new release entering the matrix | The [NetworkManager override boundary](#networkmanager) table, the two `conf.d`/`[ifupdown]` facts, and the bridge-managed-by-default fact. Re-derive the whole table; do not interpolate, and do not re-use 23.04/23.10 without reading the warning below. |
 | **A new Ubuntu release enters the matrix** | Its `nmcli --version` and its place relative to the 1.44 boundary; whether a bridge device is managed by NetworkManager's default with the declaration removed; where it packages the `systemd-resolved` daemon (`Depends` or `Recommends` or absent); and its base image digest, which belongs in `tests/podman/images.lock.json`. |
 | **dnsmasq is upgraded** | [The SIGHUP fact](#dnsmasq) — re-read `dnsmasq(8)` NOTES and re-measure. It is a documentation claim first and a behaviour claim second. |
+| **The China list is re-pinned, or mosdns is upgraded** | [The China list as mosdns loads it](#the-china-list-as-mosdns-loads-it) in full. Every figure there is a function of the rule count and of the trie implementation, so a re-pin that adds or removes a thousand rules moves the load time and the heap. |
 | **A test fails with a message that points at one of these facts** | That section, and only that section, before the fix. A failure naming `dispatching events`, `IP configuration could not be reserved`, `GENERAL.NM-MANAGED`, `strictly unmanaged`, `resolvectl` exit 127, or an unexplained `is-active` refusal is one of these facts being wrong or out of date, not an installer defect. |
 
 Two things are *not* triggers and will mislead you if treated as ones:
@@ -699,6 +705,201 @@ nothing has re-measured it.
 
 ---
 
+## The China list, as mosdns loads it
+
+Measured **2026-10-12**, on this host, with no container and no network. The two
+lists compared are the one this repository ships (`configs/cn-domains.txt`,
+**110,551 rules**) and the one it shipped the day before
+(`git show 87a34b7^:configs/cn-domains.txt`, **8,363 rules**, still the shape
+the `felixonmars/dnsmasq-china-list` change replaced).
+
+### A 13-fold rule count *adds* 95 ms and 7.7 MiB, and the startup budget cannot see it
+
+**The facts.** Through the loading path the shipped router actually uses, on
+this host. **Every row below is an absolute**; the two figures in this heading
+are the **marginal** cost, the new minus the old:
+
+| | v2fly, before | dnsmasq, now | ratio |
+|---|---:|---:|---:|
+| rules the matcher holds (`Len()`) | 8,363 | **110,551** | **13.22×** |
+| file bytes | 168,010 | 2,177,739 | 12.96× |
+| load, median of 30 samples | **5.24 ms** | **100.08 ms** | 19.1× |
+| — spread over 6 independent passes | 4.52 – 7.23 ms | 95.04 – 103.58 ms | |
+| heap the matcher holds | **0.726 MiB** | **8.404 MiB** | 11.6× |
+| — per rule | 91.0 B | 79.7 B | 0.88× |
+| **share of the 30 s readiness budget** | 0.017 % | **0.334 %** | |
+
+The marginal cost is **100.08 − 5.24 = 94.84 ms** of load and
+**8.404 − 0.726 = 7.678 MiB** of heap, which is where the heading's rounded
+"95 ms" and "7.7 MiB" come from.
+
+The budget is `readinessTimeout` in `tests/integration/routing_test.go:100`,
+the deadline the integration suite gives a cold router to start **and answer** —
+process start, first page-in and all list loading included. The whole change in
+that budget is **+94.8 ms, or 0.316 %**.
+
+**The two ratios disagree, and both are measured.** A 13.22× rule count is a
+**19.1×** load time but only an **11.6×** heap. Per rule the load costs
+627 ns → 905 ns (**1.44×** worse) while the heap gets *cheaper* per rule
+(0.88×), because a larger trie shares more prefixes between neighbouring
+domains. So the load is mildly superlinear in the rule count and the memory is
+mildly sublinear. **The mechanism behind the 1.44× was not measured** — a
+deeper trie with more nodes per `map[string]*labelNode` is the obvious
+candidate and it is exactly the kind of claim this file refuses to state as a
+fact without a number.
+
+**Provenance, in the order it matters.** The loading path is the shipped one and
+not an approximation of it: `domain.NewDomainMixMatcher()` then
+`domain.LoadFromTextReader`, which is `domain_set.LoadFile` in mosdns
+**v5.3.4**'s `plugin/data_provider/domain_set/domain_set.go`, the plugin
+`configs/mosdns.yaml` names with `type: domain_set`. Both lists were read from
+disk into a `[]byte` first, so the timing covers parsing and trie-building and
+not the read.
+
+*Why paired sampling.* This host is a working desktop, not a benchmark
+machine: `nproc` → **2**, `grep -m1 'model name' /proc/cpuinfo` → **Intel(R)
+Xeon(R) W-2150B CPU @ 3.00GHz**, and `/proc/loadavg` read between the first and
+last measurement pass gave **0.50** and **1.33** as its first field, against a
+background of `gnome-shell`, `firefox`, `opencode` and `localsearch` — this is a
+user's desktop with a permanent load, not a quiet machine. Two processes run one
+after the other do not see the same machine, and the first attempt at this
+measurement did exactly that: it measured the two lists in separate processes
+and the **same list, doing the same work, reported 8.9 ms and then 17.0 ms** on
+two consecutive passes — **1.9× apart**. The harness therefore loads **both
+lists alternately inside one process**: 10 rounds × 3 loads = **30 paired
+samples per list**, so every sample of one list is taken within milliseconds of
+a sample of the other and the interference is common to both. That was run **6
+times** as independent processes; the figures above are the **median of the six
+per-pass medians** (each of which is itself a median over 30 samples), and the
+spread row is the six per-pass medians' min–max. The matching `matcher Len()`
+figures, 8,363 and 110,551, confirm each list was loaded whole.
+
+*How the heap was read.* In a **separate fresh process per list**, because a
+process holding both has one `HeapAlloc` for the pair and would report the same
+number twice — which it did, on the first attempt. `runtime.GC()` then
+`runtime.ReadMemStats` **before** the load and again after, and the difference
+is quoted, so the figure is the list's own cost and not the Go runtime's
+startup footprint beside it. Three processes per list: the delta was
+**0.726 / 0.726 / 0.726 MiB** and **8.404 / 8.404 / 8.404 MiB**, identical to
+three decimal places. Raw loaded `HeapAlloc` was 0.977 MiB and 10.569 MiB, so
+each raw figure exceeds its own delta by what the process is still holding
+beside the trie: **0.251 MiB** against a 168,010-byte (0.160 MiB) file, and
+**2.165 MiB** against a 2,177,739-byte (2.077 MiB) one. The difference is the
+list bytes — held live on purpose so the matcher was built beside them as it is
+in production — **plus ~0.09 MiB of other retained allocations that both lists
+show** (0.091 MiB and 0.088 MiB respectively). That residual is the same size
+for a 168 KB list and a 2.1 MB one, which is what marks it as fixed overhead
+rather than something about either list; it is not identified beyond that.
+
+**Invalidated by** any of: a re-pin that changes the rule count (these are
+functions of it, and upstream re-pins freely — the pinned commit `a66b6ffc…` is
+currently still upstream's `master` HEAD, verified with `git ls-remote`, so the
+next refresh will move these figures); a mosdns version change, since the trie
+is v5.3.4's `pkg/matcher/domain` and a later release may build or walk it
+differently; or a change to this host, because the absolute milliseconds are
+one 2-core machine's. **The ratios survive a host change and the absolute
+numbers do not.**
+
+---
+
+### A 13-fold rule count does not slow a lookup down, and the reason is structural
+
+**The fact.** Lookup cost shows **no difference this measurement can separate**
+between the two lists. Ten rounds × 200,000 operations per pass, six passes;
+each cell is the **min–max across the six passes' fastest rounds**, with the
+median of those six in bold:
+
+| | v2fly, before | dnsmasq, now |
+|---|---:|---:|
+| hit (512 distinct names drawn from that list) | 179 – 235 ns, median **193 ns** | 186 – 270 ns, median **210 ns** |
+| miss (12 fixed foreign names, identical for both) | 274 – 421 ns, median **326 ns** | 309 – 370 ns, median **330 ns** |
+
+**The smaller list is consistently a little faster, and this entry does not
+pretend otherwise.** The 8,363-rule list has the faster round in **four of six
+passes** on hits, and the two medians-of-minima differ by **17 ns, about 9 %**,
+in the same direction every time. What that figure is *not* is a demonstrated
+cost of the larger list, and the reason is given so a reader does not have to
+guess: the difference is **smaller than either list's own pass-to-pass spread**
+(A spans 56 ns, B spans 84 ns); the fastest single hit on the *large* list
+(186 ns) beats four of the six rounds on the small one; and the structural
+account below predicts **no** rule-count term at all. So the honest claim is
+**"a difference this measurement cannot separate from its own noise, pointing
+the wrong way for the trie"** — not "identical", and not "9 % slower".
+
+**Why the claim is not a coincidence — read from the code, not measured.**
+`SubDomainMatcher.Match` in v5.3.4's `pkg/matcher/domain/matcher.go` is a
+**reverse-label trie**: it walks the query's labels right to left and `break`s
+at the first label with no child. Its cost is therefore **O(labels in the
+query)**, and the total rule count is not a term in it. A 13-fold larger trie
+adds nodes off the path every query already takes and cannot lengthen that
+path. *This paragraph is derived by reading the implementation; the table above
+is what confirms it did not change in v5.3.4.*
+
+*Why the fastest round and not the median.* Interference on a shared machine can
+only add time. The minimum over rounds is the least-contaminated estimate of the
+unloaded cost available without a quiet machine, and reporting it is what makes
+the two lists comparable at all; the median on this host moves by 4× between
+passes (226 ns to 960 ns for the same list and the same work), which is why no
+median is quoted as a result.
+
+**Not established.** Whether a *pathological* query — one whose every label
+exists in the trie, so the walk cannot break early — costs more on the larger
+list. It should not: the walk is still bounded by the query's label count. But
+it was not measured, and a DNS name is attacker-supplied, so this is the one
+lookup-shaped question worth re-deriving if the list grows again.
+
+**Invalidated by** a mosdns change to `SubDomainMatcher.Match` — in particular
+any move to a flat map or a hash lookup over the whole rule set, which would
+make this section's central claim false while leaving every number in it
+unchanged — or by a re-pin large enough to change the depth distribution of
+common prefixes.
+
+---
+
+### The fallback can only be published by the cold-start branch, and that is structural
+
+**The fact.** A machine can come to run **v2fly's list as its published China
+list** by exactly one route, and it is not a route a refresh can take:
+
+1. `lists.china.automatic` is **on** — the shipped default is `false` at
+   `configs/policy.yaml:11` — **and**
+2. `rules.ReadPublishedPair` reports there is **no China list on this machine at
+   all** — no lock, or an empty one — **and**
+3. the primary `felixonmars/dnsmasq-china-list` **cannot be reached**
+   (`rules.ResolveCommit` fails).
+
+That is the whole of `publishFallback`'s reachability, and it holds for two
+independent reasons, either of which alone would be enough:
+
+- **The single caller.** `publishFallback` has exactly one call site in
+  non-test code: `cmd/mosdns-cdnctl/update_lists.go:1082`, inside
+  `publishPrimaryOrFallback`, which is itself called from exactly one place —
+  the `policy.Lists.China.Automatic && readErr == nil && !found` branch at
+  `update_lists.go:734-740`.
+- **The destination.** `refreshChinaList` — the path every later refresh takes —
+  hard-codes `destination := rules.RepositoryChina` at
+  `update_lists.go:815`. It **cannot** publish v2fly, so the old arithmetic
+  that made a small publication self-refusing against a large one is no longer
+  what holds this property up. The call site is.
+
+The fallback publishes to `options.sourceLock` / `options.listFile` — the **same
+two paths as every other publication** — so there is no second document and
+nothing to keep in step. A machine with a good list keeps it through a failed
+refresh: the last good result is 13× the size of the fallback, and replacing it
+would turn an outage into a downgrade.
+
+**Provenance.** `grep -rn publishFallback --include=*.go` over the tree,
+excluding tests; the three predicates read at `update_lists.go:734`, `:735`,
+`:1079`; the destination read at `update_lists.go:815`; the publication targets
+read at `update_lists.go:1135`.
+
+**Invalidated by** a second call site for `publishFallback`, or by a
+`destination` that is computed from the published lock instead of hard-coded.
+Both are one-line changes and neither would fail anything until a machine were
+already on the small list.
+
+---
+
 ## The host
 
 | fact | value | how it was read |
@@ -756,6 +957,59 @@ should act on.
 - **`bind-interfaces` versus `bind-dynamic` under a starting race.** Measured
   identical here, and *not* measured where the interface appears after the
   daemon starts. Recorded as an open item above rather than as a fact.
+- **Where the spec's 111,357 / 111,287 came from — 806, and only one half of
+  the question is closed.** The design spec
+  (`docs/superpowers/specs/2026-10-11-china-list-dnsmasq-source-design.md` §8)
+  quotes **111,357** expressions and **111,287** unique domains. The shipped
+  artifact holds **110,551** rules, and they are not all one source: **110,481**
+  are `domain:` rules converted from the dnsmasq source and **70** are the v2fly
+  supplement (67 `full:` + 3 `regexp:` — the `kinds`
+  `configs/source-lock.json` names). Both documents carry that same 70-rule
+  supplement, which is what makes them comparable: the spec's two figures differ
+  by 70 (111,357 − 111,287) and the artifact's differ by 70 (110,551 − 110,481).
+  **On that basis every like-for-like subtraction gives the same gap of 806** —
+  111,357 − 110,551 rules, and 111,287 − 110,481 `domain:` rules.
+
+  ***Drift after the pin is excluded.*** Measured 2026-10-12: `git ls-remote`
+  reports `a66b6ffc…` as upstream's `master` HEAD; the archive fetched for that
+  commit digests to `693dc0f13…`, the lock's `primary.sha256`; and its three
+  named entries hold **110,482** `server=/…/` lines resolving to **110,481**
+  unique domains — exactly the `domain:` count the artifact carries. Nor can
+  another file in that revision supply the missing 806: the whole tree holds
+  110,482 `server=` lines and the three named entries already account for all of
+  them, because the only other `.conf`, `bogus-nxdomain.china.conf`, is 290 lines
+  of `bogus-nxdomain=<IPv4>` and contributes **zero**. The converter drops
+  nothing either — `ConvertChinaConfFS` *refuses* a malformed entry rather than
+  skipping it, so a filter cannot be the explanation.
+
+  ***Drift before the pin is NOT excluded, and it is the live explanation.*** It
+  was **sampled, not refuted**, and the sample does not close it. Nineteen
+  revisions of `master` between 2026-08-30 and the pin were fetched and counted
+  (day-end for sixteen dates, day-first for three of them). Their unique-domain
+  counts run **110,481 to 111,158**. The spec's 111,287 is **129 above the
+  highest of the nineteen**, which looks like a near miss and is not one: the
+  series **oscillates rather than trends** — 2026-09-19 alone went 111,084 →
+  111,152 between its first and last commit — and the upstream's stream is
+  **at least 100 commits in a four-day window**, nearly all single-domain
+  `accelerated-domains: remove …`, with additions mixed in. **Nineteen samples
+  taken from a stream that dense cannot bound a maximum.** The distance from the
+  spec's figure to the top of the observed range is smaller than the swing within
+  a single week, so this narrows the question and settles nothing.
+
+  This repository offers no shorter route to the answer: `configs/cn-domains.txt`
+  has held exactly two sizes in its whole history, 8,363 and 110,558 lines, so
+  the figure never came from a committed artifact here either.
+
+  **To establish it:** enumerate every commit on `master` back far enough to
+  cover the spec's writing date and count the three named entries at each, or
+  bisect for the commit whose entries carry 111,287 unique domains. Each archive
+  is ~540 KB, so the search is bounded and mechanical. A `git clone` of the
+  repository fails on this host's 94 %-full disk, which is why the per-archive
+  route was used — and why it was stopped at nineteen revisions rather than run
+  to the end. Until someone does it: treat **806** as the measured gap,
+  **110,551** as the figure the shipped pair is accountable to — `list_sha256`
+  names the file that is actually there — and the spec's two numbers as
+  **unreconciled, not explained**.
 - **A `UNIQUE SIZE` in kilobytes per image.** The records say "a few kilobytes"
   for every harness image; no per-image figure was kept, so none is quoted.
 - **arm64 and live Firefox ECH.** Both are recorded as SKIPPED with exact
