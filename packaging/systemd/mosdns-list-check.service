@@ -41,10 +41,41 @@ Type=oneshot
 User=mosdns-router-cdn
 Group=mosdns-router
 ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl update-lists --automatic
-# At most two requests against a 60-second client timeout each, so the 90-second
-# default for a oneshot would cut a slow origin off before it could report that it
-# was slow.
-TimeoutStartSec=180
+# The budget is arithmetic, not a preference, and the arithmetic is this: EVERY
+# request this command makes is capped by the command's own client timeout
+# (updateListTimeout, 60 seconds, cmd/mosdns-cdnctl/update_lists.go), so a run can
+# take at most (requests x 60s) and a unit that budgets less than that gets a
+# SIGKILL instead of the report. The 90-second default for a oneshot would cut a
+# slow origin off before it could report that it was slow, which is the whole
+# reason this directive exists and is not a consequence of the number below.
+#
+# At most 20 requests, and that figure is MEASURED rather than counted by hand:
+# cmd/mosdns-cdnctl/update_lists_budget_test.go drives `update-lists --automatic`
+# through every path against a fake origin that records each request, and 20 is
+# what the most expensive one costs. The shape that reaches it is the FULLY
+# ENABLED cold start -- a machine with nothing published, BOTH policy switches on,
+# and upstream committing while the run is in flight, which is what makes the
+# second refresh in one run publish rather than report already-at.
+#
+# So 20 x 60 = 1200, and this is 1260: the arithmetic plus one more
+# request-timeout for everything a run does that is NOT a request -- extracting a
+# source tarball, converting and sorting a list of 110,551 rules, rendering the
+# range prefix list, and replacing two files by two renames under the control
+# lock. Generous, and free: this budget only ever binds when an origin is slow.
+#
+# The SHIPPED DEFAULT is far cheaper, and it is what nearly every machine runs,
+# because both switches are off in configs/policy.yaml: the drift report alone
+# costs 6 requests when both pinned sources have moved and 2 when neither has.
+# One TimeoutStartSec has to cover the larger of the two, so it covers 20 -- and
+# the comment says both, because "two budgets and one directive" is the honest
+# description, and a comment quoting only the cheap one is how the 180 this
+# replaced came to describe a command that no longer runs.
+#
+# A change that adds a request has to change this number with it. The gate is in
+# cmd/mosdns-cdnctl, it re-reads THIS file, and it goes red when a path costs more
+# than 20 requests, when the per-request timeout changes, or when this stops
+# covering the product.
+TimeoutStartSec=1260
 # Exit 4 is the control lock being held. This unit takes that lock now, so the exit
 # is reachable, and excusing it is the difference between "the daily job skipped
 # because the router was being reconfigured" and "the daily job failed" -- which is

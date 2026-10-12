@@ -469,11 +469,15 @@ UNIT_DIRECTIVES = {
             ("User", IDENTITIES[LIST_CHECK][0]),
             ("Group", IDENTITIES[LIST_CHECK][1]),
             ("ExecStart", f"{CDNCTL_BINARY} update-lists --automatic"),
-            # `--automatic` makes the same two requests as `--check` and then, when
-            # the policy says so, two more per refresh, so the budget is the 180 s
-            # the other two state-writing units get rather than the two requests the
-            # old read-only command made.
-            ("TimeoutStartSec", "180"),
+            # `--automatic` makes the same two requests as `--check` did and then,
+            # when the policy says so, up to eighteen more, so this budget is the
+            # MEASURED request maximum (20) against the command's own 60-second
+            # client timeout, plus one request-timeout of slack -- not the 180 the
+            # other two state-writing units get. What holds it there is
+            # `cmd/mosdns-cdnctl`'s own test, which drives the command against a
+            # counting fake origin and re-reads this file; the table here only says
+            # the directive did not move.
+            ("TimeoutStartSec", "1260"),
             # Exit 4 is the control lock being held, and this unit takes that lock
             # now, so the exit is reachable and has to be excused: a daily job that
             # skipped because the router was being reconfigured is not a failed day.
