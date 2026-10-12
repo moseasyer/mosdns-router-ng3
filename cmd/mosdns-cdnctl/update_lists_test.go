@@ -1065,6 +1065,249 @@ func TestAFirstInstallThatCannotReachTheSecondSourceStillPublishesAndSaysWhy(t *
 	}
 }
 
+// A RE-PIN over a lock that names no second source.
+//
+// This is the state the defect above leaves behind, and it is why the first-install
+// fix was not enough: the first install published the dnsmasq primary alone, and the
+// lock it wrote says so. Nothing about that pair looks wrong from the outside --
+// ReadPublishedPair accepts it, the list converts, sorts and routes -- so every later
+// hand `--pin-remote` on that machine took the "carry the second source forward"
+// path and carried nothing. The machine that hit the bug keeps hitting it, and the
+// list keeps missing every rule the dnsmasq syntax cannot express.
+//
+// The state is also reachable without any of this having been released:
+// `--pin-remote HEAD --pin-source felixonmars/dnsmasq-china-list` over a v1 lock is
+// the recovery path this file's own refusals name, and it publishes the primary
+// alone the same way. So this is not a state only a buggy build creates.
+//
+// And it does not heal by itself on a default installation: the `gaining` path in
+// refreshChinaList that would resolve the supplement for it runs only under
+// `--automatic`, and lists.china.automatic is OFF BY DEFAULT
+// (internal/config/policy.go:46-54). A machine that never opted in has exactly one
+// remedy, and it is this command.
+//
+// The fixture is publishChinaPair, which writes a schema version 2 lock naming the
+// dnsmasq primary and no supplement -- a document this build both reads and writes,
+// so the case does not rest on a state the command could not produce itself.
+func TestARepinOverALockThatNamesNoSecondSourcePublishesTheUnion(t *testing.T) {
+	paths := newListPaths(t)
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Supplement == nil {
+		t.Errorf("a re-pin over a lock naming no second source published the %s primary alone: "+
+			"%+v. The syntax that primary is written in cannot express a `full:` or a `regexp:` rule, "+
+			"so this list is missing every rule only the second source can state -- and it converts, "+
+			"sorts and routes either way, so nothing about the published pair shows the loss, and "+
+			"this machine had nothing to carry from in the first place",
+			lock.Primary.Repository, lock)
+	}
+	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
+		if !strings.Contains(string(list), want) {
+			t.Errorf("the published list has %d rules and no %q, which the dnsmasq source "+
+				"cannot express", countListRules(list), want)
+		}
+	}
+}
+
+// The same run, from the operator's side of the screen.
+//
+// A run that quietly gains a second source and a run that quietly drops one are the
+// same run seen from outside: same exit code, same shape of report, same published
+// pair that describes itself. So the acquisition is said -- and said with the reason,
+// because the reason is the only thing that tells the operator this was not the first
+// install. "This machine had nothing published" on a machine that has published for
+// months is not a true sentence, and a report line an operator has to disbelieve is
+// worse than no report line.
+func TestARepinOverALockThatNamesNoSecondSourceSaysWhereTheSecondSourceCameFrom(t *testing.T) {
+	paths := newListPaths(t)
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	acquired := "added the " + rules.RepositoryV2Fly + " supplement at " + remoteSupplementCommit
+	if !strings.Contains(stdout, acquired) {
+		t.Errorf("the run acquired a second source without saying so, which is indistinguishable "+
+			"from a run that quietly dropped one: the report has no %q:\n%s", acquired, stdout)
+	}
+	if !strings.Contains(stdout, "named no second source") {
+		t.Errorf("the report does not say WHERE the second source came from, so an operator "+
+			"watching a machine acquire one it never asked about has nothing to check it "+
+			"against:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "had nothing published") {
+		t.Errorf("the report says this machine had nothing published, and it had a list: %q", stdout)
+	}
+}
+
+// The degraded note PROMISES something: re-run the pin once the second source is
+// reachable and "the run that succeeds publishes the union". That promise was false.
+//
+// After a degraded run the lock on disk names the dnsmasq primary and omits the
+// supplement, so the re-run is not a first install -- and a re-pin over a lock naming
+// no second source published the primary alone again, with no note, no warning and
+// exit 0. Following the advice the command itself printed reproduced the defect in
+// silence, which is the worst way for it to fail: the operator did exactly what they
+// were told and the list they ended up with is still short of seventy rules.
+//
+// This is the same defect as the case above, reached by the route an operator is most
+// likely to take, and it is here because a promise this file makes must be true. It is
+// also the check that the two halves are ONE fix: repairing the re-pin is what makes
+// the sentence deliverable, and there is no separate change to the wording.
+func TestTheDegradedNotePromisesARerunThatDeliversTheUnion(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		// The head answers and the archive does not, which is the shape a host that
+		// can reach one repository and not the other takes.
+		rules.RepositoryV2Fly: {head: remoteSupplementCommit},
+	})
+	pin := []string{
+		"--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock,
+	}
+
+	code, _, stderr := runCLI(t, origin.services(), pin...)
+	if code != exitSuccess {
+		t.Fatalf("the degraded install exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	// The promise itself, pinned. It passes before the change too -- the sentence is
+	// already there, and the finding is that it is not TRUE, so this assertion is a
+	// guard on the wording rather than evidence of the fix. It is here so that a later
+	// edit cannot quietly soften the claim while fixing the behaviour.
+	for _, want := range []string{
+		"mosdns-cdnctl update-lists --pin-remote HEAD",
+		"publishes the union",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the degraded note does not say %q:\n%s", want, stderr)
+		}
+	}
+
+	// The machine can now reach the second source, and the operator follows the note.
+	origin.setArchives(rules.RepositoryV2Fly, map[string][]byte{
+		remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+	})
+
+	code, _, stderr = runCLI(t, origin.services(), pin...)
+	if code != exitSuccess {
+		t.Fatalf("the re-run the note recommends exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Supplement == nil {
+		t.Fatalf("the re-run the degraded note recommends published the %s primary alone: %+v. "+
+			"Following the note on screen left the machine on exactly the list it was already "+
+			"short of, and said nothing while doing it",
+			lock.Primary.Repository, lock)
+	}
+	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
+		if !strings.Contains(string(list), want) {
+			t.Errorf("the published list has %d rules and no %q, which the dnsmasq source "+
+				"cannot express", countListRules(list), want)
+		}
+	}
+}
+
+// The DEGRADED note on the widened path is a different sentence, because the state
+// is. The first-install justification -- "this machine has no China list at all and a
+// whole list missing seventy rules is strictly better than none" -- is plainly false
+// of a machine with a hundred and eleven thousand rules on disk, and printing it
+// there would tell an operator holding a working list that it holds none.
+//
+// So this pins the widened wording, and specifically pins what it must NOT say. The
+// other half is the settled decision that a degraded run is still a successful one:
+// exit 0, the primary published, and the gap named. This command's contract already
+// contains "published, degraded, loudly, exit 0" -- publishFallback writes an
+// 8,363-rule list in place of 111,357 and returns exitSuccess -- so an exit 3 here
+// would report "nothing was published" for a publication that happened.
+func TestADegradedRunOverALockThatNamesNoSecondSourceDoesNotClaimTheMachineIsEmpty(t *testing.T) {
+	paths := newListPaths(t)
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {head: remoteSupplementCommit},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("a degraded pin over a readable lock exited %d, want %d. A publication that "+
+			"happened must not be reported as one that did not (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Primary.Repository != rules.RepositoryChina || lock.Supplement != nil {
+		t.Fatalf("the degraded publication is %+v, want the %s primary and no supplement",
+			lock, rules.RepositoryChina)
+	}
+	if strings.Contains(stderr, "this machine has no China list at all") {
+		t.Errorf("the note told an operator with a list on disk that it has none: %s", stderr)
+	}
+	for _, want := range []string{rules.RepositoryV2Fly, "already named no second source"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the diagnostic does not say %q:\n%s", want, stderr)
+		}
+	}
+}
+
 // An explicit pin survives a later unqualified run. This is the one way the new default
 // could become a new defect: if the first-install default were consulted whenever the
 // repository is not named on the command line, a machine that deliberately pinned the
@@ -3388,6 +3631,20 @@ func leaveDisagreement(t *testing.T, paths listPaths, replaced string) {
 // that could not be resolved, one about one this machine never had -- so a loose
 // assertion here would now pass on the wrong note. The publication is asserted too:
 // the note is only worth writing if the thing it describes is what happened.
+//
+// The origin serves BOTH repositories, which is the point of this case. Serving only
+// the primary made it unable to see the decision it exists to pin down: a run that
+// wrongly decided to resolve a second source from a lock it could not parse would
+// fail to resolve it, print a different note, and publish the same pair with no
+// supplement -- passing here for exactly the wrong reason. With the second source
+// served, that run publishes a supplement, and the request assertion catches it
+// before the publication one has to.
+//
+// The request assertion is the primary evidence that the unreadable path keeps its
+// own behaviour: a v1 document has no supplement field, so one that does not parse
+// cannot describe a second source, and saying "this machine had none to carry" about
+// a document whose contents are unknown is a guess dressed as a reading. The
+// widened "nothing to carry" rule excludes it for that reason.
 func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 	paths := newListPaths(t)
 	publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
@@ -3396,6 +3653,12 @@ func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 			head: remoteCommit,
 			archives: map[string][]byte{
 				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:only.cn\n"),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
 			},
 		},
 	})
@@ -3411,6 +3674,12 @@ func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 		t.Errorf("the run published a lock naming no supplement without saying WHY, which is "+
 			"what a publication that silently dropped one looks like: %q", stderr)
 	}
+	// Not consulted at all. This is the assertion that would notice if the unreadable
+	// path stopped being excluded from the widened "nothing to carry" rule.
+	if asked := origin.archivePath(rules.RepositoryV2Fly, remoteSupplementCommit); origin.fetched(asked) {
+		t.Errorf("a lock this build cannot read was treated as one naming no second source, and "+
+			"the run went to %s for a supplement the document cannot possibly have described", asked)
+	}
 	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
 	if err != nil || !found {
 		t.Fatalf("published pair: %v found=%t", err, found)
@@ -3418,6 +3687,128 @@ func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 	if lock.Supplement != nil {
 		t.Errorf("the re-pin published %+v beside a lock it could not read, and the note above "+
 			"is only true if nothing was carried over", lock.Supplement)
+	}
+}
+
+// The v1 recovery path ENDS on a correct document. This is the follow-through on the
+// case above, and it is why that one may legitimately publish no supplement rather
+// than resolving one.
+//
+// A lock this build cannot read genuinely cannot describe a second source, so that
+// publication has to carry none -- but it used to carry none FOREVER. The re-pin left
+// a readable v2 lock naming the dnsmasq primary and no supplement, and every
+// subsequent re-pin read that lock, saw something published, carried nothing, and
+// published the primary alone again. An operator following the recovery path to its
+// end arrived back where they started, silently.
+//
+// The second run below is ordinary: no flag, no v1 lock, nothing unusual. It is the
+// second run of the recovery, and the point of the case is that it repairs the
+// document rather than reproducing it.
+func TestTheV1RecoveryPathEndsOnAPairWithBothSources(t *testing.T) {
+	paths := newListPaths(t)
+	publishV1Pair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryChina,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("the v1 recovery run exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+
+	// No flag this time: the lock the run above wrote now names the repository, and
+	// this is the plain `--pin-remote HEAD` an operator types from here on.
+	code, _, stderr = runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("the second run of the v1 recovery exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Supplement == nil {
+		t.Errorf("the recovery path ended where it started: %+v. The operator ran the command the "+
+			"refusal named, twice, and is still running a list missing every rule the dnsmasq "+
+			"syntax cannot express", lock)
+	}
+	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
+		if !strings.Contains(string(list), want) {
+			t.Errorf("the published list has %d rules and no %q, which the dnsmasq source "+
+				"cannot express", countListRules(list), want)
+		}
+	}
+}
+
+// A machine that DELIBERATELY moves to the fallback must not be handed a supplement,
+// and this is the case where the widened predicate could have surprised one.
+//
+// The state it starts from is the one this defect leaves behind -- a readable lock
+// naming the dnsmasq primary and no supplement -- which under the widened rule is a
+// machine with nothing to carry. If the rule were only "carry, or resolve", this
+// operator would be given a v2fly supplement beside a v2fly primary, and
+// rules.validatePinnedSource would refuse the pair: the run would exit 3 for an
+// operator who did nothing wrong.
+//
+// So the repository is the guard, and it is checked AFTER the run rather than before
+// it, because before the run the only evidence would be the absence of a fixture.
+func TestAMachineMovedToTheFallbackByHandTakesNoSupplement(t *testing.T) {
+	paths := newListPaths(t)
+	// The no-supplement dnsmasq machine, moved onto the fallback deliberately.
+	publishChinaPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: sourceArchive(t, remoteSupplementCommit, string(rulesOf(200))),
+			},
+		},
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--pin-source", rules.RepositoryV2Fly,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("moving a machine to the fallback on purpose exited %d, want %d (stderr: %s)",
+			code, exitSuccess, stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if lock.Primary.Repository != rules.RepositoryV2Fly {
+		t.Fatalf("the fallback was not published: %+v", lock)
+	}
+	if lock.Supplement != nil {
+		t.Errorf("a v2fly primary was published beside %+v. That source already carries every "+
+			"rule kind a supplement contributes, so the lock would be untrue about how the "+
+			"list was built -- and rules.validatePinnedSource refuses the pair, which is how "+
+			"this run would have exited 3 for an operator who did nothing wrong", lock.Supplement)
+	}
+	if strings.Contains(stderr, "supplement could not be resolved") {
+		t.Errorf("a machine that asked for the fallback was told its second source had failed: %s", stderr)
 	}
 }
 
