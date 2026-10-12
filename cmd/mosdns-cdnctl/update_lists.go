@@ -1242,7 +1242,7 @@ func publishFallback(ctx context.Context, options updateListOptions, stdout, std
 	writeReportLine(stdout, "china-list: this machine had no China list and the %s primary could not be "+
 		"reached, so the %s fallback was published at %s (%s). The next refresh migrates it to the "+
 		"primary once the origin is reachable.\n",
-		rules.RepositoryChina, rules.RepositoryV2Fly, published.Primary.Commit, ruleCount(countListRules(list)))
+		rules.RepositoryChina, rules.RepositoryV2Fly, published.Primary.Commit, ruleCount(countListRules(list, published.Supplement)))
 	return exitSuccess
 }
 
@@ -1765,7 +1765,7 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	writeReportLine(stdout, "pinned-commit: %s\n", pinned.Primary.Commit)
 	writeReportLine(stdout, "pinned-archive-sha256: %s\n", pinned.Primary.SHA256)
 	writeReportLine(stdout, "pinned-list-sha256: %s\n", pinned.ListSHA256)
-	writeReportLine(stdout, "pinned-rules: %d\n", countListRules(list))
+	writeReportLine(stdout, "pinned-rules: %d\n", countListRules(list, pinned.Supplement))
 	writeReportLine(stdout, "published-source-lock: %s\n", options.sourceLock)
 	writeReportLine(stdout, "archived-previous-source-lock: %s\n", options.previousLock)
 	writeReportLine(stdout, "published-list: %s\n", options.listFile)
@@ -1884,15 +1884,29 @@ func pinAge(now, taken time.Time) time.Duration {
 	return 0
 }
 
-// countListRules counts the expressions of a published list, which is the number
-// of rules a pin added to the router's China set.
-func countListRules(list []byte) int {
-	if len(list) == 0 {
-		return 0
-	}
-	lines := strings.Split(strings.TrimSuffix(string(list), "\n"), "\n")
-	return len(lines)
+// countListRules counts the rules a published list added to the router's China set.
+//
+// It delegates to sourceRuleCounts rather than counting lines, and that is the whole
+// difference: a rendered list is not all rules. renderList writes the dnsmasq
+// converter's disabled-upstream reasons as a comment block above them and a blank line
+// between, and a line count scores those as rules. On the shipped pair that is 6
+// comments and 1 separator -- so the figure printed was 110,558 for a list the lock
+// and the matcher both call 110,551, and every reader comparing the two had to work
+// out the seven.
+//
+// sourceRuleCounts is the function the guardrails measure with, so a report of how
+// many rules a publication added is the same number the refusal that withheld the
+// publication would have quoted. Two functions counting the same thing two ways is
+// how a report ends up contradicting the thing it is reporting about.
+func countListRules(list []byte, supplement *rules.SourceRef) int {
+	primary, second := sourceRuleCounts(list, supplement)
+	return primary + second
 }
+
+// sourceRuleCounts is what this delegates to, and its skip rule is the property that
+// matters here: it drops a line that is empty or begins with '#', which is what a
+// comment block and renderList's separator both are. The dependency is named because it
+// is the whole reason the two counts below can be compared at all.
 
 // writeReportLine appends one line of a report.
 func writeReportLine(output io.Writer, format string, args ...any) {

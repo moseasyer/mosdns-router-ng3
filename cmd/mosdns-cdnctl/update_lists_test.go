@@ -1029,6 +1029,90 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 	}
 }
 
+// `pinned-rules:` is how many rules the publication added to the router's China set,
+// and a rendered list is not all rules.
+//
+// The dnsmasq converter keeps upstream's record of the entries it turned off, written
+// as a comment block above the rules with a blank line between, so a list carrying
+// those is longer in LINES than it is in rules. Counting lines scored the six
+// disabled-upstream comments and the separator as rules: on the shipped pair the
+// report said 110,558 for a list that holds 110,551 and whose digest the lock names.
+// A reader comparing the two had to work out seven that were never rules, and the
+// guardrails -- which measure with sourceRuleCounts -- disagreed with the report about
+// the same file.
+func TestPinnedRulesCountsRulesRatherThanLines(t *testing.T) {
+	paths := newListPaths(t)
+	// Six disabled records upstream, rendered as the comment block plus its blank
+	// separator, and 200 real rules.
+	const disabled = 6
+	var domains bytes.Buffer
+	for index := 0; index < disabled; index++ {
+		fmt.Fprintf(&domains, "#server=/off%02d.cn/203.0.113.7 # Disabled: upstream reason %d\n", index, index)
+	}
+	for index := 0; index < 200; index++ {
+		fmt.Fprintf(&domains, "server=/host%05d.example.cn/203.0.113.7\n", index)
+	}
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				// Written out rather than built by chinaSourceArchive, which turns a
+				// MOSDNS list into dnsmasq lines and so cannot express the disabled
+				// records this case is about.
+				remoteCommit: sourceArchiveUnder(t, "dnsmasq-china-list-"+remoteCommit, map[string]string{
+					rules.ChinaConfEntries[0]: domains.String(),
+					rules.ChinaConfEntries[1]: "server=/google.cn/203.0.113.7\n",
+					rules.ChinaConfEntries[2]: "server=/apple.cn/203.0.113.7\n",
+				}),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteSupplementCommit,
+			archives: map[string][]byte{
+				remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
+			},
+		},
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+	list := paths.listContents()
+	lines := strings.Split(strings.TrimSuffix(string(list), "\n"), "\n")
+	// The fixture really does carry the shape this is about, or the assertion below
+	// is passing for the wrong reason.
+	comments, blanks := 0, 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
+			blanks++
+		case strings.HasPrefix(trimmed, "#"):
+			comments++
+		}
+	}
+	if comments != disabled || blanks != 1 {
+		t.Fatalf("the fixture rendered %d comments and %d blanks, want %d and 1: %q",
+			comments, blanks, disabled, list)
+	}
+	// 200 rules from the main table, one each from the other two entries, and the two
+	// the supplement contributes: 204 rules in 211 lines. The seven lines that are not
+	// rules are exactly the six disabled records and renderList's one separator, which
+	// is the number the line count used to add to the answer.
+	const wantRules = 204
+	if want := wantRules + comments + blanks; len(lines) != want {
+		t.Fatalf("the published list is %d lines, want %d rules + %d comments + %d blank",
+			len(lines), wantRules, comments, blanks)
+	}
+	if !strings.Contains(stdout, fmt.Sprintf("pinned-rules: %d\n", wantRules)) {
+		t.Errorf("the report does not say %d rules for a list of %d lines carrying %d comments "+
+			"and %d blank:\n%s", wantRules, len(lines), comments, blanks, stdout)
+	}
+}
+
 // An unqualified `--pin-remote HEAD` on an empty machine installs the PRIMARY.
 //
 // Before this change there was only one source, so that invocation was
@@ -1374,7 +1458,7 @@ func TestARepinOverALockThatNamesNoSecondSourcePublishesTheUnion(t *testing.T) {
 	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
 		if !strings.Contains(string(list), want) {
 			t.Errorf("the published list has %d rules and no %q, which the dnsmasq source "+
-				"cannot express", countListRules(list), want)
+				"cannot express", countListRules(list, lock.Supplement), want)
 		}
 	}
 }
@@ -1499,7 +1583,7 @@ func TestTheDegradedNotePromisesARerunThatDeliversTheUnion(t *testing.T) {
 	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
 		if !strings.Contains(string(list), want) {
 			t.Errorf("the published list has %d rules and no %q, which the dnsmasq source "+
-				"cannot express", countListRules(list), want)
+				"cannot express", countListRules(list, lock.Supplement), want)
 		}
 	}
 }
@@ -3138,7 +3222,7 @@ func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
 	}
 	if lock.Primary.Commit == collapsed {
 		t.Fatalf("published %s, which nothing measured: its list has 1 rule where %d were published",
-			collapsed, countListRules(published))
+			collapsed, countListRules(published, lock.Supplement))
 	}
 	if lock.Primary.Commit != measured {
 		t.Errorf("published %s, want the commit that was measured (%s)", lock.Primary.Commit, measured)
@@ -3996,7 +4080,7 @@ func TestTheV1RecoveryPathEndsOnAPairWithBothSources(t *testing.T) {
 	for _, want := range []string{"full:exact000.cn", "full:exact001.cn"} {
 		if !strings.Contains(string(list), want) {
 			t.Errorf("the published list has %d rules and no %q, which the dnsmasq source "+
-				"cannot express", countListRules(list), want)
+				"cannot express", countListRules(list, lock.Supplement), want)
 		}
 	}
 }
