@@ -275,19 +275,40 @@ func (r *refusals) count() int {
 // a second read can be made to finish first. It passes everything until it is
 // armed, and after being armed it holds exactly one read: the one the test wants
 // parked, leaving the reads that follow it to run.
+//
+// WHICH read it holds is chosen by the document that read saw, not by when it
+// arrived. `holdGeneration` of 0 means any read qualifies; any other value holds
+// only the read that saw that generation. A test that needs a specific reload
+// parked cannot otherwise ask for it, because the read it wants is identified by
+// the document it read and not by the moment it happened: a test that published
+// its replacement and only THEN armed the gate left a window in which the poller
+// could read the new document, find the gate open, and store it -- so the read
+// the gate went on to park was the next tick's, and the state under test had
+// already moved. That window is a few instructions wide and the poller only loses
+// it under load, which is what made it intermittent rather than constant.
 type reloadGate struct {
-	mu      sync.Mutex
-	armed   bool
-	held    bool
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
+	mu             sync.Mutex
+	armed          bool
+	held           bool
+	holdGeneration uint64
+	entered        chan struct{}
+	release        chan struct{}
+	once           sync.Once
 }
 
+// newReloadGate builds a gate that holds the next read it sees once armed.
 func newReloadGate() *reloadGate {
+	return newReloadGateHolding(0)
+}
+
+// newReloadGateHolding builds a gate that holds the first read that saw
+// generation `generation`, and passes every other read whether or not it is armed.
+// Arming such a gate says nothing about WHEN to park, only that parking is allowed.
+func newReloadGateHolding(generation uint64) *reloadGate {
 	return &reloadGate{
-		entered: make(chan struct{}, 8),
-		release: make(chan struct{}),
+		holdGeneration: generation,
+		entered:        make(chan struct{}, 8),
+		release:        make(chan struct{}),
 	}
 }
 
@@ -297,11 +318,14 @@ func (g *reloadGate) arm() {
 	g.armed = true
 }
 
-// pass holds the first read that reaches the gate after it is armed, and returns
-// immediately for every other one.
-func (g *reloadGate) pass(state.Selector) error {
+// pass holds the first read that reaches the gate after it is armed AND that saw
+// the generation this gate was built to hold, and returns immediately for every
+// other one. A gate built for a generation does not need arming to be certain of
+// which read it will take: the document it read is the fact that identifies it.
+func (g *reloadGate) pass(selector state.Selector) error {
 	g.mu.Lock()
-	hold := g.armed && !g.held
+	wanted := g.holdGeneration == 0 || selector.Generation == g.holdGeneration
+	hold := g.armed && wanted && !g.held
 	if hold {
 		g.held = true
 	}
@@ -1121,10 +1145,12 @@ func TestJSONWatcherCloseIsSafeFromSeveralGoroutines(t *testing.T) {
 // caller a watcher whose poll goroutine is still writing to it, and would let a
 // shutdown continue while a read of the state directory is still open.
 func TestJSONWatcherCloseWaitsForAReloadInFlight(t *testing.T) {
-	gate := newReloadGate()
+	// Armed first, and built to hold generation 2: see the comment below on why
+	// both of those are load-bearing.
+	replacement := publishedSelector(2, "203.0.113.8")
+	gate := newReloadGateHolding(replacement.Generation)
 	t.Cleanup(gate.open)
 	first := publishedSelector(1, "198.51.100.7")
-	replacement := publishedSelector(2, "203.0.113.8")
 	path := statePath(t, "selector.json")
 	replaceFile(t, path, documentBytes(t, first))
 
@@ -1133,12 +1159,26 @@ func TestJSONWatcherCloseWaitsForAReloadInFlight(t *testing.T) {
 		t.Fatalf("NewJSON(%s): %v", path, err)
 	}
 
-	// The replacement is published before the gate is armed, so the reload the
-	// gate parks is one that has already read the NEW document in hand. Parking a
-	// reload that read the constructor's document would store a value the watcher
-	// was already serving, and the assertion below could not fail.
-	replaceFile(t, path, documentBytes(t, replacement))
+	// Armed BEFORE the replacement is published, and built to hold generation 2.
+	// Order matters and generation does too, and both are load-bearing:
+	//
+	// Published first, armed second (what this did before) left a window in which
+	// the poller could read the NEW document, find the gate still open, and store
+	// it. The gate would then park the NEXT tick's read instead, and the assertion
+	// below would fail having observed nothing about Close at all -- the state it
+	// checks had already moved before the gate did anything. The window is a few
+	// instructions wide, so the test passed almost always and failed under load,
+	// which is the worst shape a defect can have.
+	//
+	// Armed first, gate holding generation 2: every poll tick before the
+	// replacement is published reads generation 1 and passes straight through, and
+	// the first tick that reads generation 2 is the one that parks. Whichever order
+	// the scheduler picks, the parked read is the one holding the NEW document, and
+	// parking a read of the constructor's document -- which would store a value the
+	// watcher was already serving and make the assertion below unable to fail --
+	// is impossible rather than merely unlikely.
 	gate.arm()
+	replaceFile(t, path, documentBytes(t, replacement))
 	waitFor(t, "a reload to reach the caller's check holding the new document", func() bool {
 		select {
 		case <-gate.entered:
