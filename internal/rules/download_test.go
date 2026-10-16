@@ -567,10 +567,15 @@ func TestDownloadRefusesALockThatIsNotFullyPinned(t *testing.T) {
 				l.Primary.Entries = []string{V2FlyEntry}
 			},
 		},
-		// The dnsmasq source is three named files, so both shapes a lock can
-		// carry are wrong on it: an entry it does not use, and entries it left
-		// out. The pin is the fixed set, so a lock that names a fourth file is
-		// refused too rather than converted as if it had been reviewed.
+		// The dnsmasq source names the base file plus whichever optional files
+		// the policy turns on, so an entry it does not use is still wrong on it.
+		// A lock that leaves an optional file out is NOT wrong -- that is a
+		// subset, and reviewedChinaConfSubset accepts it -- but a lock naming a
+		// fourth file this build has never converted is refused rather than
+		// converted as if it had been reviewed. Which rule each of those falls
+		// to is proved in TestAnEntrySetIsAnyReviewedSubsetThatKeepsTheBase,
+		// which pins them against the predicate itself; the cases here pin only
+		// that Download refuses the lock BEFORE fetching anything.
 		{
 			name: "dnsmasq source naming a single entry",
 			base: validChina,
@@ -1711,4 +1716,48 @@ func (zeroReader) Read(p []byte) (int, error) {
 		p[i] = 0
 	}
 	return len(p), nil
+}
+
+func TestAnEntrySetIsAnyReviewedSubsetThatKeepsTheBase(t *testing.T) {
+	// 一个除 entries 外处处合法的锁，然后只改 entries。Validate() 是公开入口，
+	// 既有测试也是走它，所以这里不走包内的 validateRef——那会绕过锁其余部分的
+	// 校验，测到的东西比看起来少。
+	valid := func(entries []string) SourceLock {
+		return SourceLock{
+			SchemaVersion: 2,
+			Primary: SourceRef{
+				Repository: RepositoryChina,
+				Commit:     strings.Repeat("a", 40),
+				SHA256:     strings.Repeat("b", 64),
+				Entries:    entries,
+			},
+			ListSHA256: strings.Repeat("c", 64),
+		}
+	}
+	if err := valid(ChinaConfEntries).Validate(); err != nil {
+		t.Fatalf("the whole reviewed set is not valid: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		entries []string
+		wantErr bool
+	}{
+		{"base plus google", []string{ChinaConfBaseEntry, "google.china.conf"}, false},
+		{"base alone", []string{ChinaConfBaseEntry}, false},
+		{"order does not matter", []string{"google.china.conf", ChinaConfBaseEntry}, false},
+		{"without the base", []string{"google.china.conf"}, true},
+		{"empty", nil, true},
+		{"a fourth upstream file", append(append([]string(nil), ChinaConfEntries...), "bogus-nxdomain.china.conf"), true},
+		{"the base named twice", []string{ChinaConfBaseEntry, ChinaConfBaseEntry}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := valid(tc.entries).Validate()
+			if tc.wantErr && err == nil {
+				t.Fatalf("entries %v were accepted", tc.entries)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("entries %v were refused: %v", tc.entries, err)
+			}
+		})
+	}
 }

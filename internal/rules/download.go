@@ -360,17 +360,21 @@ func (l SourceLock) validateRef(ref *SourceRef) error {
 	switch ref.Repository {
 	case RepositoryChina:
 		if len(ref.Entries) == 0 {
-			return errors.New("entries is empty: the dnsmasq source is three named files")
+			// Checked here rather than left to reviewedChinaConfSubset, so the
+			// refusal says what is wrong instead of only that the set is not a
+			// subset. No entry set this build produces is empty -- the base file
+			// is in all of them -- so an empty one is a malformed document.
+			return errors.New("entries is empty: the dnsmasq source names the base file and whichever optional files are on")
 		}
 		if ref.Entry != "" {
 			return errors.New("entry and entries are both set on the dnsmasq source, which uses entries")
 		}
-		// The three files are the reviewed set rather than a hint. Upstream adds
-		// files -- `bogus-nxdomain.china.conf` among them -- and a lock naming a
-		// fourth would have this build convert a list no review ever covered,
-		// under a lock that claims it was reviewed.
-		if !sameEntries(ref.Entries, ChinaConfEntries) {
-			return fmt.Errorf("entries %v are not the reviewed set %v", ref.Entries, ChinaConfEntries)
+		// The named files are the reviewed set rather than a hint, and a subset
+		// of it rather than the whole of it -- see reviewedChinaConfSubset for
+		// why a subset is allowed and a fourth file is not.
+		if !reviewedChinaConfSubset(ref.Entries) {
+			return fmt.Errorf("entries %v are not a subset of the reviewed set %v that includes %q",
+				ref.Entries, ChinaConfEntries, ChinaConfBaseEntry)
 		}
 	case RepositoryV2Fly:
 		if ref.Entry != V2FlyEntry {
@@ -383,23 +387,38 @@ func (l SourceLock) validateRef(ref *SourceRef) error {
 	return nil
 }
 
-// sameEntries reports whether a ref names exactly the reviewed files, in any
-// order. Order carries no meaning -- the converter merges the three results
-// into one list -- but a file that is not in the reviewed set is a refusal
-// rather than a reordering.
-func sameEntries(named, reviewed []string) bool {
-	if len(named) != len(reviewed) {
+// reviewedChinaConfSubset reports whether a lock names a set of dnsmasq source
+// files this build is willing to convert: every one of them reviewed, the base
+// file among them, and none named twice.
+//
+// A SUBSET rather than the whole reviewed set, because an operator may have
+// turned an entry off; the lock then records what was actually converted, which
+// is what lets list_sha256 mean anything. Still not "any hint": upstream adds
+// files -- `bogus-nxdomain.china.conf` among them -- and a lock naming one this
+// build has never converted would be a list no review ever covered, under a lock
+// claiming it was reviewed.
+//
+// The base file is required because it is 99.75% of the list. Its absence is not
+// "the operator chose not to include a file", it is "this machine will send
+// almost every domestic name abroad", and a lock is not the place to say that
+// quietly.
+//
+// No repeats, because the converter merges each named file and a file named
+// twice contributes its rules twice -- a lock that reads as a set but is a bag.
+func reviewedChinaConfSubset(named []string) bool {
+	if len(named) == 0 || !slices.Contains(named, ChinaConfBaseEntry) {
 		return false
 	}
-	counts := make(map[string]int, len(named))
-	for _, entry := range named {
-		counts[entry]++
+	reviewed := make(map[string]bool, len(ChinaConfEntries))
+	for _, entry := range ChinaConfEntries {
+		reviewed[entry] = true
 	}
-	for _, entry := range reviewed {
-		counts[entry]--
-		if counts[entry] < 0 {
+	seen := make(map[string]bool, len(named))
+	for _, entry := range named {
+		if !reviewed[entry] || seen[entry] {
 			return false
 		}
+		seen[entry] = true
 	}
 	return true
 }

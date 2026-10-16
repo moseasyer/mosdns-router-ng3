@@ -3,6 +3,7 @@ package rules
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -201,8 +202,11 @@ func TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom(t *testing.T
 		t.Fatalf("the committed list is pinned to %q, and the primary source is %q",
 			lock.Primary.Repository, RepositoryChina)
 	}
-	if len(lock.Primary.Entries) != 3 {
-		t.Fatalf("the primary names %d entries, want the three the pin covers", len(lock.Primary.Entries))
+	// 断言"包含 base",不是"恰好三个":默认是三个,但操作员关掉一个开关之后这本
+	// 仓库的默认快照依然是三个,而一份真实的锁可以是两个或一个。断言长度会把
+	// 这个特性锁死成"永远三个"。
+	if !slices.Contains(lock.Primary.Entries, ChinaConfBaseEntry) {
+		t.Fatalf("the committed primary names %v, which does not include %q", lock.Primary.Entries, ChinaConfBaseEntry)
 	}
 }
 

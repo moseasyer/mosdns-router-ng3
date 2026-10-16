@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -489,5 +490,68 @@ func TestAnEntryThatResolvesToNoRuleIsAFailure(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "empty China set") {
 		t.Fatalf("the failure blames the whole set rather than this entry: %v", err)
+	}
+}
+
+func TestTheEntrySetIsTheBasePlusWhicheverOptionalEntriesAreOn(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		google, apple bool
+		want          []string
+	}{
+		{"both on", true, true, []string{ChinaConfBaseEntry, "apple.china.conf", "google.china.conf"}},
+		{"google off", false, true, []string{ChinaConfBaseEntry, "apple.china.conf"}},
+		{"apple off", true, false, []string{ChinaConfBaseEntry, "google.china.conf"}},
+		{"both off", false, false, []string{ChinaConfBaseEntry}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ChinaConfEntriesFor(tc.google, tc.apple)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ChinaConfEntriesFor(%t, %t) = %v, want %v", tc.google, tc.apple, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNoChoiceEverDropsTheBaseEntry(t *testing.T) {
+	// 那个文件是列表的 99.75%。任何组合把它拿掉，都是"关闭几乎全部国内分流"
+	// 而不是"选一类域名"。
+	for _, google := range []bool{true, false} {
+		for _, apple := range []bool{true, false} {
+			if !slices.Contains(ChinaConfEntriesFor(google, apple), ChinaConfBaseEntry) {
+				t.Fatalf("google=%t apple=%t dropped %q", google, apple, ChinaConfBaseEntry)
+			}
+		}
+	}
+}
+
+func TestWhateverTheSwitchesSayIsASetTheValidatorAccepts(t *testing.T) {
+	// 两份记录同一个事实：ChinaConfOptionalEntries 决定能被选中什么，
+	// ChinaConfEntries（经 reviewedChinaConfSubset）决定什么被审核过。上面每一个
+	// 测试都只测两半中的一半，所以这两个列表不同步时它们全部照样通过。
+	//
+	// 不同步的故障形态是：某个 entry 进了可选表却没进被审核集合，于是
+	// ChinaConfEntriesFor(true, true)——两个开关都开，也就是**默认的那台机器**——
+	// 产出一个校验器拒绝的集合。那台机器发不出任何列表，而没有任何东西说得出为什么，
+	// 因为 policy 里两个开关写的都是默认的"开"。
+	for _, google := range []bool{true, false} {
+		for _, apple := range []bool{true, false} {
+			entries := ChinaConfEntriesFor(google, apple)
+			if !reviewedChinaConfSubset(entries) {
+				t.Fatalf("google=%t apple=%t produced %v, which the validator refuses; "+
+					"ChinaConfOptionalEntries and ChinaConfEntries have drifted apart",
+					google, apple, entries)
+			}
+		}
+	}
+}
+
+func TestTheBaseEntryIsNotOneOfTheOptionalEntries(t *testing.T) {
+	// 那个文件是列表的 99.75%。把它放进可选表，操作员就能关掉几乎全部国内
+	// 分流——而上面每一个测试仍然会通过，因为它们只问集合里有没有它。
+	for _, optional := range ChinaConfOptionalEntries {
+		if optional.Entry == ChinaConfBaseEntry {
+			t.Fatalf("%q is optional, so an operator can turn off 99.75%% of the list", ChinaConfBaseEntry)
+		}
 	}
 }
