@@ -11,6 +11,13 @@ import (
 
 const validPolicyYAML = `schema_version: 1
 schedule: "03:30"
+lists:
+  china:
+    automatic: false
+    google: true
+    apple: true
+  cloudflare:
+    automatic: false
 foreign:
   default_provider: Quad9 Secure DNSCrypt v2
   ecs: false
@@ -65,10 +72,21 @@ foreign_cache:
 `
 
 func TestDefaultsMatchApprovedSpec(t *testing.T) {
+	// The entry switches are *bool, and reflect.DeepEqual compares what a pointer
+	// points at, so these two variables are the approved values written out rather
+	// than enabledByDefault() referenced -- for the same reason the ECH sources
+	// below are spelled out: this test IS the assertion that Defaults() still says
+	// what was approved, and `Google: enabledByDefault()` would pass for any
+	// default anyone liked.
+	googleOn, appleOn := true, true
 	got := Defaults()
 	want := Policy{
 		SchemaVersion: 1,
 		Schedule:      "03:30",
+		Lists: ListsPolicy{
+			China:      ChinaListPolicy{Automatic: false, Google: &googleOn, Apple: &appleOn},
+			Cloudflare: CloudflareListPolicy{Automatic: false},
+		},
 		Foreign: ForeignPolicy{
 			DefaultProvider: "Quad9 Secure DNSCrypt v2",
 			ECS:             false,
@@ -473,6 +491,148 @@ func TestAPolicyWithoutTheListsGroupLoads(t *testing.T) {
 	if policy.Lists.China.Automatic || policy.Lists.Cloudflare.Automatic {
 		t.Errorf("a policy with no lists: group decoded to %+v, and zero must mean both off",
 			policy.Lists)
+	}
+	// The one field in that group whose zero value is NOT the shipped default. An
+	// absent lists: group is how an operator's pre-upgrade policy looks, so if
+	// absent meant off here, the upgrade would drop google and apple out of every
+	// list on every machine that never touched its policy.
+	if !policy.Lists.China.GoogleEnabled() || !policy.Lists.China.AppleEnabled() {
+		t.Errorf("a policy with no lists: group decoded to %+v, and an absent entry switch means on",
+			policy.Lists.China)
+	}
+}
+
+// The two lines the generator writes for lists.china's entry switches, and the
+// section they sit in. Written out rather than assembled, so a case built from
+// text the generator no longer produces fails loudly instead of quietly testing a
+// document this project would never ship.
+const (
+	entrySwitchLines = "    google: true\n    apple: true\n"
+	chinaListLines   = "  china:\n    automatic: false\n" + entrySwitchLines
+)
+
+// shippedPolicy is the document an operator is handed: what Marshal writes from
+// Defaults(). The entry-switch cases below are this document with part of
+// lists.china cut or rewritten, because that is the only two shapes an upgrade
+// leaves behind -- the file the operator already had, which predates the switches.
+func shippedPolicy(t *testing.T) string {
+	t.Helper()
+	encoded, err := Marshal(Defaults())
+	if err != nil {
+		t.Fatalf("marshal the defaults: %v", err)
+	}
+	return string(encoded)
+}
+
+// rewriteShippedPolicy is shippedPolicy with `from` replaced by `to`. The
+// Contains guard is the point: without it a generator that stopped emitting the
+// lines would make every case below pass while testing a document that does not
+// exist.
+func rewriteShippedPolicy(t *testing.T, from, to string) string {
+	t.Helper()
+	document := shippedPolicy(t)
+	if !strings.Contains(document, from) {
+		t.Fatalf("the shipped policy does not contain %q:\n%s", from, document)
+	}
+	return strings.Replace(document, from, to, 1)
+}
+
+// An entry switch is on until an operator turns it off, so the field has to carry
+// three states -- written true, written false, not written -- and only a *bool can.
+// The third is what decides the meaning of the other two: it is what every policy
+// written before these fields existed decodes to, and the only reading of it that
+// does not change those machines' routing is "on".
+func TestAnEntrySwitchThisProjectShippedIsOnUntilAnOperatorTurnsItOff(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  string
+		want bool
+		// written records that the document spells the switch out, so the case can
+		// refuse to pass on the absent-means-on path alone.
+		written bool
+	}{
+		{"omitted entirely", rewriteShippedPolicy(t, entrySwitchLines, ""), true, false},
+		{"lists.china gone entirely", rewriteShippedPolicy(t, chinaListLines, ""), true, false},
+		{"written true", shippedPolicy(t), true, true},
+		{"written false", rewriteShippedPolicy(t, "    google: true\n", "    google: false\n"), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeYAML(t, tc.doc)
+			got, err := Load(path)
+			if err != nil {
+				t.Fatalf("this policy has to load for the switch to mean anything: %v\n%s", err, tc.doc)
+			}
+			if got.Lists.China.GoogleEnabled() != tc.want {
+				t.Fatalf("google = %t, want %t", got.Lists.China.GoogleEnabled(), tc.want)
+			}
+			if !got.Lists.China.AppleEnabled() {
+				t.Fatalf("apple was written true or omitted, so it is on, but it read as off")
+			}
+			if tc.written && got.Lists.China.Google == nil {
+				t.Fatalf("the document spells the switch out and it decoded to absent, so this case " +
+					"proved nothing except that absent means on")
+			}
+		})
+	}
+}
+
+// "false" in quotes parses as a string. Decoding it to true or to false are both
+// wrong: whoever wrote it believes they turned the switch off, and a machine that
+// read it as true keeps routing a file they excluded, while one that read it as
+// false has guessed at a boolean nobody typed.
+func TestAnEntrySwitchThatIsNotABooleanIsRefused(t *testing.T) {
+	path := writeYAML(t, rewriteShippedPolicy(t, "    google: true\n", "    google: \"false\"\n"))
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal(`a switch written as the string "false" loaded, and a switch that is not a boolean is not a choice`)
+	}
+}
+
+// The failure a misspelling creates, and the reason the loader stays strict about
+// unknown keys rather than making room for the new fields: an operator who writes
+// `googel: false` has asked for something this project does not have, and shrug
+// at it would leave them believing google is out of the list while it is in it.
+func TestAMisspelledEntrySwitchIsRefusedRatherThanIgnored(t *testing.T) {
+	path := writeYAML(t, rewriteShippedPolicy(t, entrySwitchLines, "    googel: true\n"))
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("lists.china.googel loaded, so a switch whose name is wrong would silently mean on")
+	}
+}
+
+// Defaults() hands out two switches and each one is a *bool, so the question of
+// whether they alias is not a style question: a helper that returned the address
+// of a package-level variable would have every Policy in the process -- the one
+// Load built, the one Defaults built, the one a test is holding -- pointing at
+// the same bool. Turning one operator's google off would turn it off everywhere,
+// and the damage would show up in a list split nobody changed.
+//
+// reflect.DeepEqual, which the approved-defaults test above uses, cannot catch
+// this: it follows the pointers and compares what they point at, so two policies
+// sharing one bool and two policies each holding their own both compare equal.
+// Writing through the pointer is the only way to tell them apart, so this does.
+func TestEachDefaultPolicyGetsItsOwnSwitchRatherThanSharingOne(t *testing.T) {
+	first, second := Defaults(), Defaults()
+
+	if first.Lists.China.Google == nil || second.Lists.China.Google == nil {
+		t.Fatalf("the shipped defaults left a switch absent: %+v and %+v", first.Lists.China, second.Lists.China)
+	}
+	if first.Lists.China.Google == second.Lists.China.Google {
+		t.Fatal("two Defaults() calls returned the same *bool for google, so every policy in this " +
+			"process shares one switch and turning it off in one turns it off in all of them")
+	}
+
+	*first.Lists.China.Google = false
+	if !second.Lists.China.GoogleEnabled() {
+		t.Fatal("turning google off in one default policy turned it off in an unrelated one, so the " +
+			"two switches are the same bool")
+	}
+	if first.Lists.China.GoogleEnabled() {
+		t.Fatal("the switch this policy owns still reports on after being written false through its " +
+			"own pointer, so GoogleEnabled is not reading the field it claims to")
+	}
+	if first.Lists.China.Apple == second.Lists.China.Apple {
+		t.Fatal("two Defaults() calls returned the same *bool for apple")
 	}
 }
 

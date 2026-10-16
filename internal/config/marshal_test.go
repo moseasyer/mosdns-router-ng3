@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"regexp"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // committedPolicyPath is the policy this project ships. It is generated from
@@ -135,6 +137,41 @@ func TestOnlyQuad9sResolversAreInThePublishedSet(t *testing.T) {
 
 // ipv4Address finds every dotted-quad in a generated document.
 var ipv4Address = regexp.MustCompile(`[0-9]{1,3}(\.[0-9]{1,3}){3}`)
+
+// TestTheShippedPolicySaysWhichEntrySwitchesAreOn reads the generated document
+// back and asks what it says about the entry switches. The byte-for-byte
+// comparison above already catches a hand edit; what it cannot catch is WHY the
+// file is wrong, because a switch that ships off is a default this code chose and
+// the comparison happily accepts.
+//
+// Both switches are named explicitly in the shipped document. Omitting them would
+// be shorter and would decode identically -- absent means on -- but it would leave
+// an operator's first look at the file unable to tell "this project includes
+// google" from "this project has never heard of google", which are different
+// statements about the same list.
+func TestTheShippedPolicySaysWhichEntrySwitchesAreOn(t *testing.T) {
+	encoded, err := Marshal(Defaults())
+	if err != nil {
+		t.Fatalf("Marshal(Defaults()): %v", err)
+	}
+	var decoded struct {
+		Lists struct {
+			China struct {
+				Google *bool `yaml:"google"`
+				Apple  *bool `yaml:"apple"`
+			} `yaml:"china"`
+		} `yaml:"lists"`
+	}
+	if err := yaml.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("the marshalled policy does not parse: %v", err)
+	}
+	if decoded.Lists.China.Google == nil || !*decoded.Lists.China.Google {
+		t.Fatal("the shipped policy does not say google is on, so a fresh install does not get it")
+	}
+	if decoded.Lists.China.Apple == nil || !*decoded.Lists.China.Apple {
+		t.Fatal("the shipped policy does not say apple is on, so a fresh install does not get it")
+	}
+}
 
 // updateCommitted rewrites a committed file from the code that produces it, so
 // the bytes in the repository are never hand-edited. Set MOSDNS_ROUTER_UPDATE=1
