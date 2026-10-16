@@ -63,10 +63,23 @@ type ListsPolicy struct {
 // the default and would apply silently to every machine whose policy predates these
 // fields. nil means on, which is also what an operator's existing policy has to
 // keep meaning after an upgrade.
+//
+// The omitempty is what keeps that promise honest in the other direction. Without
+// it a nil switch encodes as `google: null`, and null decodes back to nil, so the
+// field ends up with two spellings of "on" -- a key that is absent and a key that
+// says null -- of which only the first is what this file promises. Both would
+// behave identically, which is why the duplication is invisible until someone
+// reads the encoder and asks what it writes.
+//
+// omitempty skips a pointer for being nil and never for what it points at, so a
+// switch an operator explicitly turned off still encodes as `google: false`. That
+// asymmetry is the point rather than an accident: an absent switch is a default
+// being applied, and a false one is a decision somebody made, and only the second
+// of those is worth writing down.
 type ChinaListPolicy struct {
 	Automatic bool  `yaml:"automatic"`
-	Google    *bool `yaml:"google"`
-	Apple     *bool `yaml:"apple"`
+	Google    *bool `yaml:"google,omitempty"`
+	Apple     *bool `yaml:"apple,omitempty"`
 }
 
 // GoogleEnabled reports whether google.china.conf is converted into the list.
