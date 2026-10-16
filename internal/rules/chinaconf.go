@@ -49,8 +49,13 @@ type ChinaConfOptionalEntry struct {
 // ChinaConfOptionalEntries 是可选项,按 policy 字段名索引。
 //
 // 顺序与 ChinaConfEntries 一致,所以两个开关都开时 ChinaConfEntriesFor(true,
-// true) 与被审核集合逐项相同。转换器把每个文件的结果合并之后排序,所以顺序不
-// 进入任何产物;这里保持一致,是为了让"全部打开 = 已发布快照"这句话读得出来。
+// true) 与被审核集合逐项相同。这里保持一致,是为了让"全部打开 = 已发布快照"这句话
+// 读得出来。
+//
+// 只到"转换成功后的产物与顺序无关"为止,而不是"顺序不进入任何产物":转换器把每个
+// 文件的结果合并之后排序(:257-258),所以发布的字节确实与顺序无关;但顺序仍然进入
+// 锁里序列化的 entries 数组,也进入失败路径——不可读的文件按给定顺序拼接(:161),
+// 而没有解析出规则的文件在第一个就中止(:240-241),所以两个坏文件时消息随顺序变。
 var ChinaConfOptionalEntries = []ChinaConfOptionalEntry{
 	{Field: "apple", Entry: "apple.china.conf"},
 	{Field: "google", Entry: "google.china.conf"},

@@ -202,11 +202,32 @@ func TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom(t *testing.T
 		t.Fatalf("the committed list is pinned to %q, and the primary source is %q",
 			lock.Primary.Repository, RepositoryChina)
 	}
-	// 断言"包含 base",不是"恰好三个":默认是三个,但操作员关掉一个开关之后这本
-	// 仓库的默认快照依然是三个,而一份真实的锁可以是两个或一个。断言长度会把
-	// 这个特性锁死成"永远三个"。
+	// 一般锁的规则:含 base 即可。操作员关掉一个开关之后,一份真实的锁可以只
+	// 命名两个 entry,而上面那条 Contains 对它同样成立。
 	if !slices.Contains(lock.Primary.Entries, ChinaConfBaseEntry) {
 		t.Fatalf("the committed primary names %v, which does not include %q", lock.Primary.Entries, ChinaConfBaseEntry)
+	}
+	// 而这份**已提交**快照是相反的情况:默认全开,所以它必须命名全部三个。
+	// 这一条没有别的测试覆盖——committed_test.go 下面的合成锁从 ChinaConfEntries
+	// 派生,cmd/mosdns-cdnctl 那几处也都从代码派生,而 source-lock.json 自己
+	// 只被比对了仓库名与 sha256。上面那条 Contains 证明不了这份快照是全开的,
+	// 而 google 只占 0.10%,不触发 0.95 的防塌缩护栏:所以将来某个 task 重新
+	// 生成锁与列表、顺手关掉 google,整个套件照样全绿——两个文件会互相印证
+	// 彼此的 list_sha256。
+	//
+	// 比的是**集合**,不是顺序:这份快照把 google 排在 apple 之前,而
+	// ChinaConfEntries 是 apple 在前。顺序进的是锁里序列化的 entries 数组,
+	// 不进任何产物,所以把这条比较钉成顺序敏感,断言的是本仓库从未做过、也
+	// 不打算做的事:改了顺序就得重新 pin,而不改任何一个字节。
+	committed := append([]string(nil), lock.Primary.Entries...)
+	slices.Sort(committed)
+	reviewed := append([]string(nil), ChinaConfEntries...)
+	slices.Sort(reviewed)
+	if !slices.Equal(committed, reviewed) {
+		t.Fatalf("the committed primary names %v, want the whole reviewed set %v; "+
+			"the committed snapshot is generated with every switch on, so a re-pin "+
+			"that turned one off is not the snapshot this repository reviewed",
+			lock.Primary.Entries, ChinaConfEntries)
 	}
 }
 

@@ -546,6 +546,25 @@ func TestWhateverTheSwitchesSayIsASetTheValidatorAccepts(t *testing.T) {
 	}
 }
 
+func TestEveryOptionalEntryIsReachableFromASwitch(t *testing.T) {
+	// ChinaConfOptionalEntries 用 policy 字段名索引，而 ChinaConfEntriesFor 用一张
+	// 硬编码的 map 查开关。两者之间没有编译期的联系，所以 Field 拼错的一行永远
+	// 不会被任何组合选中。这一条把“两个开关都开 = 被审核集合”钉住。
+	//
+	// 它和上面那张表问的不是同一件事：那张表自己硬编码期望值，测的是
+	// switch→entry 的映射；这条测的是 switch→被审核集合。所以一个进了
+	// ChinaConfEntries 却没有任何开关能选中的 entry，在那张表和
+	// TestWhateverTheSwitchesSayIsASetTheValidatorAccepts 里都是绿的——两边比的都是
+	// 真正被选中的那几个，也就是旧集合的一个子集。（Field 拼错的那一半反而已经被
+	// 那张表抓住：期望值里写着 google.china.conf，所以它缺席就红。这一条抓的是另一
+	// 半，即反向的不同步。）
+	if !slices.Equal(ChinaConfEntriesFor(true, true), ChinaConfEntries) {
+		t.Fatalf("both switches on produced %v, which is not the reviewed set %v; "+
+			"an optional entry is misspelled, unreachable, or out of order",
+			ChinaConfEntriesFor(true, true), ChinaConfEntries)
+	}
+}
+
 func TestTheBaseEntryIsNotOneOfTheOptionalEntries(t *testing.T) {
 	// 那个文件是列表的 99.75%。把它放进可选表，操作员就能关掉几乎全部国内
 	// 分流——而上面每一个测试仍然会通过，因为它们只问集合里有没有它。
