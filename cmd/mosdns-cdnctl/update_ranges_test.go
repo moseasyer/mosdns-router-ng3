@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"mosdns-router/internal/candidate"
+	"mosdns-router/internal/config"
 	"mosdns-router/internal/filelock"
 	"mosdns-router/internal/optimizer"
 )
@@ -210,6 +211,13 @@ func (o *rangeOrigin) services(github *http.Client) services {
 		// itself is the thing under test; a fixture that needs neither should not
 		// have to think about it.
 		now: time.Now,
+		// The policy reader is the REAL one rather than a fixture's, because the
+		// cases that run `--automatic` here hand the command a policy file they
+		// wrote and expect it to be read: this fixture replaces the network, not the
+		// configuration. `--automatic` also reads the same file for which of the
+		// primary source's files it converts, so leaving this nil would make those
+		// cases crash rather than measure.
+		loadPolicy: config.Load,
 		// The two boundaries the emergency-rollback verb uses are the real ones
 		// here, because this fixture replaces the network and the filesystem and
 		// says nothing about who the caller is or what running the installer

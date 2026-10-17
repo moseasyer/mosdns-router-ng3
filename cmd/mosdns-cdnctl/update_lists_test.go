@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -522,6 +523,25 @@ func (o *fakeOrigin) services() services {
 	return services
 }
 
+// pinServices is what a hand-run `--pin-remote` is given, and it differs from
+// services in one field.
+//
+// A pin now reads the policy to know which of the primary source's files to convert,
+// so it cannot be run without one it can read -- the same way `--automatic` always
+// could not. Without this injection every pin case would read the HOST's
+// /etc/mosdns/policy.yaml: it would pass on a developer machine that has one, fail
+// on a machine that does not, and change meaning with whatever that file happens to
+// say. A case is about the repository, the supplement or the archive ordering, not
+// about the switches, so the answer for all of them is config.Defaults(): no switch
+// named, every entry converted, which is exactly what each of them was written
+// against. A case that IS about the switches sets its own policy -- see
+// TestAPinPublishesOnlyTheEntriesTheOperatorLeftOn.
+func (o *fakeOrigin) pinServices() services {
+	services := o.services()
+	services.loadPolicy = func(string) (config.Policy, error) { return config.Defaults(), nil }
+	return services
+}
+
 // snapshot records the directory so a test can prove a command wrote nothing.
 func snapshot(t *testing.T, dir string) map[string][]byte {
 	t.Helper()
@@ -985,7 +1005,7 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 	archive := sourceArchive(t, remoteCommit, firstInstallArchive)
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: archive})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1074,7 +1094,7 @@ func TestPinnedRulesCountsRulesRatherThanLines(t *testing.T) {
 		},
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1156,7 +1176,7 @@ func TestAnUnqualifiedFirstInstallPublishesThePrimary(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1209,7 +1229,7 @@ func TestTheFallbackIsStillReachableByNameOnAnEmptyMachine(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
@@ -1267,7 +1287,7 @@ func TestAFirstInstallPublishesTheUnionAndNotThePrimaryAlone(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1325,7 +1345,7 @@ func TestAFirstInstallSaysItAcquiredTheSecondSource(t *testing.T) {
 		},
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1366,7 +1386,7 @@ func TestAFirstInstallThatCannotReachTheSecondSourceStillPublishesAndSaysWhy(t *
 		rules.RepositoryV2Fly: {head: remoteSupplementCommit},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1437,7 +1457,7 @@ func TestARepinOverALockThatNamesNoSecondSourcePublishesTheUnion(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1490,7 +1510,7 @@ func TestARepinOverALockThatNamesNoSecondSourceSaysWhereTheSecondSourceCameFrom(
 		},
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1544,7 +1564,7 @@ func TestTheDegradedNotePromisesARerunThatDeliversTheUnion(t *testing.T) {
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock,
 	}
 
-	code, _, stderr := runCLI(t, origin.services(), pin...)
+	code, _, stderr := runCLI(t, origin.pinServices(), pin...)
 	if code != exitSuccess {
 		t.Fatalf("the degraded install exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
@@ -1566,7 +1586,7 @@ func TestTheDegradedNotePromisesARerunThatDeliversTheUnion(t *testing.T) {
 		remoteSupplementCommit: supplementArchive(t, remoteSupplementCommit, 2),
 	})
 
-	code, _, stderr = runCLI(t, origin.services(), pin...)
+	code, _, stderr = runCLI(t, origin.pinServices(), pin...)
 	if code != exitSuccess {
 		t.Fatalf("the re-run the note recommends exited %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
@@ -1613,7 +1633,7 @@ func TestADegradedRunOverALockThatNamesNoSecondSourceDoesNotClaimTheMachineIsEmp
 		rules.RepositoryV2Fly: {head: remoteSupplementCommit},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1673,7 +1693,7 @@ func TestADeliberateV2FlyPinSurvivesALaterUnqualifiedPin(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -1711,7 +1731,7 @@ func TestUpdateListsPinRemoteReplacesAnInstalledPair(t *testing.T) {
 	archive := sourceArchive(t, remoteCommit, firstInstallArchive)
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: archive})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
@@ -1809,7 +1829,7 @@ func TestUpdateListsPinRemoteKeepsTheInstalledPairOnEveryFailure(t *testing.T) {
 			test.arrange(t, paths, origin)
 			before := snapshotWithout(t, paths.dir, filepath.Base(paths.controlLock))
 
-			code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+			code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 				"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 			if code == exitSuccess {
 				t.Fatalf("pin reported success although it could not publish:\n%s", stdout)
@@ -1894,7 +1914,7 @@ func TestPinRemotePublishesTheNamedCommitRatherThanTheRemoteHead(t *testing.T) {
 	// The source is named: this case is about pinning a NAMED COMMIT rather than
 	// whatever HEAD says now, and leaving it to the first-install default would make
 	// it a test of the default as well.
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", lockedCommit,
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", lockedCommit,
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", filepath.Join(paths.dir, "previous.json"))
@@ -1954,7 +1974,7 @@ func TestPublishingArchivesThePinThatWasCurrent(t *testing.T) {
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", previous)
 	if code != exitSuccess {
@@ -2014,7 +2034,7 @@ func TestAFailedPublishLeavesThePinAndTheArchiveIntact(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(listDir, 0o755) })
 
 	previous := paths.previousLock
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", previous)
 	if code == exitSuccess {
@@ -2066,7 +2086,7 @@ func TestAFailedArchiveRefusesRatherThanPublishing(t *testing.T) {
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", previous)
 	if code == exitSuccess {
@@ -2095,7 +2115,7 @@ func TestUpdateListsPinRemoteReportsAPublicationFailureInsteadOfSuccess(t *testi
 
 	// The source is named: this case is about the refusal a failed PUBLICATION
 	// produces, and the repository the source came from is not part of it.
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitStateUnavailable {
@@ -2131,7 +2151,7 @@ func TestUpdateListsPinRemoteFailsWithExitFourWhileTheControlLockIsHeld(t *testi
 	before := snapshot(t, paths.dir)
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive)})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitLockHeld {
 		t.Fatalf("pin under a held lock exit = %d, want %d (stderr: %s)", code, exitLockHeld, stderr)
@@ -2162,7 +2182,7 @@ func TestUpdateListsTakesTheControlLockOnlyAfterTheSourceIsVerified(t *testing.T
 
 	// The source is named: this case is about WHEN the control lock is taken relative
 	// to the conversion, not about which repository the conversion came from.
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code == exitLockHeld {
@@ -2274,7 +2294,7 @@ func TestAMachineOnAV1LockCanFollowTheRefusalItIsGiven(t *testing.T) {
 		},
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -2337,7 +2357,7 @@ func TestPinSourceOverAHealthyPairLeavesAnArchiveThisBuildCanReadBack(t *testing
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -2411,7 +2431,7 @@ func TestPinSourceOverAHandEditedListIsRefused(t *testing.T) {
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code == exitSuccess {
@@ -2453,7 +2473,7 @@ func TestPinSourceOverAV1LockStillPublishesWhereAParsingPairIsRefused(t *testing
 		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
 			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 		})
-		code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+		code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
 			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 		if code != exitSuccess {
@@ -2469,7 +2489,7 @@ func TestPinSourceOverAV1LockStillPublishesWhereAParsingPairIsRefused(t *testing
 		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
 			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 		})
-		code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
+		code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--pin-source", rules.RepositoryV2Fly,
 			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 		if code == exitSuccess {
@@ -2514,7 +2534,7 @@ func TestForcePublishesOverTheStateACrashBetweenRenamesLeaves(t *testing.T) {
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--force",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -2540,7 +2560,7 @@ func TestTheRefusalNamesTheCommandThatRecoversFromIt(t *testing.T) {
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code == exitSuccess {
@@ -2618,7 +2638,7 @@ func TestForceAnswersOnlyTheDisagreement(t *testing.T) {
 		origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
 			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 		})
-		code, _, _ := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+		code, _, _ := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--force",
 			"--pin-source", rules.RepositoryV2Fly,
 			"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 			"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
@@ -2638,7 +2658,7 @@ func TestForceOnAPairThatAgreesIsHarmless(t *testing.T) {
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--force",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -2714,7 +2734,7 @@ func TestARefusalToDefaultTheRepositoryNamesTheFlagThatWouldHaveWorked(t *testin
 		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code == exitSuccess {
@@ -2746,7 +2766,7 @@ func TestAPinTakesTheRepositoryFromThePublishedLockWhenNothingNamesIt(t *testing
 		rules.RepositoryV2Fly: {head: remoteCommit},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -3772,7 +3792,7 @@ func TestAMeasuredRepositoryCannotBeRedirectedByAPinSource(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	code := runPinRemote(context.Background(), options, &stdout, &stderr, origin.services())
+	code := runPinRemote(context.Background(), options, &stdout, &stderr, origin.pinServices())
 	if code != exitSuccess {
 		t.Fatalf("the measured pin exited %d (stdout: %s, stderr: %s)", code, stdout.String(), stderr.String())
 	}
@@ -3818,7 +3838,7 @@ func TestAPinKeepsTheSupplementThePublishedListAlreadyCarries(t *testing.T) {
 	origin := newFakeOriginSources(t, sources)
 	publishChinaPairFromOrigin(t, paths, sources[rules.RepositoryChina], sources[rules.RepositoryV2Fly], published)
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -3902,7 +3922,7 @@ func TestAForcedPinOverAPairThatDisagreesKeepsTheSupplementTheLockNames(t *testi
 	// exists to publish over.
 	leaveDisagreement(t, paths, "domain:halfwritten.cn\n")
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD", "--force",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD", "--force",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -3993,7 +4013,7 @@ func TestAPinOverALockItCannotReadSaysThatNoSupplementIsCarried(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryChina,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
@@ -4052,7 +4072,7 @@ func TestTheV1RecoveryPathEndsOnAPairWithBothSources(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryChina,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
@@ -4062,7 +4082,7 @@ func TestTheV1RecoveryPathEndsOnAPairWithBothSources(t *testing.T) {
 
 	// No flag this time: the lock the run above wrote now names the repository, and
 	// this is the plain `--pin-remote HEAD` an operator types from here on.
-	code, _, stderr = runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr = runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -4116,7 +4136,7 @@ func TestAMachineMovedToTheFallbackByHandTakesNoSupplement(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
@@ -4173,7 +4193,7 @@ func TestTheFallbackRefusalOverASupplementNamesHowToGetPastIt(t *testing.T) {
 		},
 	})
 
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, _, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--pin-source", rules.RepositoryV2Fly,
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
@@ -4220,7 +4240,7 @@ func TestAnInstallThatCannotConvertTheSupplementSaysSoAndNamesWhatToRollBackTo(t
 		},
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	code, stdout, stderr := runCLI(t, origin.pinServices(), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitStateUnavailable {
@@ -4563,4 +4583,285 @@ func snapshotTree(t *testing.T, dir string) map[string][]byte {
 		t.Fatal(err)
 	}
 	return state
+}
+
+// A pin publishes only the entries the operator left on, and the lock says which.
+//
+// The switch is CONTENT and the pin is neither content nor time: what changes is
+// which files of the primary source's archive become rules, so a pin on a machine
+// that turned google off has to record that in `entries` rather than convert all
+// three and let the operator wonder why the list still carries the names they
+// switched off.
+//
+// It is a manual pin here rather than an unattended refresh because this is the
+// path that read no policy at all until now, and a switch that only the timer
+// honours is one an operator who pins by hand believes they have turned off.
+func TestAPinPublishesOnlyTheEntriesTheOperatorLeftOn(t *testing.T) {
+	paths := newListPaths(t)
+	policy := config.Defaults()
+	off := false
+	policy.Lists.China.Google = &off
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:kept.cn\n"),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+			},
+		},
+	})
+	services := origin.services()
+	services.loadPolicy = func(string) (config.Policy, error) { return policy, nil }
+
+	code, stdout, stderr := runCLI(t, services, "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--pin-remote exit = %d (stdout: %s, stderr: %s)", code, stdout, stderr)
+	}
+
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if slices.Contains(lock.Primary.Entries, "google.china.conf") {
+		t.Fatalf("google is off but the lock records it: %v", lock.Primary.Entries)
+	}
+	if !slices.Contains(lock.Primary.Entries, rules.ChinaConfBaseEntry) {
+		t.Fatalf("the base entry went missing: %v", lock.Primary.Entries)
+	}
+	if !strings.Contains(string(list), "kept.cn") {
+		t.Fatalf("the list does not carry what the remaining entries contributed: %q", list)
+	}
+	// The switch is a switch on the LIST, not only on the lock: google.china.conf is
+	// the only file of the archive that carries google.cn, so a lock that dropped the
+	// entry while the list kept the rule would be a machine still routing those names
+	// domestically after the operator said otherwise.
+	if strings.Contains(string(list), "google.cn") {
+		t.Fatalf("google is off but the published list still carries its names: %q", list)
+	}
+	if !strings.Contains(string(list), "apple.cn") {
+		t.Fatalf("apple is on, so the list must still carry what it contributed: %q", list)
+	}
+}
+
+// A machine that cannot read which entries it wants is not one to guess on.
+//
+// The guess is the whole danger: an entry set read as "all of them" publishes a
+// list that is quietly missing nothing at all, and an entry set read as "none of
+// them" publishes one missing a category of domestic names -- every one of which
+// quietly takes the foreign branch, with no exit code, no stderr line and nothing
+// in the report to notice it. So `--pin-remote`, which used to read no policy at
+// all, now refuses when it cannot.
+//
+// The cost is that a machine with a broken policy.yaml cannot pin by hand, and it
+// is paid deliberately: a broken policy makes `--automatic` and the schedule
+// untrustworthy too, so a pin that succeeds there would be a false reassurance.
+func TestAMachineThatCannotReadItsPolicyCannotPinEither(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {head: remoteCommit, archives: map[string][]byte{
+			remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:a.cn\n")}},
+	})
+	services := origin.services()
+	services.loadPolicy = func(string) (config.Policy, error) {
+		return config.Policy{}, errors.New("policy.yaml: line 11: found a tab")
+	}
+
+	code, _, stderr := runCLI(t, services, "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitInvalidCLI {
+		t.Fatalf("exit = %d, want %d: a machine that cannot read which entries it wants is not "+
+			"one to guess on (stderr: %s)", code, exitInvalidCLI, stderr)
+	}
+	if !strings.Contains(stderr, "policy") {
+		t.Fatalf("the refusal does not name what it could not read: %s", stderr)
+	}
+}
+
+// The unattended path honours the switches too, and reads the policy once.
+//
+// `--automatic` reads the policy for two different questions -- when to refresh and
+// which files to convert -- and those two answers have to come from ONE reading.
+// A second read is not merely wasteful: the file could change between them, and the
+// run would then have decided to refresh under one policy and converted under
+// another, which is precisely the disagreement a single file exists to prevent.
+// Counting the reads is what makes the property real rather than intended.
+//
+// The switch assertions are the same ones the pin case makes, deliberately: the
+// mode that refreshes and the mode an operator runs by hand publish through
+// different code, and a switch honoured by only one of them is a switch the
+// operator turned off and did not get.
+func TestAnUnattendedRefreshConvertsOnlyTheEntriesTheOperatorLeftOn(t *testing.T) {
+	paths := newListPaths(t)
+	publishChinaPairWithSupplement(t, paths, lockedCommit, lockedSupplementCommit, rulesOf(200))
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: supplementArchive(t, remoteCommit, 2),
+			},
+		},
+	})
+	off := false
+	policy := config.Defaults()
+	policy.Lists.China.Automatic = true
+	policy.Lists.China.Google = &off
+	reads := 0
+	services := origin.services()
+	services.loadPolicy = func(string) (config.Policy, error) {
+		reads++
+		return policy, nil
+	}
+
+	code, stdout, stderr := runCLI(t, services, "--automatic",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exit = %d (stdout: %s, stderr: %s)", code, stdout, stderr)
+	}
+	if reads != 1 {
+		t.Errorf("the policy was read %d times in one unattended run, want exactly 1: the same "+
+			"file says when to refresh and which files to convert, and two readings could be two "+
+			"different policies", reads)
+	}
+
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if slices.Contains(lock.Primary.Entries, "google.china.conf") {
+		t.Fatalf("google is off but the unattended lock records it: %v", lock.Primary.Entries)
+	}
+	if !slices.Contains(lock.Primary.Entries, rules.ChinaConfBaseEntry) {
+		t.Fatalf("the base entry went missing: %v", lock.Primary.Entries)
+	}
+	if strings.Contains(string(list), "google.cn") {
+		t.Fatalf("google is off but the unattended publication still carries its names: %q", list)
+	}
+	if !strings.Contains(string(list), "apple.cn") {
+		t.Fatalf("apple is on, so the unattended publication must still carry what it contributed: %q", list)
+	}
+	if !strings.Contains(string(list), "domain:host00000.example.cn") {
+		t.Fatalf("the unattended publication lost the base file's own contribution: %q", list)
+	}
+}
+
+// chinaEntriesFrom may remove an entry the operator switched off. It may not remove
+// one they left on, and the difference has to be a refusal rather than a shorter
+// list, because a shorter list is the one failure nothing downstream reports.
+//
+// Nothing reaches this from a command today: every resolution of the dnsmasq source
+// names the whole reviewed set, and the policy's set is a subset of it by
+// construction. This test therefore pins the invariant against a future change that
+// breaks it rather than against a defect that exists now -- which is still worth
+// doing, because the alternative is an assertion that reads "cannot happen" and
+// costs nothing to write and everything to be wrong about.
+// Turning a switch off has to take effect even when upstream has not moved.
+//
+// The unattended refresh used to answer "already at" on the strength of the two
+// COMMITS alone, which is the right question for a drifted source and the wrong
+// one for a reconfigured machine: the operator changed a switch in a file the run
+// reads every night, and nothing about the two commits says so. Upstream commits
+// rarely, so the switch would appear to do nothing for weeks while the run reported
+// `up-to-date: true` and did no work -- the quietest possible way for a conversion
+// parameter to be ignored.
+//
+// So the entry set is part of what "already at" means. This is the same predicate
+// the check reports on, and it is here rather than there because this is the half
+// that ACTS: a check that says a machine is out of date while the refresh declines
+// to move it is a report and a fix that disagree.
+func TestAnUnattendedRefreshConvertsAfterTheOperatorTurnsAnEntryOff(t *testing.T) {
+	paths := newListPaths(t)
+	origin := newFakeOriginSources(t, map[string]fakeSource{
+		rules.RepositoryChina: {
+			// Already where this machine is published: nothing upstream has moved.
+			head: remoteCommit,
+			archives: map[string][]byte{
+				remoteCommit: chinaSourceArchive(t, remoteCommit, string(rulesOf(200))),
+			},
+		},
+		rules.RepositoryV2Fly: {
+			head: lockedSupplementCommit,
+			archives: map[string][]byte{
+				lockedSupplementCommit: supplementArchive(t, lockedSupplementCommit, 2),
+			},
+		},
+	})
+	// Published with google ON, at the very commit upstream still points at.
+	//
+	// Two hundred base rules, because the collapse guardrail measures the incoming
+	// primary against what this machine published and the shape that matters is the
+	// real one: the base file is 110,205 of 110,481 published rules, so switching a
+	// whole entry off is a 0.25% move and the guardrail never sees it. A three-rule
+	// list would make the switch-off a 33% shrink and the guardrail would refuse it
+	// as an upstream collapse -- a shape this project does not publish, so a fixture
+	// that used it would be testing arithmetic rather than the run.
+	publishChinaPairWithSupplement(t, paths, remoteCommit, lockedSupplementCommit,
+		append(append([]byte("domain:apple.cn\ndomain:google.cn\n"), rulesOf(200)...), supplementRules(2)...))
+
+	off := false
+	policy := config.Defaults()
+	policy.Lists.China.Automatic = true
+	policy.Lists.China.Google = &off
+	services := origin.services()
+	services.loadPolicy = func(string) (config.Policy, error) { return policy, nil }
+
+	code, stdout, stderr := runCLI(t, services, "--automatic",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exit = %d (stdout: %s, stderr: %s)", code, stdout, stderr)
+	}
+	if strings.Contains(stdout, "already at") {
+		t.Fatalf("the run did nothing although the entry set changed:\n%s", stdout)
+	}
+
+	lock, list, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: %v found=%t", err, found)
+	}
+	if slices.Contains(lock.Primary.Entries, "google.china.conf") {
+		t.Fatalf("google is off but the lock still records it: %v", lock.Primary.Entries)
+	}
+	if strings.Contains(string(list), "google.cn") {
+		t.Fatalf("google is off but the published list still carries its names: %q", list)
+	}
+	if !strings.Contains(string(list), "apple.cn") {
+		t.Fatalf("apple is on, so the publication must still carry what it contributed: %q", list)
+	}
+}
+
+func TestChinaEntriesFromRefusesToDropAnEntryThePolicyNamed(t *testing.T) {
+	resolved := rules.ChinaConfEntries
+	wanted := []string{rules.ChinaConfBaseEntry, "google.china.conf"}
+
+	got, err := chinaEntriesFrom(resolved, wanted)
+	if err != nil {
+		t.Fatalf("narrowing %v to %v refused: %v", resolved, wanted, err)
+	}
+	if !slices.Equal(got, wanted) {
+		t.Fatalf("narrowing %v to %v gave %v, want %v", resolved, wanted, got, wanted)
+	}
+
+	// The base entry alone is enough to make a refusal, because its absence is the
+	// failure this change exists to prevent: 99.75%% of the list, gone in silence.
+	if _, err := chinaEntriesFrom([]string{"google.china.conf"}, wanted); err == nil {
+		t.Fatal("a resolution carrying none of what the policy names was trimmed instead of refused")
+	}
+	if _, err := chinaEntriesFrom([]string{rules.ChinaConfBaseEntry, "apple.china.conf"}, wanted); err == nil {
+		t.Fatal("a resolution missing one file the policy names was trimmed instead of refused")
+	}
 }

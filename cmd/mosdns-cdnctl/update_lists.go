@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -238,12 +239,32 @@ type updateListOptions struct {
 	// two differ in what they may do -- one writes and one does not -- and a flag that
 	// changed that would be a flag whose name understated it.
 	automatic bool
-	// policy is where --automatic reads what to refresh. It defaults to the installed
-	// policy, which is the file the rest of this package renders from, so a scheduled
-	// run and a hand-run render cannot disagree about what the machine is configured
-	// to do.
+	// policy is where the mode reads what the operator configured: --automatic reads
+	// when to refresh, and both publishing paths read which of the dnsmasq source's
+	// files become domestic names. It defaults to the installed policy, which is the
+	// file the rest of this package renders from, so a scheduled run and a hand-run
+	// render cannot disagree about what the machine is configured to do.
 	policy    string
 	pinRemote string
+	// chinaEntries is the set of the dnsmasq source's files this machine converts.
+	//
+	// It travels on the options rather than as a parameter of its own because TWO
+	// readers below need it and the first of them hands its options to the second:
+	// refreshChinaList narrows what it resolved and then passes the same struct to
+	// runPinRemote, so the set crosses that call in an argument both already take
+	// rather than a third parameter on both signatures.
+	//
+	// A nil here means "no path has read the policy", and only runPinRemote turns
+	// that into a read. It is a usable sentinel because ChinaConfEntriesFor always
+	// returns at least the base entry, so a set that HAS been read is never nil --
+	// which chinaEntriesFrom then treats as a refusal rather than an empty
+	// conversion, so a caller that forgets to read the policy stops the run instead
+	// of publishing a lock that names no files at all.
+	//
+	// runAutomaticLists sets it, and that is what makes a scheduled run read
+	// policy.yaml exactly once: the same file says how often to refresh and which
+	// files to convert, and two readings could be two different policies.
+	chinaEntries []string
 	// pinSource is the repository the operator named with --pin-source. It is the
 	// one way to pin without reading the published lock, and therefore the way out
 	// of a published lock this build refuses: a schema version 1 document, whose
@@ -322,7 +343,11 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	// without is actually on disk, and the man page inherits this string rather
 	// than a second copy of it.
 	automatic := flags.Bool("automatic", false, "act on the policy's lists.china.automatic and lists.cloudflare.automatic: always report drift, and then refresh what the policy says to refresh, which by default is nothing at all. The mode a scheduled run uses")
-	policy := flags.String("policy", defaultPolicyPath, "path to the policy YAML file, read by --automatic to decide what to refresh")
+	// The --policy description names both modes that read the file, because one of
+	// them used not to. It says which files of the dnsmasq source become domestic
+	// names rather than "the settings", so an operator who turns a switch off can see
+	// from `--help` which path is the one that has to be able to read it.
+	policy := flags.String("policy", defaultPolicyPath, "path to the policy YAML file, read by --automatic to decide what to refresh and by --pin-remote to decide which files of the dnsmasq source become domestic names")
 	check := flags.Bool("check", false, "report whether the pinned sources have changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. A published list is built from two repositories, so the report names both and the verdict covers both: `up-to-date: false` when either has moved on. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
 	pinSource := flags.String("pin-source", "", "name the reviewed repository to pin from. Without it the repository is the one this machine published, or -- on a machine with nothing published -- the reviewed primary `"+rules.RepositoryChina+"`; `"+rules.RepositoryV2Fly+"` is the fallback and is how you ask for it by name on a machine that has nothing installed. On a machine whose lock already names a supplement it is refused: that source cannot travel beside a `"+rules.RepositoryV2Fly+"` primary, which already carries every rule kind a supplement contributes. With the flag the pin does not read the published lock at all, which is the way out of a published lock this build refuses -- a schema version 1 document, whose own refusal names this flag")
@@ -799,16 +824,105 @@ func ruleCount(count int) string {
 	return fmt.Sprintf("%d rules", count)
 }
 
+// chinaEntriesFromPolicy reads the entry set this machine wants, from the policy the
+// command already reads for its schedule.
+//
+// A switch is CONTENT -- which of the primary source's files become domestic names
+// -- and `automatic` is TIME. Reading both from one file is what keeps them
+// orthogonal: a machine refreshing nightly and a machine that has turned google off
+// do the same work, and the second simply publishes a list without it. There is
+// therefore nothing to arbitrate between a flag and a policy, because a switch is
+// not a policy that can lose an argument -- it is a conversion parameter, and every
+// path that produces a list converts by it.
+//
+// A policy that cannot be read is a refusal rather than a default. Guessing here
+// publishes a list that is quietly missing a category of domestic names, and
+// nothing about that is visible to the operator afterwards: the pin exits 0, the
+// list converts, and the only symptom is that some domestic domains take the
+// foreign branch.
+func chinaEntriesFromPolicy(services services, options updateListOptions) ([]string, error) {
+	policy, err := services.loadPolicy(options.policy)
+	if err != nil {
+		return nil, fmt.Errorf("update-lists: the policy at %s could not be read, so which entries to "+
+			"convert is unknown, and guessing would publish a list that is quietly missing a "+
+			"category of domestic names: %w", options.policy, err)
+	}
+	return rules.ChinaConfEntriesFor(policy.Lists.China.GoogleEnabled(), policy.Lists.China.AppleEnabled()), nil
+}
+
+// chinaEntriesFrom narrows a resolved entry set to the ones this machine converts.
+//
+// Narrowing, never widening: a set the policy does not name is not something this
+// machine converts, so the operator's switches can only remove. The order of what
+// survives is the RESOLVED order, not the wanted order, so with every switch on the
+// result is the reviewed set byte for byte and the lock this command writes is the
+// document it wrote before.
+//
+// The other direction is a refusal rather than a shorter list, and that is the whole
+// asymmetry. Removing an entry the operator switched off is the feature; removing
+// one they left on is this exact command's stated worst outcome -- a publication
+// that is quietly missing a category of domestic names, exit 0, nothing in the
+// report -- and a shorter list is the one failure nothing downstream reports: the
+// base file is 99.75%% of the list, so a set that lost it converts, publishes and
+// ships. So a name the policy asked for that the resolution does not carry stops
+// the run rather than being trimmed away.
+//
+// Nothing can produce one today: a resolution of the dnsmasq source names the whole
+// reviewed set (rules.entriesFor) and the policy's set is a subset of it by
+// construction (rules.ChinaConfEntriesFor). The check is here because that is an
+// arrangement between two packages rather than a type the compiler checks, and the
+// cost of being wrong is a list that routes almost every domestic name abroad.
+func chinaEntriesFrom(resolved, wanted []string) ([]string, error) {
+	keep := make(map[string]bool, len(wanted))
+	for _, entry := range wanted {
+		keep[entry] = true
+	}
+	var missing []string
+	for _, entry := range wanted {
+		if !slices.Contains(resolved, entry) {
+			missing = append(missing, entry)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("the policy names %v as the files to convert, and the entry set this run "+
+			"resolved to (%v) does not carry them, so publishing would drop a category of domestic "+
+			"names with nothing in the exit code to notice it", missing, resolved)
+	}
+	kept := make([]string, 0, len(wanted))
+	for _, entry := range resolved {
+		if keep[entry] {
+			kept = append(kept, entry)
+		}
+	}
+	return kept, nil
+}
+
 func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	// Loaded before anything is fetched, and refused before anything is written. The
-	// policy is what says whether to refresh, so a run that could not read it has no
-	// business resolving a commit -- and a policy that does not parse is an operator
-	// typo, not a condition to refresh anyway with the old settings.
-	policy, err := config.Load(options.policy)
+	// policy is what says whether to refresh and which of the primary source's files
+	// become rules, so a run that could not read it has no business resolving a commit
+	// -- and a policy that does not parse is an operator typo, not a condition to
+	// refresh anyway with the old settings.
+	//
+	// Read through services rather than through config.Load directly, which is what
+	// production does anyway and what every other reader of a policy here does. More
+	// to the point it is what makes ONE read enough: the entry set is put on the
+	// options below and carried to the pin this refresh ends in, so an unattended run
+	// and a hand-run pin cannot disagree because one of them read the file twice and
+	// the file changed in between.
+	policy, err := services.loadPolicy(options.policy)
 	if err != nil {
 		writeCLIError(stderr, "update-lists --automatic: %v", err)
 		return exitInvalidCLI
 	}
+	// Turning the refresh off does not turn the switches off: `automatic` is TIME and
+	// these are CONTENT, so a machine that refreshes nightly and a machine that turned
+	// google off do the same work and the second publishes a list without it. The set
+	// is computed whether or not anything is refreshed, because the report below has
+	// to describe the machine the operator configured rather than the one the switch
+	// happened to leave switched.
+	options.chinaEntries = rules.ChinaConfEntriesFor(
+		policy.Lists.China.GoogleEnabled(), policy.Lists.China.AppleEnabled())
 
 	// A machine with no China list at all is the one state the report below cannot
 	// describe: the check refuses a machine that has nothing to compare against, and
@@ -934,6 +1048,24 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
+	// The archive is the same whatever entries are converted; what the operator's
+	// switches change is which files of it become rules. Narrowing here -- after the
+	// digest was computed over the whole archive -- is what keeps the lock's sha256 an
+	// archive digest and its entries an honest record of the conversion.
+	//
+	// Before the download below, so the guardrail measures the list that would
+	// actually be published: a run that converted three files and published two would
+	// be sized against a list no machine would ever run.
+	//
+	// It cannot reach a v2fly primary -- `destination` is the dnsmasq repository on
+	// every run, and a v2fly publication is the fallback, which names one entry rather
+	// than a set -- so there is nothing here to narrow away.
+	entries, err := chinaEntriesFrom(resolved.Primary.Entries, options.chinaEntries)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	resolved.Primary.Entries = entries
 	// The supplement is resolved against ITS OWN repository and its own HEAD, for
 	// the same reason the primary is resolved against the destination rather than
 	// the lock's: a document cannot be looked up in a repository it does not live
@@ -945,7 +1077,24 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 			len(rules.SupplementKinds()), err)
 		return exitStateUnavailable
 	}
-	// "Already at" means BOTH sources are where this machine left them.
+	// "Already at" means BOTH sources are where this machine left them, AND the
+	// published pair was built from the entry set this run would convert.
+	//
+	// The entry set is the third clause because the first two answer a different
+	// question than the one an operator asked. Both commits standing still means
+	// upstream has not moved; it says nothing about the machine's own
+	// configuration, which is the other half of what a daily refresh exists to
+	// reconcile. A policy edit changes no commit id, so a predicate built only on
+	// them reports "already at" on a machine whose operator just turned google off
+	// -- and upstream commits rarely, so that switch would take weeks to show up
+	// while every nightly run said it had nothing to do.
+	//
+	// The comparison is on the NARROWED set above, so it asks exactly the right
+	// question: does what is published match what the operator's switches now ask
+	// for. A lock that records the same files in a different order also differs
+	// here, which republishes once and then settles -- the bytes are identical, so
+	// the re-publication is a repair of the document rather than a change to the
+	// list.
 	//
 	// `gaining` is what keeps this safe as well as honest. This build's refresh
 	// always resolves a supplement beside a dnsmasq primary, so `supplement` is
@@ -962,7 +1111,8 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	// on the short list for as long as the primary's own HEAD stays quiet.
 	if !migrating && !gaining && found &&
 		resolved.Primary.Commit == pinned.Primary.Commit &&
-		supplement.Commit == pinned.Supplement.Commit {
+		supplement.Commit == pinned.Supplement.Commit &&
+		slices.Equal(resolved.Primary.Entries, pinned.Primary.Entries) {
 		// Already there. Nothing to do and nothing to say beyond the fact, because
 		// re-downloading and re-publishing an identical commit is how a daily job
 		// turns a no-op into wear on the disk the machine is running from.
@@ -1499,6 +1649,26 @@ func writeDownloadRemedy(stderr io.Writer, options updateListOptions, err error)
 }
 
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	// Read before anything is resolved, downloaded or written, so a machine that
+	// cannot say which entries it converts has published nothing at all when it finds
+	// out. The unattended path has already read the policy and carries the set on the
+	// options; this is the hand-run path, and it is the reason the read cannot be
+	// optional.
+	//
+	// What the alternative would be is worth stating plainly, because it is the
+	// tempting one: fall back to the reviewed set when the policy cannot be read. A
+	// pin that guessed would exit 0, write a lock, and convert a list -- and an
+	// operator who had switched google off would get google's names back with no
+	// message anywhere. A refusal is the only answer that cannot be mistaken for a
+	// successful pin.
+	if options.chinaEntries == nil {
+		entries, err := chinaEntriesFromPolicy(services, options)
+		if err != nil {
+			writeCLIError(stderr, "%v", err)
+			return exitInvalidCLI
+		}
+		options.chinaEntries = entries
+	}
 	client := services.newHTTPClient()
 	// Which repository the commit is resolved against, in the order the three ways
 	// of naming one are trusted.
@@ -1617,6 +1787,23 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 			return exitStateUnavailable
 		}
 		resolved = pinnedRepository
+	}
+	// The same narrowing the refresh does, on whichever of the two ways above produced
+	// the lock: the measured fast path hands over a ref that was already narrowed, and
+	// this leaves it alone because narrowing a narrowed set is a fixed point, while
+	// the long way round hands over the reviewed set and this is what trims it.
+	//
+	// After the resolution rather than inside it, because the resolution's job is to
+	// say what upstream publishes -- which is the whole archive -- and the operator's
+	// switches say which files of it become rules. A v2fly primary is left as it is:
+	// it names one entry rather than a set, and the switches are not about it.
+	if resolved.Primary.Repository == rules.RepositoryChina {
+		entries, err := chinaEntriesFrom(resolved.Primary.Entries, options.chinaEntries)
+		if err != nil {
+			writeCLIError(stderr, "update-lists: %v", err)
+			return exitStateUnavailable
+		}
+		resolved.Primary.Entries = entries
 	}
 	// The supplement travels with the primary unless the caller measured a new one.
 	// An operator's pin re-pins the PRIMARY, and a publication that dropped the
