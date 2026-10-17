@@ -135,6 +135,37 @@ opening the cheap one opens the expensive one. Both are off in the shipped polic
 is curated by hand, so any upstream commit moves the split, and accepting one
 unattended is a routing change nobody reviewed.
 .br
+The primary is converted from three of its files, and two of them have a switch.
+.B lists.china.google
+selects
+.B google.china.conf
+(112 rules) and
+.B lists.china.apple
+selects
+.B apple.china.conf
+(165 rules); both are on in the shipped policy, and setting one to
+.B false
+takes that file's names out of the published list \em at the next pin or refresh,
+not at the next upstream commit, which may be weeks away. They are not the refresh
+switch:
+.B lists.china.automatic
+alone decides whether anything is updated, so a machine that turns one of them off
+keeps updating on exactly the schedule it had and simply publishes a shorter list.
+Every path that produces a list reads them, which is why
+.BR \-\-pin\-remote ,
+.B \-\-automatic
+and
+.B \-\-check
+all say which files they converted rather than only what they published.
+.br
+The third file,
+.BR accelerated\-domains.china.conf ,
+has no switch and cannot be turned off, because it is not a category of names: it
+is 110,205 of the 110,481 rules this machine publishes \em 99.75% \em and a list
+without it sends almost every domestic name down the foreign branch, quietly, with
+nothing anywhere reporting it. A published lock that does not name it is refused
+rather than trimmed.
+.br
 The China list is published from two sources \em the
 .I felixonmars/dnsmasq\-china\-list
 primary, and a
@@ -225,6 +256,37 @@ for the same reason it is printed at all: a machine with no route to the interne
 exactly the machine whose China\-list requests fail, and a timer that printed nothing
 there would never measure the snapshot below.
 .br
+The verdict also covers the entry set, because the published list is not only a pair
+of commits: it is a set of files, and that set is a decision the operator made in
+.BR policy.yaml .
+So the report carries
+.B desired\-entries:
+\(em what this machine's
+.B lists.china
+switches select now \em beside
+.BR published\-entries: ,
+which is what the lock beside it records, and
+.B up\-to\-date:
+is
+.B false
+when the two sets differ, exactly as it is when a commit has moved. Without that
+third clause the report calls a machine current whose list still carries a category
+it was just told to stop including, which is what
+.B \-\-automatic
+republishes over the following night. The two sets are compared as sets, not as
+sequences: the converter merges each named file and sorts the result, so a lock
+spelling the same files in another order \em as the pair this package ships does \em
+describes the same list, and a machine that has just upgraded is not drifted.
+Neither line is printed for a machine published from the
+.I v2fly/domain\-list\-community
+fallback, whose list is built from one entry of another repository and has no set
+for these switches to disagree with.
+.br
+Like the two publishing paths, the check reads
+.B /etc/mosdns/policy.yaml
+and refuses \em exit 2 \em when it cannot, naming the file, rather than guessing
+which entries this machine wants and reporting a verdict it made up.
+.br
 The report also carries the range snapshot this package ships: its two digests, the
 moment it was taken, how old it is, and whether the document published on this machine
 is still the one the snapshot holds. That is the only measurement of how stale the
@@ -245,6 +307,23 @@ an answer to that question. A branch, a tag, an abbreviated commit and
 .B HEAD~1
 are all refused at the command line rather than after a request \em the lock
 records a commit, and none of those is one.
+.br
+A pin reads
+.B /etc/mosdns/policy.yaml
+to learn which of the primary source's files become domestic names \em
+.BR lists.china.google ,
+.BR lists.china.apple ,
+both on by default \em and refuses when that file cannot be read, naming it, with
+exit status 2. It does not fall back to the reviewed set, and the reason is worth
+stating: a guess here is a silent verdict about this machine's DNS. Read as all
+three files, it hands back the names an operator asked to be rid of; read as none
+of them, it publishes a list missing a category of domestic names, every one of
+which quietly takes the foreign branch \em and the pin still exits 0 with nothing
+in its report to notice. A refusal is the only answer that cannot be mistaken for
+a successful pin. A broken policy also makes
+.B \-\-automatic
+and the daily timer untrustworthy, so a pin that succeeded there would be a false
+reassurance.
 .br
 Before publishing, the outgoing lock is archived to
 .I /var/lib/mosdns/lists/source-lock.previous.json

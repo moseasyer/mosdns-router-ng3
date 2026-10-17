@@ -154,6 +154,15 @@ type rangePaths struct {
 	// happens to have this package installed.
 	pinSnapshot string
 	pinLock     string
+	// policy is a policy file the command is given, with every switch off. It is
+	// here because the modes in this file share the update-lists boundary and
+	// `--check` reads the policy to say which entries the operator's switches
+	// select: left at the installed default, every check case below would read the
+	// HOST's /etc/mosdns/policy.yaml, which is a fixture whose answer depends on
+	// which machine runs the suite. The reader stays the real one -- this fixture
+	// replaces the network, not the configuration -- so what is under test is the
+	// command reading a policy file, not a stub returning one.
+	policy string
 }
 
 func newRangePaths(t *testing.T) rangePaths {
@@ -168,6 +177,7 @@ func newRangePaths(t *testing.T) rangePaths {
 		control:     filepath.Join(dir, "control.lock"),
 		pinSnapshot: filepath.Join(dir, "cloudflare-ranges.json"),
 		pinLock:     filepath.Join(dir, "cloudflare-ranges.lock.json"),
+		policy:      automaticPolicy(t, false, false),
 	}
 }
 
@@ -270,7 +280,11 @@ func runRangeRefresh(t *testing.T, boundary services, paths rangePaths) (int, st
 func runRangeCheck(t *testing.T, boundary services, paths rangePaths) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := runWith(append([]string{"update-lists", "--check"}, refreshArgs(paths)...),
+	// The policy is named HERE and not in refreshArgs, because a mode that takes
+	// its own --policy must be able to pass one: refreshArgs is shared, and the
+	// flag would come after and quietly win. `--check` needs it because it reports
+	// which entries the operator's switches select against the published list.
+	code := runWith(append([]string{"update-lists", "--check"}, append(refreshArgs(paths), "--policy", paths.policy)...),
 		&stdout, &stderr, boundary)
 	return code, stdout.String(), stderr.String()
 }

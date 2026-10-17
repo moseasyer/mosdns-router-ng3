@@ -479,6 +479,26 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 	case options.automatic:
 		return runAutomaticLists(ctx, options, stdout, stderr, services)
 	case options.check:
+		// The entry set is read HERE, at the call, and not inside runCheckLists.
+		// That function is called a second time by --automatic, which has already
+		// read the policy and carries the set on its options; a read inside the
+		// report would read the same file twice on that path and could act on two
+		// different policies, which is the one thing the single file exists to
+		// prevent. Leaving it nil here is therefore a caller's mistake, not a case
+		// to serve -- the check is the only other caller, and the unattended path
+		// has filled it in.
+		//
+		// The nil test is kept because it costs nothing and the alternative is a
+		// report that compares against an empty set and calls every machine
+		// drifted, which is a false verdict rather than a missing one.
+		if options.chinaEntries == nil {
+			entries, err := chinaEntriesFromPolicy(services, options)
+			if err != nil {
+				writeCLIError(stderr, "%v", err)
+				return exitInvalidCLI
+			}
+			options.chinaEntries = entries
+		}
 		return runCheckLists(ctx, options, stdout, stderr, services)
 	case options.refreshRanges:
 		return runRefreshRanges(ctx, options, stdout, stderr, services)
@@ -515,6 +535,13 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 // repository, because a commit id is only meaningful in the repository that issued
 // it, and a failure to reach EITHER one is the same fail-closed answer as a failure to
 // reach the primary.
+//
+// AND the entry set, which is the third input and not a commit at all. It arrives on
+// options.chinaEntries, filled by the caller: runUpdateLists reads the policy for the
+// `--check` mode and runAutomaticLists has already read it, so this function never
+// reads a policy itself and an unattended run never reads one twice. A nil set would
+// compare as drifted, which is the fail-closed direction; it is a caller's mistake
+// rather than a state a machine can be in.
 func runCheckLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	published, _, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
@@ -556,6 +583,35 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	writeReportLine(&report, "locked-archive-sha256: %s\n", published.Primary.SHA256)
 	reportSupplement(&report, published)
 	writeReportLine(&report, "locked-list-sha256: %s\n", published.ListSHA256)
+
+	// The entry set is the third thing this report can be wrong about. The other
+	// two are commits; this one is a set the operator chose, and a report that
+	// only judged commits says `up-to-date: true` about a machine whose list still
+	// carries a category it was just told to stop including. That is not a
+	// hypothetical: `--automatic` republishes on exactly this change, so a machine
+	// the timer had already fixed was being called current by the check that
+	// reports on it.
+	//
+	// Both sets are printed, each in its own order, rather than one of them plus a
+	// verdict. The two orders are genuinely different on this project's own shipped
+	// pair -- the lock records the files the way it was pinned, the policy's set is
+	// built in the order the switches are declared -- and a reader who has to diff
+	// two reports by hand is doing the job the report exists to do. The VERDICT
+	// compares them as sets, which is the only thing about them that means
+	// anything: the converter merges the files and sorts the result.
+	//
+	// Only for the dnsmasq primary. The switches name files of THAT repository, and
+	// a machine published from the v2fly fallback carries one entry of the other
+	// one and no set at all, so the comparison has nothing on one side to be about.
+	// Printing it there would report drift on every fallback machine forever, on a
+	// list that is exactly what that machine asked for.
+	entriesDrifted := false
+	if published.Primary.Repository == rules.RepositoryChina {
+		desired := options.chinaEntries
+		writeReportLine(&report, "desired-entries: %s\n", strings.Join(desired, " "))
+		writeReportLine(&report, "published-entries: %s\n", strings.Join(published.Primary.Entries, " "))
+		entriesDrifted = !sameEntrySet(desired, published.Primary.Entries)
+	}
 
 	// The Cloudflare ranges are reported here, in the same report, and they cost
 	// no request: ReadPublished reads the two artifacts off the disk and says
@@ -613,9 +669,14 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	// indication of which source moved sends the operator to the wrong repository.
 	primaryDrifted := remote.Primary.Commit != published.Primary.Commit
 	supplementDrifted := published.Supplement != nil && supplementRemote != published.Supplement.Commit
-	if !primaryDrifted && !supplementDrifted {
-		// Every remote still publishes the commit this machine was built from, so
-		// no archive is fetched at all -- on either source.
+	if !primaryDrifted && !supplementDrifted && !entriesDrifted {
+		// Every remote still publishes the commit this machine was built from, and the
+		// published list still names the entries the operator's switches select, so
+		// no archive is fetched at all -- on either source. An entry-set drift takes
+		// the other branch even with every commit standing still, and that branch
+		// reports only the commit digests a pin would record, which is the honest
+		// half of the answer: the list to fetch is a REPUBLICATION of what is on
+		// disk, not a new archive.
 		writeReportLine(&report, "up-to-date: true\n")
 		return writeReport(stdout, stderr, report.Bytes())
 	}
@@ -895,6 +956,42 @@ func chinaEntriesFrom(resolved, wanted []string) ([]string, error) {
 		}
 	}
 	return kept, nil
+}
+
+// sameEntrySet reports whether two entry sets name the same files, in any order.
+//
+// Order is not part of the question. The converter merges each named file and
+// sorts the result, so a set written the other way round converts to the same
+// list, byte for byte -- and the sets really do differ in order on a machine that
+// has just upgraded: the pair this package ships records the entries the way it
+// was pinned, while ChinaConfEntriesFor builds the set in the order the optional
+// entries are declared. A positional comparison would call every one of those
+// machines drifted on its first run of the new build, which is the loudest way to
+// spend an operator's trust on a fact that is not one.
+//
+// Multiplicity is counted rather than ignored because a set that names one file
+// twice is not the same set as one that names it once, even though the converter
+// would merge it the same way. The parser refuses that lock before a report is
+// assembled, so this cannot be reached in production -- which is the reason the
+// predicate holds to it rather than leaving it to whichever comparison was
+// written first.
+func sameEntrySet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, entry := range a {
+		counts[entry]++
+	}
+	for _, entry := range b {
+		counts[entry]--
+	}
+	for _, n := range counts {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
@@ -1188,6 +1285,26 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 			"published no supplement to compare against\n", supplement.Repository)
 	} else if err := guardSize(stderr, "supplement", supplement, isSupplement, wasSupplement, minimumRetained); err != nil {
 		return exitStateUnavailable
+	}
+
+	// A configuration change and an upstream collapse look identical to a count, and
+	// the guardrail above has just been passed by one of them. An operator turning a
+	// switch off is a deliberate drop of a category of names; a source that lost
+	// them is a fault nobody reviewed. The threshold is NOT relaxed for the first
+	// and nothing is exempted -- 0.25%% is far above the 0.95 retention floor, so a
+	// switched-off entry never trips it -- but the report has to say which of the two
+	// the number was, because that is what decides the next action: an edit to
+	// policy.yaml, or a look at upstream.
+	//
+	// Only when there WAS a previous publication from this source to change from. A
+	// machine being migrated off the fallback has no dnsmasq entry set to compare
+	// against -- and on that run the primary guardrail was skipped altogether, which
+	// the migration line above already names. Saying the set changed here would
+	// describe a comparison that did not happen.
+	if found && !migrating && !sameEntrySet(pinned.Primary.Entries, published.Primary.Entries) {
+		writeReportLine(stdout, "china-list: the entry set changed %s -> %s; the size guardrail "+
+			"compared counts across that change, which is a configuration change and not an "+
+			"upstream one\n", strings.Join(pinned.Primary.Entries, " "), strings.Join(published.Primary.Entries, " "))
 	}
 
 	// Publish what was MEASURED, not whatever HEAD has become since. This is the
