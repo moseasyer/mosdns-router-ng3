@@ -145,23 +145,26 @@ selects
 .B apple.china.conf
 (165 rules); both are on in the shipped policy, and setting one to
 .B false
-takes that file's names out of the published list \em at the next pin or refresh,
+takes that file's names out of the published list \(em at the next pin or refresh,
 not at the next upstream commit, which may be weeks away. They are not the refresh
 switch:
 .B lists.china.automatic
 alone decides whether anything is updated, so a machine that turns one of them off
 keeps updating on exactly the schedule it had and simply publishes a shorter list.
-Every path that produces a list reads them, which is why
-.BR \-\-pin\-remote ,
-.B \-\-automatic
-and
+Both paths that publish a list record the set in the lock they write \(em that is
+where a later reader learns what this machine's list was actually built from, and
+the pin's own report does not repeat it.
 .B \-\-check
-all say which files they converted rather than only what they published.
+is the report that names both sets, on every run of a machine published from that
+primary, which is how a switch edit becomes visible before the next upstream commit
+rather than after it. An unattended refresh says so only on the run where the set
+really changed, because on the runs where it did not, nothing about its report is
+different.
 .br
 The third file,
 .BR accelerated\-domains.china.conf ,
 has no switch and cannot be turned off, because it is not a category of names: it
-is 110,205 of the 110,481 rules this machine publishes \em 99.75% \em and a list
+is 110,205 of the 110,481 rules this machine publishes \(em 99.75% \(em and a list
 without it sends almost every domestic name down the foreign branch, quietly, with
 nothing anywhere reporting it. A published lock that does not name it is refused
 rather than trimmed.
@@ -263,7 +266,7 @@ So the report carries
 .B desired\-entries:
 \(em what this machine's
 .B lists.china
-switches select now \em beside
+switches select now \(em beside
 .BR published\-entries: ,
 which is what the lock beside it records, and
 .B up\-to\-date:
@@ -275,7 +278,7 @@ it was just told to stop including, which is what
 .B \-\-automatic
 republishes over the following night. The two sets are compared as sets, not as
 sequences: the converter merges each named file and sorts the result, so a lock
-spelling the same files in another order \em as the pair this package ships does \em
+spelling the same files in another order \(em as the pair this package ships does \(em
 describes the same list, and a machine that has just upgraded is not drifted.
 Neither line is printed for a machine published from the
 .I v2fly/domain\-list\-community
@@ -284,7 +287,7 @@ for these switches to disagree with.
 .br
 Like the two publishing paths, the check reads
 .B /etc/mosdns/policy.yaml
-and refuses \em exit 2 \em when it cannot, naming the file, rather than guessing
+and refuses \(em exit 2 \(em when it cannot, naming the file, rather than guessing
 which entries this machine wants and reporting a verdict it made up.
 .br
 The report also carries the range snapshot this package ships: its two digests, the
@@ -310,15 +313,15 @@ records a commit, and none of those is one.
 .br
 A pin reads
 .B /etc/mosdns/policy.yaml
-to learn which of the primary source's files become domestic names \em
+to learn which of the primary source's files become domestic names \(em
 .BR lists.china.google ,
 .BR lists.china.apple ,
-both on by default \em and refuses when that file cannot be read, naming it, with
+both on by default \(em and refuses when that file cannot be read, naming it, with
 exit status 2. It does not fall back to the reviewed set, and the reason is worth
 stating: a guess here is a silent verdict about this machine's DNS. Read as all
 three files, it hands back the names an operator asked to be rid of; read as none
 of them, it publishes a list missing a category of domestic names, every one of
-which quietly takes the foreign branch \em and the pin still exits 0 with nothing
+which quietly takes the foreign branch \(em and the pin still exits 0 with nothing
 in its report to notice. A refusal is the only answer that cannot be mistaken for
 a successful pin. A broken policy also makes
 .B \-\-automatic

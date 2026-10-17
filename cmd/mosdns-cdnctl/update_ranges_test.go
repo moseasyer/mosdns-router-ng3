@@ -154,14 +154,28 @@ type rangePaths struct {
 	// happens to have this package installed.
 	pinSnapshot string
 	pinLock     string
-	// policy is a policy file the command is given, with every switch off. It is
-	// here because the modes in this file share the update-lists boundary and
+	// policy is a policy file the command is given. It has BOTH AUTOMATIC switches
+	// off -- lists.china.automatic and lists.cloudflare.automatic, which is what
+	// automaticPolicy(t, false, false) sets -- and both entry switches explicitly
+	// true, because automaticPolicy marshals the whole reviewed default policy and
+	// config.Defaults() names those two as on. That is deliberate and it is NOT
+	// "every switch off": a case reading this comment and assuming google and apple
+	// are off would get a report whose desired and published entry sets disagree
+	// for a reason it did not arrange.
+	//
+	// It is here because the modes in this file share the update-lists boundary and
 	// `--check` reads the policy to say which entries the operator's switches
 	// select: left at the installed default, every check case below would read the
 	// HOST's /etc/mosdns/policy.yaml, which is a fixture whose answer depends on
 	// which machine runs the suite. The reader stays the real one -- this fixture
 	// replaces the network, not the configuration -- so what is under test is the
 	// command reading a policy file, not a stub returning one.
+	//
+	// The entry comparison is not reached by the cases here: all three
+	// `runRangeCheck` call sites publish a v2fly-primary pair, and a report about
+	// that source says nothing about dnsmasq entry sets. A case here that published
+	// a China primary would want every entry converted, which is what this file
+	// gives it.
 	policy string
 }
 
