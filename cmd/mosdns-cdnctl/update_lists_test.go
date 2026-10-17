@@ -2286,13 +2286,24 @@ func TestTheCheckAsksTheRepositoryThePublishedLockNames(t *testing.T) {
 	if other := origin.archivePath(rules.RepositoryV2Fly, remoteCommit); origin.fetched(other) {
 		t.Fatalf("--check fetched %q, which belongs to a source this list was not published from", other)
 	}
-	for _, want := range []string{"repository: " + rules.RepositoryChina, "entries: " + strings.Join(rules.ChinaConfEntries, " "), "up-to-date: false"} {
+	for _, want := range []string{"repository: " + rules.RepositoryChina, "published-entries: " + strings.Join(rules.ChinaConfEntries, " "), "up-to-date: false"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("check output does not report %q:\n%s", want, stdout)
 		}
 	}
 	if strings.Contains(stdout, "entry: ") {
 		t.Errorf("check reported a single entry for a source that has none:\n%s", stdout)
+	}
+	// The set is printed ONCE, as `published-entries:` beside `desired-entries:`.
+	// The assertion above cannot tell the two spellings apart -- `entries:` is a
+	// substring of `published-entries:` -- so it passes either way, and this is
+	// what holds the report to the one key the manual describes. A second key
+	// carrying the same string is a line an operator cannot read as either the
+	// wanted set or the published one.
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(line, "entries: ") {
+			t.Errorf("check reported the entry set a second time, under a second key: %q\n%s", line, stdout)
+		}
 	}
 	if stderr != "" {
 		t.Errorf("check wrote a diagnostic: %q", stderr)

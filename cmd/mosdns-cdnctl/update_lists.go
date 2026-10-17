@@ -256,10 +256,16 @@ type updateListOptions struct {
 	//
 	// A nil here means "no path has read the policy", and only runPinRemote turns
 	// that into a read. It is a usable sentinel because ChinaConfEntriesFor always
-	// returns at least the base entry, so a set that HAS been read is never nil --
-	// which chinaEntriesFrom then treats as a refusal rather than an empty
-	// conversion, so a caller that forgets to read the policy stops the run instead
-	// of publishing a lock that names no files at all.
+	// returns at least the base entry, so a set that HAS been read is never nil.
+	//
+	// Nothing in this file turns a nil into a refusal, and the comment has said so
+	// wrongly once: chinaEntriesFrom treats a nil `wanted` as a set naming nothing to
+	// keep, so it returns an EMPTY conversion and no error. What stops a caller that
+	// forgets to read the policy is the lock that run then tries to write --
+	// rules.validateRef refuses a dnsmasq primary naming no files ("entries is
+	// empty"), and reviewedChinaConfSubset refuses the same emptiness underneath it.
+	// The run stops instead of publishing a lock that names no files at all, but it
+	// is the lock's own validator that stops it, not this field and not the narrowing.
 	//
 	// runAutomaticLists sets it, and that is what makes a scheduled run read
 	// policy.yaml exactly once: the same file says how often to refresh and which
@@ -574,11 +580,20 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	writeReportLine(&report, "repository: %s\n", published.Primary.Repository)
 	if published.Primary.Entry != "" {
 		writeReportLine(&report, "entry: %s\n", published.Primary.Entry)
-	} else {
-		// A source that is three named files has no single entry, and reporting
-		// an empty field would be a report that looks complete and says nothing.
-		writeReportLine(&report, "entries: %s\n", strings.Join(published.Primary.Entries, " "))
 	}
+	// A source that is three named files has no single entry, and reporting an
+	// empty field would be a report that looks complete and says nothing.
+	//
+	// It used to be spelled `entries:` here, and that key is gone rather than
+	// explained: `published-entries:` below prints the same string byte for byte,
+	// because the schema makes the two keys coincide. A lock this build can read
+	// is either a dnsmasq primary, which names a set and no single entry, or a
+	// v2fly ref, which names one entry and no set -- validateRef refuses every
+	// other shape -- so the set is printed exactly in the case where the pair is
+	// printed. A reader given two identical lines cannot tell which of them is
+	// what the policy asks for, and `entries:` sitting beside `desired-entries:`
+	// invites reading it as a third quantity. Nothing is lost: `grep entries:`
+	// still finds the set, inside `published-entries:`.
 	writeReportLine(&report, "locked-commit: %s\n", published.Primary.Commit)
 	writeReportLine(&report, "locked-archive-sha256: %s\n", published.Primary.SHA256)
 	reportSupplement(&report, published)
@@ -1298,9 +1313,12 @@ func refreshChinaList(ctx context.Context, options updateListOptions, stdout, st
 	//
 	// Only when there WAS a previous publication from this source to change from. A
 	// machine being migrated off the fallback has no dnsmasq entry set to compare
-	// against -- and on that run the primary guardrail was skipped altogether, which
-	// the migration line above already names. Saying the set changed here would
-	// describe a comparison that did not happen.
+	// against: what `published` carries there is a v2fly ref, whose Entries is empty
+	// by schema, so the set on the other side of this comparison would be the empty
+	// set rather than one the operator chose. Saying the set changed here would
+	// report a comparison that did not happen. This run already says one thing it
+	// could not judge -- the primary guardrail it skipped -- and that is the
+	// migration line above, which is about the guardrail and not about this.
 	if found && !migrating && !sameEntrySet(pinned.Primary.Entries, published.Primary.Entries) {
 		writeReportLine(stdout, "china-list: the entry set changed %s -> %s; the size guardrail "+
 			"compared counts across that change, which is a configuration change and not an "+

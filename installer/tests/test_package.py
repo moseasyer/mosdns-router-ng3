@@ -6332,6 +6332,152 @@ class BuiltPackageTests(_Staged):
         self.assertEqual(sorted(staged - inside), [], "the tree holds a file the package does not")
 
 
+# --- the manual pages, rendered ----------------------------------------------
+#
+# Every other gate here reads a document as words (`shipped_prose` above, the
+# staged file below). This one renders it, because the class of defect it exists
+# for is invisible to a reader of the source: the escapes troff does not
+# understand, which are the ones that swallow text.
+
+MAN_PAGES = (
+    PACKAGING / "man" / "mosdns-cdnctl.1",
+    PACKAGING / "man" / "mosdns-router.8",
+    PACKAGING / "man" / "dnscrypt-proxy.8",
+)
+
+# What groff writes for bold and italic with GROFF_NO_SGR: the character, a
+# backspace, the character again. `-Tutf8` writes SGR escapes instead, which are
+# real characters in the output -- and a diagnostic that quotes a line containing
+# them reads as if the page were full of escape sequences, which is exactly the
+# thing being hunted.
+OVERSTRIKE = re.compile(r".\x08")
+
+
+def render_roff(page: Path):
+    """(the text a reader sees, everything groff said about it), for one page.
+
+    `groff -man` rather than `man -l`, for three reasons that all have to hold
+    where groff is installed. The output is deterministic, so this compares
+    against nothing that varies with a terminal or a locale. The warnings are
+    the ones groff emits rather than the ones `man` chose to pass on, and groff
+    is the program that decides what a page means. And `-l` is a `man` flag that
+    not every `man` has.
+    """
+    rendered = subprocess.run(
+        ["groff", "-man", "-Tascii", "-ww", str(page)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C", "GROFF_NO_SGR": "1"},
+    )
+    if rendered.returncode != 0:
+        return "", f"groff exited {rendered.returncode}: {rendered.stderr.strip()}"
+    return OVERSTRIKE.sub("", rendered.stdout), rendered.stderr.strip()
+
+
+def manual_defects(page: Path):
+    """Every way this page would lose a word or a dash to an escape it does not
+    understand. Empty is the only good answer, and the three questions are three
+    different failures rather than one regex over the source:
+
+    * An escape groff does not know, which it prints literally. `\\em` reached
+      the reader as a literal `\\m` where a dash should be, and groff said
+      nothing at all -- so this one is caught in the OUTPUT, and the pattern is
+      deliberately broader than the `\\m` that actually shipped: any backslash
+      in front of an alphanumeric is a control character on the page.
+    * A name troff cannot resolve. `\\(` introduces a special character BY NAME,
+      so `\\(the` asked for one called "th", did not find it, printed nothing,
+      and ate the two letters it could not name: the page said `e default`.
+      That one does warn, which is what the stderr question is for.
+    * `\\"`, which starts a comment -- ANYWHERE it appears, not only at the
+      start of a line, and always silently. Thirteen words were missing from
+      `mosdns-cdnctl(1)` because of it and groff reported nothing, because the
+      only evidence a comment happened is the absence of the words. So this one
+      cannot be asked about the output: reading absence out of a filled,
+      hyphenated page is a gate that fails on typography. It is asked about the
+      source instead, against the one rule this page's comment lines rely on: a
+      `\\"` is a comment only when it is the first thing on its line, so a macro
+      line may carry one and nothing else may.
+    """
+    problems = []
+    text, warnings = render_roff(page)
+    if warnings:
+        problems.append(f"groff did not understand something in it:\n{warnings}")
+    for line in text.splitlines():
+        if re.search(r"\\[A-Za-z0-9]", line):
+            problems.append(f"a reader sees a troff escape: {line.strip()}")
+    for number, line in enumerate(page.read_text(encoding="utf-8").splitlines(), start=1):
+        if '\\"' in line and not line.lstrip().startswith("."):
+            problems.append(
+                f'line {number} writes a quote as \\", which comments out the rest of '
+                f"the line: {line.strip()}"
+            )
+    return problems
+
+
+@unittest.skipUnless(shutil.which("groff"), "groff is not installed, so no manual page can be rendered")
+class ManualRenderingTests(unittest.TestCase):
+    """The three manual pages, rendered the way a reader gets them.
+
+    A page is the one shipped document nobody can read by reading the source:
+    an escape only means something after a formatter has decided what it means,
+    so a defect in one is invisible to every other gate in this file -- the ones
+    above strip the macro names and stop there, which is exactly why 29 bare
+    `\\em` survived a review that checked the rendering by hand, and why the text
+    added by the last commit of that change had to be corrected by hand too.
+
+    Not a `_Staged` subclass: a page is a file in the repository, so this needs
+    no build, and a gate that can only run where a build already runs is a gate
+    that is skipped exactly when a reviewer is looking at a page.
+    """
+
+    def test_no_shipped_manual_page_loses_words_to_an_undefined_escape(self):
+        for page in MAN_PAGES:
+            with self.subTest(page=page.name):
+                self.assertEqual(
+                    manual_defects(page),
+                    [],
+                    f"{page.name} does not render as written; see the escaped words above, "
+                    f"which a reader of the source cannot see",
+                )
+
+    def test_this_gate_notices_each_escape_it_exists_for(self):
+        """Three mutations, one per question, in copies.
+
+        A gate that cannot fail is not a gate, and this one has a failure mode
+        that reading it does not reveal: `groff` missing, or a typo in the
+        pattern, would leave it green over a page that had lost a sentence. The
+        pages are the real ones with one escape changed, because a hand-written
+        fixture would prove the checker works on the fixture's shape rather than
+        on this page's.
+        """
+        real = MAN_PAGES[0].read_text(encoding="utf-8")
+        mutations = {
+            "an escape groff does not know": (
+                r"\(em at the next pin or refresh",
+                r"\em at the next pin or refresh",
+            ),
+            "a name troff cannot resolve": (
+                "(the default, and the documented invocation)",
+                r"\(the default, and the documented invocation)",
+            ),
+            'a quote written as \\"': (
+                'and "whatever upstream says now" is not',
+                'and \\"whatever upstream says now\\" is not',
+            ),
+        }
+        with tempfile.TemporaryDirectory(prefix="mosdns-man-roff.") as scratch:
+            for name, (introduced, mutated) in mutations.items():
+                with self.subTest(defect=name):
+                    self.assertIn(introduced, real, f"the page no longer says {introduced!r}")
+                    copy = Path(scratch) / ("mutated" + MAN_PAGES[0].suffix)
+                    copy.write_text(real.replace(introduced, mutated, 1), encoding="utf-8")
+                    self.assertNotEqual(
+                        manual_defects(copy),
+                        [],
+                        f"the gate did not notice {name}",
+                    )
+
+
 # --- the controls ------------------------------------------------------------
 
 
