@@ -6388,15 +6388,19 @@ def manual_defects(page: Path):
       so `\\(the` asked for one called "th", did not find it, printed nothing,
       and ate the two letters it could not name: the page said `e default`.
       That one does warn, which is what the stderr question is for.
-    * `\\"`, which starts a comment -- ANYWHERE it appears, not only at the
-      start of a line, and always silently. Thirteen words were missing from
-      `mosdns-cdnctl(1)` because of it and groff reported nothing, because the
-      only evidence a comment happened is the absence of the words. So this one
-      cannot be asked about the output: reading absence out of a filled,
-      hyphenated page is a gate that fails on typography. It is asked about the
-      source instead, against the one rule this page's comment lines rely on: a
-      `\\"` is a comment only when it is the first thing on its line, so a macro
-      line may carry one and nothing else may.
+    * `\\"`, which starts a comment -- anywhere it appears, and always silently.
+      The `--unit-out` paragraph of `mosdns-cdnctl(1)` is written as 38 words and
+      rendered as 22 of them because of this escape, and groff reported nothing at
+      all, because the only evidence a comment happened is the absence of the
+      words. So this one cannot be asked about the output: reading absence out of
+      a filled, hyphenated page is a gate that fails on typography. It is asked
+      about the source instead, against the one rule that makes BOTH of the legal
+      forms legal: a `\\"` is a comment only in CONTROL POSITION, which on a line
+      means as its first non-blank character -- bare (`\\"`) or after the `.` no-op
+      (`.\\"`, the form this page's own header comment uses). Anywhere else it
+      comments the rest of the line out, and a MACRO LINE is anywhere else:
+      `.B flag meaning \\"the output directory is here` rendered as `flag meaning`,
+      with nothing on stderr and a zero exit.
     """
     problems = []
     text, warnings = render_roff(page)
@@ -6406,7 +6410,15 @@ def manual_defects(page: Path):
         if re.search(r"\\[A-Za-z0-9]", line):
             problems.append(f"a reader sees a troff escape: {line.strip()}")
     for number, line in enumerate(page.read_text(encoding="utf-8").splitlines(), start=1):
-        if '\\"' in line and not line.lstrip().startswith("."):
+        # Control position, and nothing else, is a comment. Exempting every line
+        # that starts with `.` -- which is what this did before -- exempted the
+        # MACRO lines too, and a `\"` on a macro line swallows the rest of it
+        # silently, so the gate went green over a page that had lost a sentence.
+        # It also over-reported the bare form, which is legal and which the
+        # narrower rule has to keep legal or the check is wrong in the other
+        # direction instead.
+        stripped = line.lstrip()
+        if '\\"' in line and not (stripped.startswith('\\"') or stripped.startswith('.\\"')):
             problems.append(
                 f'line {number} writes a quote as \\", which comments out the rest of '
                 f"the line: {line.strip()}"
@@ -6441,7 +6453,7 @@ class ManualRenderingTests(unittest.TestCase):
                 )
 
     def test_this_gate_notices_each_escape_it_exists_for(self):
-        """Three mutations, one per question, in copies.
+        """Four mutations: one per question, plus the second shape of the third.
 
         A gate that cannot fail is not a gate, and this one has a failure mode
         that reading it does not reveal: `groff` missing, or a typo in the
@@ -6449,6 +6461,14 @@ class ManualRenderingTests(unittest.TestCase):
         pages are the real ones with one escape changed, because a hand-written
         fixture would prove the checker works on the fixture's shape rather than
         on this page's.
+
+        The fourth is the shape this rule got wrong first. The mutation above
+        lands on a TEXT line, which any rule reading "an escape anywhere on a
+        line comments the line" catches -- so it stayed green over the shape that
+        really does swallow words: the escape on a MACRO line, which a rule that
+        exempts every line beginning with `.` reads as a comment instead. One
+        mutation per question is not one per shape, and the shape is the whole of
+        what went wrong here.
         """
         real = MAN_PAGES[0].read_text(encoding="utf-8")
         mutations = {
@@ -6464,6 +6484,10 @@ class ManualRenderingTests(unittest.TestCase):
                 'and "whatever upstream says now" is not',
                 'and \\"whatever upstream says now\\" is not',
             ),
+            'a quote written as \\" on a MACRO line': (
+                ".B \\-\\-out\n",
+                '.B \\-\\-out \\"and every word after it is gone\n',
+            ),
         }
         with tempfile.TemporaryDirectory(prefix="mosdns-man-roff.") as scratch:
             for name, (introduced, mutated) in mutations.items():
@@ -6476,6 +6500,40 @@ class ManualRenderingTests(unittest.TestCase):
                         [],
                         f"the gate did not notice {name}",
                     )
+
+
+class InstalledManualPagesTests(unittest.TestCase):
+    """`MAN_PAGES` above, against the one list that says what the package installs.
+
+    `MAN_PAGES` is a hand-maintained tuple and `packaging/mosdns-router.install` is a
+    hand-maintained file list, and both name the same three pages, which means
+    nothing read either one against the other: add a fourth page to the manifest and
+    the package installs it while this file renders three pages and calls that a
+    clean run. The gate for pages that silently lose words would then be green over
+    the one page nobody ever rendered -- the same root cause as the stale line-number
+    anchors, in the gate written to catch that root cause.
+
+    The manifest is the authoritative side, because it is what the package is built
+    from rather than what a test reads. Compared as a SET, because the order of two
+    lists is not a fact about the package.
+
+    Its own class rather than a third method on `ManualRenderingTests`, because that
+    class is skipped where groff is absent and this holds or fails without groff, with
+    no build and no renderer in it at all.
+    """
+
+    def test_the_pages_this_file_renders_are_the_pages_the_package_installs(self):
+        installed = {
+            REPO / source
+            for source, _destination in manifest_entries(MANIFEST.read_text())
+            if source.startswith("packaging/man/")
+        }
+        self.assertEqual(
+            set(MAN_PAGES),
+            installed,
+            "the pages rendered above and the pages the package installs are not the "
+            "same set, so a page this package ships is one nothing here ever renders",
+        )
 
 
 # --- the controls ------------------------------------------------------------
