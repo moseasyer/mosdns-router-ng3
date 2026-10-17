@@ -626,7 +626,7 @@ func TestAPinPublishesOnlyTheEntriesTheOperatorLeftOn(t *testing.T) {
 		rules.RepositoryChina: {
 			head: remoteCommit,
 			archives: map[string][]byte{
-				remoteCommit: chinaSourceArchive(t, remoteCommit, "server=/kept.cn/114.114.114.114\n"),
+				remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:kept.cn\n"),
 			},
 		},
 		rules.RepositoryV2Fly: {
@@ -665,7 +665,7 @@ func TestAMachineThatCannotReadItsPolicyCannotPinEither(t *testing.T) {
 	paths := newListPaths(t)
 	origin := newFakeOriginSources(t, map[string]fakeSource{
 		rules.RepositoryChina: {head: remoteCommit, archives: map[string][]byte{
-			remoteCommit: chinaSourceArchive(t, remoteCommit, "server=/a.cn/114.114.114.114\n")}},
+			remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:a.cn\n")}},
 	})
 	services := origin.services()
 	services.loadPolicy = func(string) (config.Policy, error) {
@@ -835,7 +835,7 @@ func TestTheCheckSaysWhenThePublishedListDoesNotMatchTheSwitches(t *testing.T) {
 	paths := newListPaths(t)
 	origin := newFakeOriginSources(t, map[string]fakeSource{
 		rules.RepositoryChina: {head: remoteCommit, archives: map[string][]byte{
-			remoteCommit: chinaSourceArchive(t, remoteCommit, "server=/a.cn/114.114.114.114\n")}},
+			remoteCommit: chinaSourceArchive(t, remoteCommit, "domain:a.cn\n")}},
 		rules.RepositoryV2Fly: {head: remoteCommit, archives: map[string][]byte{
 			remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive)}},
 	})
@@ -843,7 +843,11 @@ func TestTheCheckSaysWhenThePublishedListDoesNotMatchTheSwitches(t *testing.T) {
 	// 先按"全开"发布一份，再把 policy 改成关掉 google，然后问 --check。
 	// 如果 --check 只看 commit，它会报 up-to-date: true，而那份列表里其实有
 	// 一类域名，操作员刚要求去掉。
-	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+	// Task 3 之后 --pin-remote 必须能读到 policy，所以播种这一次也要注入。
+	// 照抄 origin.services() 会去读宿主的 /etc/mosdns/policy.yaml，那台机器上
+	// 没有可用的 policy，于是这一跑以 exitInvalidCLI 结束，而失败信息讲的是
+	// policy，与本测试要证的事毫无关系。
+	code, _, stderr := runCLI(t, pinServices(origin), "--pin-remote", "HEAD",
 		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
 		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
@@ -981,10 +985,30 @@ cd installer/tests && python3 -m unittest test_package -q 2>&1 | tail -4
 Expected: `Ran 150 tests` / `OK`。若因缺 `build/dnscrypt-proxy-2.1.18.tar.gz` 而报 setup 错误，从
 `/home/ubuntu/project_v2/.worktrees/mosdns-router/build/` 复制该文件过来——那是构建输入，不是代码。
 
+- [ ] **Step 7b: 手册页——本计划之前没有任何 task 拥有它**
+
+Task 3 让 `--pin-remote` 第一次依赖 policy：读不出来就拒绝。这**没有**任何 task 拥有对应的
+文档，而它正是操作员唯一会读到的地方。手册页的 `update-lists` 小节（`mosdns-cdnctl.1:105` 起）
+有 `--automatic`、`--check` 与那两个刷新开关的条目，**但既没有 `--policy` 也没有这两个新开关**
+（`--policy` 只出现在 SYNOPSIS `:13` 与 `render` 小节 `:96`）。`installer/tests/test_package.py`
+里有逐字比对手册页与 `--help` 输出的用例，所以两处会互相印证。
+
+要加的：
+
+1. `--pin-remote` 条目里说明它需要一份可读的 policy，读不出来会拒绝且不猜默认值——并写明理由
+   （猜错的后果是"静静地少装了一类规则"）。
+2. `lists.china` 那一段里加 `google` 与 `apple` 两个条目：默认开、关掉它们**不影响更新**、
+   `accelerated` 没有开关且是列表的 99.75%。
+3. `--check` 条目里说明它现在会报 `desired-entries` 与 `published-entries`。
+
+改完用 `man -l packaging/man/mosdns-cdnctl.1` 渲染确认 roff 有效（已有一个既有的 `\(t` 拼写
+警告在 207 行，与本次无关）。
+
 - [ ] **Step 8: 提交**
 
 ```bash
-git add cmd/mosdns-cdnctl/update_lists.go cmd/mosdns-cdnctl/update_lists_test.go
+git add cmd/mosdns-cdnctl/update_lists.go cmd/mosdns-cdnctl/update_lists_test.go \
+        packaging/man/mosdns-cdnctl.1
 git commit -m "feat(cdnctl): the check reports an entry set that does not match the switches"
 ```
 
