@@ -43,15 +43,53 @@ type ListsPolicy struct {
 	Cloudflare CloudflareListPolicy `yaml:"cloudflare"`
 }
 
-// ChinaListPolicy is unattended refresh of the pinned domain list. Off by default,
-// and the reason is a fact about the upstream document rather than a preference:
-// data/cn is curated by hand, so ANY commit to it moves the split, and accepting one
-// unattended is a routing change nobody reviewed. The switch exists because an
-// operator who has decided they want that trade can have it, not because it is a
-// good default.
+// ChinaListPolicy is unattended refresh of the pinned domain list, plus which of
+// the primary source's files are converted at all.
+//
+// Automatic is TIME -- how often to fetch. Google and Apple are CONTENT -- which
+// of the source's files become domestic names. They are orthogonal: a machine
+// refreshing nightly and a machine that has turned google off do exactly the same
+// work, and the second one simply ends up with a list that does not contain it.
+//
+// Automatic is off by default, and the reason is a fact about the upstream document
+// rather than a preference: data/cn is curated by hand, so ANY commit to it moves
+// the split, and accepting one unattended is a routing change nobody reviewed. The
+// switch exists because an operator who has decided they want that trade can have
+// it, not because it is a good default.
+//
+// The two entry switches are the opposite default -- on -- and they are *bool
+// rather than bool because the zero value of a bool is false. A plain bool would
+// make "the operator did not write this field" mean OFF, which is the opposite of
+// the default and would apply silently to every machine whose policy predates these
+// fields. nil means on, which is also what an operator's existing policy has to
+// keep meaning after an upgrade.
+//
+// The omitempty is what keeps that promise honest in the other direction. Without
+// it a nil switch encodes as `google: null`, and null decodes back to nil, so the
+// field ends up with two spellings of "on" -- a key that is absent and a key that
+// says null -- of which only the first is what this file promises. Both would
+// behave identically, which is why the duplication is invisible until someone
+// reads the encoder and asks what it writes.
+//
+// omitempty skips a pointer for being nil and never for what it points at, so a
+// switch an operator explicitly turned off still encodes as `google: false`. That
+// asymmetry is the point rather than an accident: an absent switch is a default
+// being applied, and a false one is a decision somebody made, and only the second
+// of those is worth writing down.
 type ChinaListPolicy struct {
-	Automatic bool `yaml:"automatic"`
+	Automatic bool  `yaml:"automatic"`
+	Google    *bool `yaml:"google,omitempty"`
+	Apple     *bool `yaml:"apple,omitempty"`
 }
+
+// GoogleEnabled reports whether google.china.conf is converted into the list.
+// Absent means on: that is the default, and it is what a policy written before the
+// field existed decodes to.
+func (p ChinaListPolicy) GoogleEnabled() bool { return p.Google == nil || *p.Google }
+
+// AppleEnabled reports whether apple.china.conf is converted into the list. Absent
+// means on, for the same reason as GoogleEnabled.
+func (p ChinaListPolicy) AppleEnabled() bool { return p.Apple == nil || *p.Apple }
 
 // CloudflareListPolicy is unattended refresh of the published Cloudflare address
 // ranges. Off by default for the same reason as every other fetch in this package:

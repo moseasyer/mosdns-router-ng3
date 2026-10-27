@@ -9,6 +9,8 @@ schedule: "03:30"
 lists:
   china:
     automatic: false
+    google: true
+    apple: true
   cloudflare:
     automatic: false
 foreign:

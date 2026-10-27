@@ -86,10 +86,13 @@ func Defaults() Policy {
 	return Policy{
 		SchemaVersion: 1,
 		Schedule:      "03:30",
-		// Both false, and written out rather than left to the zero value so a
-		// reader of Defaults() can see the decision rather than infer it.
+		// automatic is false in both, and written out rather than left to the zero
+		// value so a reader of Defaults() can see the decision rather than infer it.
+		// The China entry switches are the other way round and are on, so they are
+		// written out too: absent would mean the same thing to a decoder, but a file
+		// an operator reads has to be able to say which entries are in the list.
 		Lists: ListsPolicy{
-			China:      ChinaListPolicy{Automatic: false},
+			China:      ChinaListPolicy{Automatic: false, Google: enabledByDefault(), Apple: enabledByDefault()},
 			Cloudflare: CloudflareListPolicy{Automatic: false},
 		},
 		Foreign: ForeignPolicy{
@@ -151,6 +154,15 @@ func Defaults() Policy {
 			PersistentDump: false,
 		},
 	}
+}
+
+// enabledByDefault is the *bool a switch carries when this project ships it on. A
+// pointer rather than a value because the field's meaning is three-state -- on,
+// off, and absent -- and a bool cannot spell the third, which is the state every
+// policy written before the field existed decodes to.
+func enabledByDefault() *bool {
+	on := true
+	return &on
 }
 
 // defaultForeignUpstreams is the shipped foreign route.

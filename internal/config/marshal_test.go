@@ -1,12 +1,15 @@
 package config
 
 import (
+	"bytes"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // committedPolicyPath is the policy this project ships. It is generated from
@@ -135,6 +138,104 @@ func TestOnlyQuad9sResolversAreInThePublishedSet(t *testing.T) {
 
 // ipv4Address finds every dotted-quad in a generated document.
 var ipv4Address = regexp.MustCompile(`[0-9]{1,3}(\.[0-9]{1,3}){3}`)
+
+// TestTheShippedPolicySaysWhichEntrySwitchesAreOn reads the generated document
+// back and asks what it says about the entry switches. The byte-for-byte
+// comparison above already catches a hand edit; what it cannot catch is WHY the
+// file is wrong, because a switch that ships off is a default this code chose and
+// the comparison happily accepts.
+//
+// Both switches are named explicitly in the shipped document. Omitting them would
+// be shorter and would decode identically -- absent means on -- but it would leave
+// an operator's first look at the file unable to tell "this project includes
+// google" from "this project has never heard of google", which are different
+// statements about the same list.
+func TestTheShippedPolicySaysWhichEntrySwitchesAreOn(t *testing.T) {
+	encoded, err := Marshal(Defaults())
+	if err != nil {
+		t.Fatalf("Marshal(Defaults()): %v", err)
+	}
+	var decoded struct {
+		Lists struct {
+			China struct {
+				Google *bool `yaml:"google"`
+				Apple  *bool `yaml:"apple"`
+			} `yaml:"china"`
+		} `yaml:"lists"`
+	}
+	if err := yaml.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("the marshalled policy does not parse: %v", err)
+	}
+	if decoded.Lists.China.Google == nil || !*decoded.Lists.China.Google {
+		t.Fatal("the shipped policy does not say google is on, so a fresh install does not get it")
+	}
+	if decoded.Lists.China.Apple == nil || !*decoded.Lists.China.Apple {
+		t.Fatal("the shipped policy does not say apple is on, so a fresh install does not get it")
+	}
+}
+
+// A switch that encodes as BOTH an absent key and as `null` is a field with two
+// spellings of one meaning, and only one of them is what the code promises:
+// "absent means on". Decoding is perfectly happy with either -- null decodes
+// back to a nil pointer, which means on -- which is exactly why the duplication
+// survives review: both spellings work, and only a reader of the encoder's mind
+// can tell they are saying the same thing. One of them has to go.
+//
+// The encode side is therefore pinned here, not the decode side. What decodes
+// from an absent key has to encode back to an absent key, so a policy that went
+// through this project's own encoder and loader is still the document it
+// started as rather than a document that has grown `null` where the operator
+// wrote nothing.
+func TestAnAbsentEntrySwitchIsLeftOutRatherThanWrittenAsNull(t *testing.T) {
+	policy, err := Load(writeYAML(t, rewriteShippedPolicy(t, entrySwitchLines, "")))
+	if err != nil {
+		t.Fatalf("a policy that omits the switches must load: %v", err)
+	}
+	if policy.Lists.China.Google != nil || policy.Lists.China.Apple != nil {
+		t.Fatalf("the switches decoded to %+v, and this case is only about an absent one",
+			policy.Lists.China)
+	}
+
+	encoded, err := Marshal(policy)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, key := range []string{"google:", "apple:"} {
+		if bytes.Contains(encoded, []byte(key)) {
+			t.Errorf("the marshalled policy contains %q, so an absent switch was written instead "+
+				"of left out, and the field now spells \"on\" twice:\n%s", key, encoded)
+		}
+	}
+}
+
+// The half of the same rule that a fix for the above can easily break: a switch
+// an operator explicitly turned off is a decision, not an absence, and it has to
+// survive the round trip.
+//
+// If omitempty ever started skipping a switch whose value is false -- which is
+// what the name suggests to someone who has not read yaml.v3's rule, where a
+// pointer is omitted for being nil and never for what it points at -- then a
+// file that said `google: false` would come back out with the key gone, and
+// absent means on. The operator's decision would be inverted by the encoder
+// itself, which is the one component whose job is to reproduce the input.
+func TestAnEntrySwitchAnOperatorTurnedOffIsWrittenRatherThanSwallowed(t *testing.T) {
+	policy, err := Load(writeYAML(t, rewriteShippedPolicy(t, "    google: true\n", "    google: false\n")))
+	if err != nil {
+		t.Fatalf("a policy that turns google off must load: %v", err)
+	}
+	if policy.Lists.China.Google == nil {
+		t.Fatal("google: false decoded to absent, so this case would pass without testing anything")
+	}
+
+	encoded, err := Marshal(policy)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(encoded, []byte("    google: false\n")) {
+		t.Fatalf("a switch the operator turned off was not written back, so the file now says "+
+			"nothing where it said no and absent means on:\n%s", encoded)
+	}
+}
 
 // updateCommitted rewrites a committed file from the code that produces it, so
 // the bytes in the repository are never hand-edited. Set MOSDNS_ROUTER_UPDATE=1

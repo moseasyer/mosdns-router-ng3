@@ -3,6 +3,7 @@ package rules
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -201,8 +202,34 @@ func TestTheCommittedLockDescribesTheSourceTheCommittedListCameFrom(t *testing.T
 		t.Fatalf("the committed list is pinned to %q, and the primary source is %q",
 			lock.Primary.Repository, RepositoryChina)
 	}
-	if len(lock.Primary.Entries) != 3 {
-		t.Fatalf("the primary names %d entries, want the three the pin covers", len(lock.Primary.Entries))
+	// 而这份**已提交**快照是相反的情况:默认全开,所以它必须命名全部三个。
+	// 这一条没有别的测试覆盖——committed_test.go 下面的合成锁从 ChinaConfEntries
+	// 派生,cmd/mosdns-cdnctl 那几处也都从代码派生,而 source-lock.json 自己
+	// 只被比对了仓库名与 sha256。它确实含 base,但含 base 不等于全开,而 google 只占
+	// 0.10%,不触发 0.95 的防塌缩护栏:所以将来某个 task 重新生成锁与列表、顺手关掉
+	// google,整个套件照样全绿——两个文件会互相印证彼此的 list_sha256。
+	//
+	// 这里没有"含 base 即可"那条 Contains,是一条死断言而不是一条规则:下面那条
+	// 多重集相等已经蕴含 base 在内(ChinaConfEntries 恒含它),两者读同一个
+	// lock.Primary.Entries,所以它永远不会失败,实际覆盖的是零。那条一般规则归
+	// reviewedChinaConfSubset 管(download_test.go 的
+	// TestAnEntrySetIsAnyReviewedSubsetThatKeepsTheBase 是它的用例),归的不是这份
+	// 已提交快照。
+	//
+	// 比的是**集合**,不是顺序,两边都排序:这份快照把 google 排在 apple 之前,而
+	// ChinaConfEntries 是 apple 在前。顺序进的是锁里序列化的 entries 数组——重排
+	// 确实改锁文件自己的字节——而不进任何产物:转换器合并各文件之后排序,所以
+	// list_sha256 与归档摘要一字不变。把这条比较钉成顺序敏感,断言的是本仓库从未
+	// 做过、也不打算做的事:只重排数组就要重新 pin。
+	committed := append([]string(nil), lock.Primary.Entries...)
+	slices.Sort(committed)
+	reviewed := append([]string(nil), ChinaConfEntries...)
+	slices.Sort(reviewed)
+	if !slices.Equal(committed, reviewed) {
+		t.Fatalf("the committed primary names %v, want the whole reviewed set %v; "+
+			"the committed snapshot is generated with every switch on, so a re-pin "+
+			"that turned one off is not the snapshot this repository reviewed",
+			lock.Primary.Entries, ChinaConfEntries)
 	}
 }
 

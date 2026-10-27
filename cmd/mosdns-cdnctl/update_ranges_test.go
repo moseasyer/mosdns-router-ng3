@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"mosdns-router/internal/candidate"
+	"mosdns-router/internal/config"
 	"mosdns-router/internal/filelock"
 	"mosdns-router/internal/optimizer"
 )
@@ -153,6 +154,29 @@ type rangePaths struct {
 	// happens to have this package installed.
 	pinSnapshot string
 	pinLock     string
+	// policy is a policy file the command is given. It has BOTH AUTOMATIC switches
+	// off -- lists.china.automatic and lists.cloudflare.automatic, which is what
+	// automaticPolicy(t, false, false) sets -- and both entry switches explicitly
+	// true, because automaticPolicy marshals the whole reviewed default policy and
+	// config.Defaults() names those two as on. That is deliberate and it is NOT
+	// "every switch off": a case reading this comment and assuming google and apple
+	// are off would get a report whose desired and published entry sets disagree
+	// for a reason it did not arrange.
+	//
+	// It is here because the modes in this file share the update-lists boundary and
+	// `--check` reads the policy to say which entries the operator's switches
+	// select: left at the installed default, every check case below would read the
+	// HOST's /etc/mosdns/policy.yaml, which is a fixture whose answer depends on
+	// which machine runs the suite. The reader stays the real one -- this fixture
+	// replaces the network, not the configuration -- so what is under test is the
+	// command reading a policy file, not a stub returning one.
+	//
+	// The entry comparison is not reached by the cases here: all three
+	// `runRangeCheck` call sites publish a v2fly-primary pair, and a report about
+	// that source says nothing about dnsmasq entry sets. A case here that published
+	// a China primary would want every entry converted, which is what this file
+	// gives it.
+	policy string
 }
 
 func newRangePaths(t *testing.T) rangePaths {
@@ -167,6 +191,7 @@ func newRangePaths(t *testing.T) rangePaths {
 		control:     filepath.Join(dir, "control.lock"),
 		pinSnapshot: filepath.Join(dir, "cloudflare-ranges.json"),
 		pinLock:     filepath.Join(dir, "cloudflare-ranges.lock.json"),
+		policy:      automaticPolicy(t, false, false),
 	}
 }
 
@@ -210,6 +235,13 @@ func (o *rangeOrigin) services(github *http.Client) services {
 		// itself is the thing under test; a fixture that needs neither should not
 		// have to think about it.
 		now: time.Now,
+		// The policy reader is the REAL one rather than a fixture's, because the
+		// cases that run `--automatic` here hand the command a policy file they
+		// wrote and expect it to be read: this fixture replaces the network, not the
+		// configuration. `--automatic` also reads the same file for which of the
+		// primary source's files it converts, so leaving this nil would make those
+		// cases crash rather than measure.
+		loadPolicy: config.Load,
 		// The two boundaries the emergency-rollback verb uses are the real ones
 		// here, because this fixture replaces the network and the filesystem and
 		// says nothing about who the caller is or what running the installer
@@ -262,7 +294,11 @@ func runRangeRefresh(t *testing.T, boundary services, paths rangePaths) (int, st
 func runRangeCheck(t *testing.T, boundary services, paths rangePaths) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := runWith(append([]string{"update-lists", "--check"}, refreshArgs(paths)...),
+	// The policy is named HERE and not in refreshArgs, because a mode that takes
+	// its own --policy must be able to pass one: refreshArgs is shared, and the
+	// flag would come after and quietly win. `--check` needs it because it reports
+	// which entries the operator's switches select against the published list.
+	code := runWith(append([]string{"update-lists", "--check"}, append(refreshArgs(paths), "--policy", paths.policy)...),
 		&stdout, &stderr, boundary)
 	return code, stdout.String(), stderr.String()
 }

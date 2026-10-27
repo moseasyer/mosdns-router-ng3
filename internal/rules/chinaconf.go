@@ -25,12 +25,54 @@ import (
 	"strings"
 )
 
-// ChinaConfEntries 是主仓库中被转换的三个文件。这是一个 pin 住的固定集合:
+// ChinaConfEntries 是主仓库中全部被转换的文件。这是一个 pin 住的固定集合:
 // 上游新增文件不会被自动纳入,少一个则整个转换失败。
 var ChinaConfEntries = []string{
-	"accelerated-domains.china.conf",
-	"google.china.conf",
+	ChinaConfBaseEntry,
 	"apple.china.conf",
+	"google.china.conf",
+}
+
+// ChinaConfBaseEntry 是**永远**被转换的那一个文件,不是一类可选项。
+// 它占已发布列表 110,481 条中的 110,205 条——99.75%。把它做成开关等于给
+// 操作员一个一键关闭几乎全部国内分流的按钮,而那不是任何人的真实意图。
+const ChinaConfBaseEntry = "accelerated-domains.china.conf"
+
+// ChinaConfOptionalEntry 把 policy 里的一个字段映射到它控制的上游文件。
+// 新增一项要同时改 internal/config 的字段和这张表:那个摩擦是有意的,它就是
+// "上游新增文件不会被自动纳入"这条属性在维护期的样子。
+type ChinaConfOptionalEntry struct {
+	Field string
+	Entry string
+}
+
+// ChinaConfOptionalEntries 是可选项,按 policy 字段名索引。
+//
+// 顺序与 ChinaConfEntries 一致,所以两个开关都开时 ChinaConfEntriesFor(true,
+// true) 与被审核集合逐项相同。这里保持一致,是为了让"全部打开 = 已发布快照"这句话
+// 读得出来。
+//
+// 只到"转换成功后的产物与顺序无关"为止,而不是"顺序不进入任何产物":转换器把每个
+// 文件的结果合并之后排序(:262-263),所以发布的字节确实与顺序无关;但顺序仍然进入
+// 锁里序列化的 entries 数组,也进入失败路径——不可读的文件按给定顺序拼接(:172),
+// 而没有解析出规则的文件在第一个就中止(:246),所以两个坏文件时消息随顺序变。
+var ChinaConfOptionalEntries = []ChinaConfOptionalEntry{
+	{Field: "apple", Entry: "apple.china.conf"},
+	{Field: "google", Entry: "google.china.conf"},
+}
+
+// ChinaConfEntriesFor 返回操作员的开关选中之后要转换的 entry 集合:恒定的
+// base,加上开着的那几个可选项。返回的是新切片,调用方可以持有它。
+func ChinaConfEntriesFor(google, apple bool) []string {
+	enabled := map[string]bool{"google": google, "apple": apple}
+	entries := make([]string, 0, len(ChinaConfEntries))
+	entries = append(entries, ChinaConfBaseEntry)
+	for _, optional := range ChinaConfOptionalEntries {
+		if enabled[optional.Field] {
+			entries = append(entries, optional.Entry)
+		}
+	}
+	return entries
 }
 
 // chinaConfRuleShape 与 chinaConfDisabledShape 是本转换器能定义的两行形状,

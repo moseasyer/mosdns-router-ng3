@@ -85,8 +85,8 @@ that did not happen.
 names the directory the timer is published into, and render creates it. It is a
 separate flag from
 .B \-\-out
-because the two files go to different places, and one flag meaning \"the output
-directory\" for two directories is how a machine ends up with a policy that says
+because the two files go to different places, and one flag meaning "the output
+directory" for two directories is how a machine ends up with a policy that says
 one hour and a timer that fires at another.
 .PP
 The policy path it is given is the path both published documents NAME, so rendering
@@ -112,9 +112,9 @@ whose name understated it.
 .B \-\-automatic
 The mode the scheduled run uses, and the one
 .BR mosdns\-list\-check.service (8)
-executes. It always produces the drift report \em that report is the only place
+executes. It always produces the drift report \(em that report is the only place
 this machine's answer about its own source is written down, so a machine with
-unattended refreshing turned on must not thereby stop being told \em and then
+unattended refreshing turned on must not thereby stop being told \(em and then
 refreshes exactly what
 .I /etc/mosdns/policy.yaml
 says to refresh, which by default is nothing at all. With both switches off it does
@@ -135,11 +135,45 @@ opening the cheap one opens the expensive one. Both are off in the shipped polic
 is curated by hand, so any upstream commit moves the split, and accepting one
 unattended is a routing change nobody reviewed.
 .br
-The China list is published from two sources \em the
+The primary is converted from three of its files, and two of them have a switch.
+.B lists.china.google
+selects
+.B google.china.conf
+(112 rules) and
+.B lists.china.apple
+selects
+.B apple.china.conf
+(165 rules); both are on in the shipped policy, and setting one to
+.B false
+takes that file's names out of the published list \(em at the next pin or refresh,
+not at the next upstream commit, which may be weeks away. They are not the refresh
+switch:
+.B lists.china.automatic
+alone decides whether anything is updated, so a machine that turns one of them off
+keeps updating on exactly the schedule it had and simply publishes a shorter list.
+Both paths that publish a list record the set in the lock they write \(em that is
+where a later reader learns what this machine's list was actually built from, and
+the pin's own report does not repeat it.
+.B \-\-check
+is the report that names both sets, on every run of a machine published from that
+primary, which is how a switch edit becomes visible before the next upstream commit
+rather than after it. An unattended refresh says so only on the run where the set
+really changed, because on the runs where it did not, nothing about its report is
+different.
+.br
+The third file,
+.BR accelerated\-domains.china.conf ,
+has no switch and cannot be turned off, because it is not a category of names: it
+is 110,205 of the 110,481 rules this machine publishes \(em 99.75% \(em and a list
+without it sends almost every domestic name down the foreign branch, quietly, with
+nothing anywhere reporting it. A published lock that does not name it is refused
+rather than trimmed.
+.br
+The China list is published from two sources \(em the
 .I felixonmars/dnsmasq\-china\-list
 primary, and a
 .I v2fly/domain\-list\-community
-supplement carrying the rule kinds the primary's syntax cannot say \em and the
+supplement carrying the rule kinds the primary's syntax cannot say \(em and the
 refresh follows each of them at its own repository, because a commit id is only
 meaningful in the repository that issued it. It refuses a source that has lost
 more than 5% of the rules this machine published for \fBthat same source\fR, and
@@ -148,7 +182,7 @@ each other, nor against the merged list: the supplement is seventy rules beside
 110,551, so a supplement that lost every one of them moves the merged list by
 0.06% and would sail through a check of the merged list. The digest cannot catch
 this either, because a commit whose list is a fraction of its former size
-verifies perfectly \em it really is the upstream document. The refusal leaves the
+verifies perfectly \(em it really is the upstream document. The refusal leaves the
 pin, the list and the rollback archive exactly as they were, so publishing that
 commit afterwards is one deliberate command an operator runs having read the diff.
 The threshold is not a refusal to ever update: a curated list does lose domains
@@ -156,8 +190,8 @@ now and then.
 .br
 Everything that can fail happens before anything is written, so a machine with no
 route out fails without having touched the pin, the list or the archive. A machine
-with \em no China list at all, which is the one state the drift report above cannot
-describe \em is installed first, and it is installed from the primary: a fresh
+with \(em no China list at all, which is the one state the drift report above cannot
+describe \(em is installed first, and it is installed from the primary: a fresh
 install on a working network gets
 .I felixonmars/dnsmasq\-china\-list
 and the supplement beside it. Only when the primary itself cannot be reached does
@@ -172,9 +206,9 @@ The refresh's destination is always the primary, never whatever the published lo
 names. A machine published from the fallback is one that has not reached the
 primary yet, so its next successful refresh migrates it: the fallback is not a
 second primary, it is what this gateway falls back to. That migration is the one
-run with no previous count to measure against \em the number on disk belongs to the
+run with no previous count to measure against \(em the number on disk belongs to the
 source being left, and weighing the new primary against it would be exactly the
-cross\-source comparison the guardrail above exists to refuse \em so the collapse
+cross\-source comparison the guardrail above exists to refuse \(em so the collapse
 guardrail is skipped on that run, and the report says so by name. The same applies
 to the supplement on the run that installs one for the first time: a list published
 from the dnsmasq primary with no supplement beside it has no previous contribution
@@ -189,11 +223,11 @@ from disk without requesting them. Takes no lock, writes nothing, and cannot pub
 missing prefix list. Scheduled daily by
 .BR mosdns\-list\-check.timer (5).
 .br
-A published China list is built from two repositories \em the
+A published China list is built from two repositories \(em the
 .I felixonmars/dnsmasq\-china\-list
 primary and, beside it, the
 .I v2fly/domain\-list\-community
-supplement \em so the report names both. It carries the primary's repository, entry or
+supplement \(em so the report names both. It carries the primary's repository, entry or
 entries, commit and archive digest, and then either the supplement's repository,
 commit, archive digest and kinds, or
 .B supplement\-present: false
@@ -204,7 +238,7 @@ cannot be reached, it looks otherwise healthy from the outside, and nothing else
 report would say the seventy\-odd rules only the second source can express are missing.
 Beside a
 .I v2fly/domain\-list\-community
-primary the absence is not a fault and is reported without a remedy \em that source
+primary the absence is not a fault and is reported without a remedy \(em that source
 already carries every rule kind a supplement contributes.
 .br
 .B up\-to\-date:
@@ -219,11 +253,48 @@ for the primary and
 for the second source, and the archive digest a new pin would record is reported for
 whichever of them drifted. A source that cannot be reached at all is not a verdict:
 the half of the report that was read off the disk goes to standard error, standard
-output stays empty and the exit status is the check's own \em which is what a machine
+output stays empty and the exit status is the check's own \(em which is what a machine
 with no route to the internet sees. That half of the report goes out on standard error
 for the same reason it is printed at all: a machine with no route to the internet is
 exactly the machine whose China\-list requests fail, and a timer that printed nothing
 there would never measure the snapshot below.
+.br
+The verdict also covers the entry set, because the published list is not only a pair
+of commits: it is a set of files, and that set is a decision the operator made in
+.BR policy.yaml .
+So the report carries
+.B desired\-entries:
+\(em what this machine's
+.B lists.china
+switches select now \(em beside
+.BR published\-entries: ,
+which is what the lock beside it records, and
+.B up\-to\-date:
+is
+.B false
+when the two sets differ, exactly as it is when a commit has moved. Without that
+third clause the report calls a machine current whose list still carries a category
+it was just told to stop including, which is what a refresh republishes over the
+following night \(em but only on a machine that has
+.B lists.china.automatic
+on, and the shipped policy has that off. Nothing republishes by itself on a machine
+left as it was installed: the next
+.B \-\-pin\-remote
+is what carries the entry set, and until one is run those two lines keep reporting
+.B up\-to\-date: false
+however many nights pass. The two sets are compared as sets, not as
+sequences: the converter merges each named file and sorts the result, so a lock
+spelling the same files in another order \(em as the pair this package ships does \(em
+describes the same list, and a machine that has just upgraded is not drifted.
+Neither line is printed for a machine published from the
+.I v2fly/domain\-list\-community
+fallback, whose list is built from one entry of another repository and has no set
+for these switches to disagree with.
+.br
+Like the two publishing paths, the check reads
+.B /etc/mosdns/policy.yaml
+and refuses \(em exit 2 \(em when it cannot, naming the file, rather than guessing
+which entries this machine wants and reporting a verdict it made up.
 .br
 The report also carries the range snapshot this package ships: its two digests, the
 moment it was taken, how old it is, and whether the document published on this machine
@@ -237,14 +308,31 @@ while a pin nobody measures is not.
 Re\-pins the China domain list and publishes the list and the lock that describes
 it. With
 .B HEAD
-\(the default, and the documented invocation) it takes the source's current
+(the default, and the documented invocation) it takes the source's current
 default\-branch commit. With a full 40\-character commit it publishes that commit
 instead, which is how a pin accepted by mistake is undone: the rollback has to be
-able to name where it is going back to, and \"whatever upstream says now\" is not
+able to name where it is going back to, and "whatever upstream says now" is not
 an answer to that question. A branch, a tag, an abbreviated commit and
 .B HEAD~1
-are all refused at the command line rather than after a request \em the lock
+are all refused at the command line rather than after a request \(em the lock
 records a commit, and none of those is one.
+.br
+A pin reads
+.B /etc/mosdns/policy.yaml
+to learn which of the primary source's files become domestic names \(em
+.BR lists.china.google ,
+.BR lists.china.apple ,
+both on by default \(em and refuses when that file cannot be read, naming it, with
+exit status 2. It does not fall back to the reviewed set, and the reason is worth
+stating: a guess here is a silent verdict about this machine's DNS. Read as all
+three files, it hands back the names an operator asked to be rid of; read as none
+of them, it publishes a list missing a category of domestic names, every one of
+which quietly takes the foreign branch \(em and the pin still exits 0 with nothing
+in its report to notice. A refusal is the only answer that cannot be mistaken for
+a successful pin. A broken policy also makes
+.B \-\-automatic
+and the daily timer untrustworthy, so a pin that succeeded there would be a false
+reassurance.
 .br
 Before publishing, the outgoing lock is archived to
 .I /var/lib/mosdns/lists/source-lock.previous.json
@@ -252,19 +340,19 @@ and is then replaced by the new one. That order is the mechanism rather than a
 detail: the moment the new lock is renamed into place the old one exists nowhere,
 so an archive taken afterwards would record the commit that was just accepted
 instead of the one this machine was on. Taken before, a publication that fails
-leaves an archive naming a commit that really was current \em the one you need
+leaves an archive naming a commit that really was current \(em the one you need
 after a failed unattended refresh.
 .br
 An archive that cannot be written stops the publication rather than being warned
 about. Publishing without one is the only outcome here that is unrecoverable: the
 rollback target is destroyed by the very operation that needed it. A lock that is
-not there at all is not that case \em it is the first pin.
+not there at all is not that case \(em it is the first pin.
 .br
 A pin re\-pins the
 .I felixonmars/dnsmasq\-china\-list
 primary and carries the
 .I v2fly/domain\-list\-community
-supplement the published lock already names, at the commit it already names \em
+supplement the published lock already names, at the commit it already names \(em
 this command was asked about one source, so the second source is not re\-resolved.
 The exception is a run with nothing to carry: the first pin, and also a later pin
 over a published lock that names no second source. Either way the run resolves the
@@ -275,14 +363,14 @@ same run seen from outside. The dnsmasq primary on its own cannot express the
 and
 .B regexp
 rules only the second source contributes, so a list published without it is a
-shorter list rather than the same one \em a pin that resolves the supplement here
+shorter list rather than the same one \(em a pin that resolves the supplement here
 is repairing a machine whose lock named a single source, not adding one to a
-machine that had the pair. A lock this build cannot read \em a schema version 1
-document, which is the one every machine upgrading carries \em is never treated
+machine that had the pair. A lock this build cannot read \(em a schema version 1
+document, which is the one every machine upgrading carries \(em is never treated
 this way: such a document has no supplement field and so cannot be said to name
 none, and the run says so rather than guessing. If that second source cannot be
 reached, the primary is published without it and standard error says what is
-missing from the list \em refusing would strand the operator on the one command
+missing from the list \(em refusing would strand the operator on the one command
 documented as the way out, and on a machine with nothing installed would leave no
 China list at all, which is worse than one missing seventy rules out of a hundred
 and eleven thousand. Run
@@ -304,7 +392,7 @@ and only with one of these two values:
 or
 .BR felixonmars/dnsmasq\-china\-list .
 Anything else is refused at the command line, before the name is used to build a
-request \em the allowlist is what makes a repository name a record of something
+request \(em the allowlist is what makes a repository name a record of something
 this gateway reviewed, and a name outside it would put the lock at the service of
 a stranger.
 .br
@@ -317,15 +405,15 @@ is the fallback, not the default, and naming it here is how you ask for it on a
 machine that has nothing installed.
 .br
 That last qualifier is the whole boundary of this flag, because naming the fallback
-on a machine that is \em not empty is refused rather than carried out. A published lock
+on a machine that is \(em not empty is refused rather than carried out. A published lock
 that already names a
 .I v2fly/domain\-list\-community
 supplement cannot travel beside a
 .I v2fly/domain\-list\-community
 primary: that source already holds every rule kind a supplement contributes, so the
 pair would be a lock untrue about how the list was built, and the pin is refused with
-nothing published. The refusal is fail\-closed and deliberate \em a list that dropped
-the second source silently would be a shorter list rather than the same one \em so
+nothing published. The refusal is fail\-closed and deliberate \(em a list that dropped
+the second source silently would be a shorter list rather than the same one \(em so
 this flag is for the empty machine and for a machine whose lock this build cannot read.
 To move a machine that carries a supplement onto the fallback, remove the
 .B supplement
@@ -341,8 +429,8 @@ re\-pins the source its own lock names. What the default decides is only the
 first install.
 .br
 Reading the lock is also why the flag exists: a lock
-this build cannot read \em a schema version 1 document is the one an upgraded
-machine carries \em cannot say which repository the machine was running. So a
+this build cannot read \(em a schema version 1 document is the one an upgraded
+machine carries \(em cannot say which repository the machine was running. So a
 machine on such a lock is told to run
 .BR "mosdns\-cdnctl update\-lists \-\-pin\-remote HEAD \-\-pin\-source"
 .IR repository ,
@@ -358,7 +446,7 @@ this flag solves.
 .br
 A run with this flag still archives the outgoing lock, re\-encoded the way this
 package writes locks when the outgoing lock parses and copied byte for byte when
-it does not \em so the record of what was running survives even when this build
+it does not \(em so the record of what was running survives even when this build
 cannot read it. To go back, read the commit out of
 .I /var/lib/mosdns/lists/source-lock.previous.json
 and pin it by name:
@@ -378,7 +466,7 @@ network at all.
 .br
 Where nothing is cached either, it publishes the snapshot the package installs at
 .IR /usr/share/mosdns\-router/cloudflare\-ranges.json ,
-beside the lock that accounts for it \em and only after verifying the snapshot
+beside the lock that accounts for it \(em and only after verifying the snapshot
 against that lock. A snapshot whose bytes the lock does not record, a lock that
 records no date or no digest of the prefix list, and a snapshot taken from a
 different endpoint are all refusals, and nothing is published: a selector over
@@ -614,7 +702,8 @@ be asked for together, in which case each is prefixed with its name.
 The CDN selector. On a default installation:
 .RB " sudo mosdns\-cdnctl status \-\-selector /var/lib/mosdns/runtime/cdn\-selector.json"
 prints
-.BR generation: ", " mode: ", " provider: ", " schema_version: ",\nand then
+.BR generation: ", " mode: ", " provider: ", " schema_version: ",
+and then
 .BR winner_ip: ", " fallback_ip: ", " winner_proof_until: " and " last_success:
 when they are set. An empty optional field is omitted rather than printed blank, so
 a missing winner cannot be mistaken for a configured one.
